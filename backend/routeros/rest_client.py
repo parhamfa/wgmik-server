@@ -6,10 +6,20 @@ from .client_base import RouterOSClient, WGPeer, WGInterfaceConfig
 
 
 class RouterOSRestClient(RouterOSClient):
-    def __init__(self, host: str, port: int, username: str, password: str, tls_verify: bool = True, https: bool = True):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        tls_verify: bool = True,
+        https: bool = True,
+        allow_scheme_fallback: bool = True,
+    ):
         self.host = host
         self.port = port
         self.https = https
+        self.allow_scheme_fallback = allow_scheme_fallback
         self.auth = (username, password)
         self.verify = tls_verify
 
@@ -25,8 +35,14 @@ class RouterOSRestClient(RouterOSClient):
                 if r.headers.get("content-type", "").startswith("application/json"):
                     return r.json()
                 return r.text
-        except Exception:
-            # Fallback to opposite scheme if initial scheme fails
+        except httpx.HTTPStatusError:
+            # Non-2xx from RouterOS is a real API response; do not "flip protocol".
+            raise
+        except httpx.TransportError:
+            # Only fallback when connection/protocol fails (e.g. https vs http mismatch),
+            # and only when the profile allows it.
+            if not self.allow_scheme_fallback:
+                raise
             alt_https = not self.https
             alt_url = f"{self._base(alt_https)}{path}"
             with httpx.Client(verify=self.verify, timeout=10.0, auth=self.auth) as c:
@@ -110,6 +126,21 @@ class RouterOSRestClient(RouterOSClient):
             return total or None
         return None
 
+    def _parse_bool(self, value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("1", "true", "t", "yes", "y", "on", "enabled"):
+                return True
+            if v in ("0", "false", "f", "no", "n", "off", "disabled"):
+                return False
+        return bool(value)
+
     def list_wireguard_peers(self, interface: str) -> List[WGPeer]:
         # Filter peers by interface
         data = self._get("/interface/wireguard/peers")
@@ -124,7 +155,7 @@ class RouterOSRestClient(RouterOSClient):
                     name=row.get("name", ""),
                     public_key=row.get("public-key", ""),
                     allowed_address=row.get("allowed-address", ""),
-                    disabled=row.get("disabled", False),
+                    disabled=self._parse_bool(row.get("disabled", False)),
                     rx_bytes=int(row.get("rx", 0)),
                     tx_bytes=int(row.get("tx", 0)),
                     last_handshake=self._parse_last_handshake(row.get("last-handshake")),
@@ -134,7 +165,50 @@ class RouterOSRestClient(RouterOSClient):
         return peers
 
     def set_peer_disabled(self, interface: str, ros_id: str, disabled: bool) -> None:
-        # PUT to the peer resource: path format /interface/wireguard/peers/<id>
-        self._put(f"/interface/wireguard/peers/{ros_id}", {"disabled": disabled})
+        # RouterOS REST has an item endpoint, but on some versions it returns 500 for PUT/PATCH.
+        # The "set" action endpoint is reliable:
+        #   POST /rest/interface/wireguard/peers/set  {"numbers":"*8","disabled":"yes"}
+        self._request(
+            "POST",
+            "/interface/wireguard/peers/set",
+            json={"numbers": ros_id, "disabled": "yes" if disabled else "no"},
+        )
+
+    def add_wireguard_peer(
+        self,
+        interface: str,
+        public_key: str,
+        allowed_address: str,
+        name: str = "",
+        comment: str = "",
+        disabled: bool = False,
+    ) -> str:
+        # RouterOS REST add expects hyphenated keys and returns {"ret":"*XX"}
+        payload = {
+            "interface": interface,
+            "public-key": public_key,
+            "allowed-address": allowed_address,
+        }
+        if name:
+            payload["name"] = name
+        if comment:
+            payload["comment"] = comment
+        if disabled:
+            payload["disabled"] = "yes"
+        res = self._request("POST", "/interface/wireguard/peers/add", json=payload)
+        if isinstance(res, dict):
+            rid = res.get("ret") or res.get(".id")
+            if isinstance(rid, str) and rid:
+                return rid
+        # Fallback: re-list peers and locate by pubkey
+        for p in self.list_wireguard_peers(interface):
+            if p.public_key == public_key:
+                return p.ros_id
+        raise RuntimeError("RouterOS did not return peer id")
+
+    def remove_wireguard_peer(self, interface: str, ros_id: str) -> None:
+        # RouterOS REST remove endpoint:
+        #   POST /rest/interface/wireguard/peers/remove  {"numbers":"*53"}
+        self._request("POST", "/interface/wireguard/peers/remove", json={"numbers": ros_id})
 
 

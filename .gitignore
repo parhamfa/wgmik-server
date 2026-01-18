@@ -1,10 +1,35 @@
+# Dependencies
 /.venv/
-/wgmik.db
-/.env
-/.env.*
 /frontend/node_modules/
-/frontend/dist/
 __pycache__/
 *.pyc
+.pytest_cache/
 
+# Build outputs
+/frontend/dist/
+/frontend/tsconfig.tsbuildinfo
 
+# Environment and secrets
+.env
+.env.*
+/.env
+
+# Database
+*.db
+wgmik.db
+
+# IDE/Editor
+.cursor/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Debug files
+backend/debug_*.py
+backend/debug_*.log
+check_rows.py
+
+# Agent/development notes
+agent-guide.md

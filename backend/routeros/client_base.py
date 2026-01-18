@@ -33,6 +33,22 @@ class RouterOSClient:
     def set_peer_disabled(self, interface: str, ros_id: str, disabled: bool) -> None:
         raise NotImplementedError
 
+    def add_wireguard_peer(
+        self,
+        interface: str,
+        public_key: str,
+        allowed_address: str,
+        name: str = "",
+        comment: str = "",
+        disabled: bool = False,
+    ) -> str:
+        """Create a WireGuard peer and return its RouterOS internal .id."""
+        raise NotImplementedError
+
+    def remove_wireguard_peer(self, interface: str, ros_id: str) -> None:
+        """Remove a WireGuard peer by RouterOS internal .id."""
+        raise NotImplementedError
+
     def get_wireguard_interface(self, interface: str) -> WGInterfaceConfig:
         """Return config for a single WireGuard interface (public key, listen port, etc.)."""
         raise NotImplementedError

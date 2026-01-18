@@ -18,6 +18,7 @@ def make_client(router: Router):
             password=password,
             tls_verify=router.tls_verify,
             https=https,
+            allow_scheme_fallback=(router.proto == "rest"),
         )
     else:
         # api-plain forces no TLS; api uses TLS

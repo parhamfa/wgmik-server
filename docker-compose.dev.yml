@@ -1,0 +1,64 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/wgmik.db}
+      SECRET_KEY: ${SECRET_KEY:-change-me}
+      DEBUG: "true"
+    command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./backend:/app/backend
+      - wgmik_data:/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/settings', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  web:
+    image: node:20-alpine
+    working_dir: /app
+    environment:
+      # Used by vite.config.ts to proxy /api in dev mode
+      VITE_PROXY_TARGET: http://api:8000
+    volumes:
+      - ./frontend:/app
+      - web_node_modules:/app/node_modules
+    command:
+      [
+        "sh",
+        "-lc",
+        "if [ ! -d node_modules ] || [ -z \"$(ls -A node_modules 2>/dev/null)\" ]; then npm ci; fi; npm run dev -- --host 0.0.0.0 --port 5173"
+      ]
+    ports:
+      - "5173:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:5173', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1));",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  wgmik_data:
+  web_node_modules:
+
+

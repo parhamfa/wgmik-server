@@ -103,4 +103,11 @@ class SettingsKV(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(String)
 
+class User(Base):
+    __tablename__ = "users"
 
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    hashed_password: Mapped[str] = mapped_column(String)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

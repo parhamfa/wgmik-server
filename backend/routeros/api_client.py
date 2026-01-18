@@ -51,6 +51,21 @@ class RouterOSApiClient(RouterOSClient):
             return total or None
         return None
 
+    def _parse_bool(self, value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("1", "true", "t", "yes", "y", "on", "enabled"):
+                return True
+            if v in ("0", "false", "f", "no", "n", "off", "disabled"):
+                return False
+        return bool(value)
+
     def list_wireguard_interfaces(self) -> List[str]:
         api = self._conn()
         try:
@@ -95,7 +110,7 @@ class RouterOSApiClient(RouterOSClient):
                         name=row.get("name", ""),
                         public_key=row.get("public-key", ""),
                         allowed_address=row.get("allowed-address", ""),
-                        disabled=row.get("disabled", False),
+                        disabled=self._parse_bool(row.get("disabled", False)),
                         rx_bytes=int(row.get("rx", 0)),
                         tx_bytes=int(row.get("tx", 0)),
                         last_handshake=self._parse_last_handshake(row.get("last-handshake")),
@@ -113,6 +128,64 @@ class RouterOSApiClient(RouterOSClient):
         api = self._conn()
         try:
             api(cmd="/interface/wireguard/peers/set", **{".id": ros_id, "disabled": "yes" if disabled else "no"})
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def add_wireguard_peer(
+        self,
+        interface: str,
+        public_key: str,
+        allowed_address: str,
+        name: str = "",
+        comment: str = "",
+        disabled: bool = False,
+    ) -> str:
+        api = self._conn()
+        try:
+            params = {
+                "interface": interface,
+                "public-key": public_key,
+                "allowed-address": allowed_address,
+            }
+            if name:
+                params["name"] = name
+            if comment:
+                params["comment"] = comment
+            if disabled:
+                params["disabled"] = "yes"
+            res = api(cmd="/interface/wireguard/peers/add", **params)
+            # librouteros may return dict-like with 'ret' or list
+            if isinstance(res, dict):
+                rid = res.get("ret") or res.get(".id")
+                if isinstance(rid, str) and rid:
+                    return rid
+            if isinstance(res, list) and res:
+                first = res[0]
+                if isinstance(first, dict):
+                    rid = first.get("ret") or first.get(".id")
+                    if isinstance(rid, str) and rid:
+                        return rid
+            # Fallback: locate by pubkey
+            rows = api(cmd="/interface/wireguard/peers/print")
+            for row in rows:
+                if row.get("interface") == interface and row.get("public-key") == public_key:
+                    rid = row.get(".id") or ""
+                    if rid:
+                        return rid
+            raise RuntimeError("RouterOS did not return peer id")
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def remove_wireguard_peer(self, interface: str, ros_id: str) -> None:
+        api = self._conn()
+        try:
+            api(cmd="/interface/wireguard/peers/remove", **{".id": ros_id})
         finally:
             try:
                 api.close()

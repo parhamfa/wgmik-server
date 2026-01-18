@@ -4,6 +4,46 @@
 
 html, body, #root { height: 100%; }
 
+@layer base {
+  :root {
+    --chart-line-1: #111827;
+    --chart-line-2: #6b7280;
+    --chart-tick: #6b7280;
+    --chart-grid: rgba(0,0,0,0.08);
+    --chart-fill-1: #111827;
+    --chart-fill-2: #6b7280;
+    --chart-tooltip-bg: #ffffff;
+    --chart-tooltip-border: #e5e7eb;
+    --chart-tooltip-text: #111827;
+  }
+  html.dark {
+    --chart-line-1: #e5e7eb;
+    --chart-line-2: #9ca3af;
+    --chart-tick: #9ca3af;
+    --chart-grid: rgba(255,255,255,0.12);
+    --chart-fill-1: #e5e7eb;
+    --chart-fill-2: #9ca3af;
+    --chart-tooltip-bg: #0b1220;
+    --chart-tooltip-border: #1f2937;
+    --chart-tooltip-text: #e5e7eb;
+  }
+  html { color-scheme: light; }
+  html.dark { color-scheme: dark; }
+  body { @apply bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100; }
+  input, textarea, select {
+    @apply bg-white text-gray-900;
+  }
+  html.dark input, html.dark textarea, html.dark select {
+    @apply bg-gray-950 text-gray-100;
+  }
+  input::placeholder, textarea::placeholder {
+    @apply text-gray-400;
+  }
+  html.dark input::placeholder, html.dark textarea::placeholder {
+    @apply text-gray-500;
+  }
+}
+
 @keyframes shimmer {
   0% { background-position: -200% 0; }
   100% { background-position: 200% 0; }
@@ -12,6 +52,10 @@ html, body, #root { height: 100%; }
   background: linear-gradient(90deg, #e5e7eb 0%, #f5f5f5 50%, #e5e7eb 100%);
   background-size: 200% 100%;
   animation: shimmer 1.4s infinite;
+}
+.dark .shimmer {
+  background: linear-gradient(90deg, #111827 0%, #0b1220 50%, #111827 100%);
+  background-size: 200% 100%;
 }
 
 .dot {

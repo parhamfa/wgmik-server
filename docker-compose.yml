@@ -1,0 +1,49 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      # Persist DB in a named volume (recommended for docker).
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/wgmik.db}
+      # Used to encrypt RouterOS passwords in DB; override in your own .env.
+      SECRET_KEY: ${SECRET_KEY:-change-me}
+      DEBUG: ${DEBUG:-false}
+    volumes:
+      - wgmik_data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      # Web UI (nginx serves built frontend, proxies /api to backend)
+      - "5173:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  wgmik_data:
+
+
