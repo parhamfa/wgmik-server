@@ -9,7 +9,8 @@ WireGuard accounting panel for MikroTik RouterOS (FastAPI + React/Vite).
 ### Production-style (build UI, serve via nginx, proxy `/api`)
 
 ```bash
-cd /Users/parhamfatemi/Developer/mikrotik/wgmik-server
+git clone https://github.com/parhamfa/wgmik-server.git
+cd wgmik-server
 cp env.example .env
 # edit .env and set SECRET_KEY to something non-trivial
 docker compose up --build
@@ -29,7 +30,6 @@ docker compose down
 ### Dev mode (hot reload for backend + frontend)
 
 ```bash
-cd /Users/parhamfatemi/Developer/mikrotik/wgmik-server
 cp env.example .env
 docker compose -f docker-compose.dev.yml up --build
 ```
@@ -46,7 +46,5 @@ docker compose -f docker-compose.dev.yml down
 ## What to test after boot
 
 - **UI loads** at `http://localhost:5173`
-- **API health**: open `http://localhost:8000/api/settings` (should return JSON)
+- **API health**: open `http://localhost:8000/health` (should return `{"status": "ok"}`)
 - **Router actions**: Settings → Connection profiles → Test should return OK (or a clear error)
-
-
