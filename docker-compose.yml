@@ -10,7 +10,7 @@ services:
       SECRET_KEY: ${SECRET_KEY:-change-me}
       DEBUG: ${DEBUG:-false}
     volumes:
-      - wgmik_data:/data
+      - ./data:/data
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -42,8 +42,5 @@ services:
       interval: 10s
       timeout: 3s
       retries: 10
-
-volumes:
-  wgmik_data:
 
 
