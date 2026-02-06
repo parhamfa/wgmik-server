@@ -8,6 +8,11 @@ class AppSettings(BaseSettings):
     database_url: str = Field(default="sqlite:///./wgmik.db")
     debug: bool = Field(default=True)
 
+    # Authentication bootstrap (first run)
+    initial_admin_username: str = Field(default="admin")
+    # If empty, a random password will be generated and printed to logs once.
+    initial_admin_password: str = Field(default="")
+
     # Polling and accounting
     poll_interval_seconds: int = Field(default=30)
     online_threshold_seconds: int = Field(default=15)
@@ -19,5 +24,4 @@ class AppSettings(BaseSettings):
 
 
 settings = AppSettings()
-
 

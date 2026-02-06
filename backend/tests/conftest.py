@@ -1,14 +1,13 @@
 import os
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 # FORCE environment variables before any other imports that might read settings
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["SECRET_KEY"] = "test-secret-key"
 os.environ["DEBUG"] = "true"
+os.environ["INITIAL_ADMIN_USERNAME"] = "admin"
+os.environ["INITIAL_ADMIN_PASSWORD"] = "test-admin-password"
 
 import sys
 from pathlib import Path
@@ -17,38 +16,29 @@ from pathlib import Path
 # This assumes conftest.py is in backend/tests/
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from backend.db import Base, get_db
+from backend.bootstrap import ensure_initial_admin
+from backend.db import Base, get_db, engine, SessionLocal
 from backend.main import app
 
-# Create in-memory engine
-engine = create_engine(
-    "sqlite:///:memory:",
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
-)
-TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
 @pytest.fixture(scope="function")
-def test_db():
-    # Create tables
+def client():
+    # Ensure a clean DB per test (sqlite :memory: persists due to StaticPool)
+    Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
-    
-    db = TestingSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-        # Drop tables after test
-        Base.metadata.drop_all(bind=engine)
+    ensure_initial_admin()
 
-@pytest.fixture(scope="function")
-def client(test_db):
     def override_get_db():
+        db = SessionLocal()
         try:
-            yield test_db
+            yield db
         finally:
-            pass # db is closed by fixture
+            db.close()
 
     app.dependency_overrides[get_db] = override_get_db
-    yield TestClient(app)
+    with TestClient(app) as c:
+        r = c.post("/api/auth/login", json={"username": "admin", "password": "test-admin-password"})
+        assert r.status_code == 200
+        yield c
+
     app.dependency_overrides.clear()
+    Base.metadata.drop_all(bind=engine)

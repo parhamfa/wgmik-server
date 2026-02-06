@@ -8,6 +8,9 @@ services:
       DATABASE_URL: ${DATABASE_URL:-sqlite:////data/wgmik.db}
       # Used to encrypt RouterOS passwords in DB; override in your own .env.
       SECRET_KEY: ${SECRET_KEY:-change-me}
+      # First-run admin user bootstrap (only used if DB has no users yet)
+      INITIAL_ADMIN_USERNAME: "${INITIAL_ADMIN_USERNAME:-admin}"
+      INITIAL_ADMIN_PASSWORD: "${INITIAL_ADMIN_PASSWORD:-}"
       DEBUG: ${DEBUG:-false}
     volumes:
       - ./data:/data
@@ -42,5 +45,4 @@ services:
       interval: 10s
       timeout: 3s
       retries: 10
-
 

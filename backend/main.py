@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from .api.routes import router as api_router
+from .bootstrap import ensure_initial_admin
 from .scheduler import ensure_scheduler
 from .db import Base, engine
 from .settings import settings
@@ -25,6 +26,9 @@ def health_check():
 def _start():
     # Ensure tables exist
     Base.metadata.create_all(bind=engine)
+
+    # Ensure there's at least one admin account on a fresh install
+    ensure_initial_admin()
     
     # Hydrate runtime settings from DB BEFORE starting scheduler
     from .db import SessionLocal
@@ -59,5 +63,4 @@ async def log_errors(request: Request, call_next):
         # Simple print; uvicorn will also log traceback
         print(f"Unhandled error on {request.url}: {e}")
         raise
-
 

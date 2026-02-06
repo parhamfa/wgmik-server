@@ -6,6 +6,8 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite:////data/wgmik.db}
       SECRET_KEY: ${SECRET_KEY:-change-me}
+      INITIAL_ADMIN_USERNAME: "${INITIAL_ADMIN_USERNAME:-admin}"
+      INITIAL_ADMIN_PASSWORD: "${INITIAL_ADMIN_PASSWORD:-}"
       DEBUG: "true"
     command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     volumes:
@@ -19,7 +21,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/settings', timeout=2).read()",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()",
         ]
       interval: 10s
       timeout: 3s
@@ -60,5 +62,4 @@ services:
 volumes:
   wgmik_data:
   web_node_modules:
-
 

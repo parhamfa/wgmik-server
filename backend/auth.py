@@ -4,9 +4,10 @@ import jwt
 from jwt.exceptions import PyJWTError
 from passlib.context import CryptContext
 from fastapi import HTTPException, status
+from .settings import settings
 
 # Configuration
-SECRET_KEY = "CHANGE_THIS_IN_PRODUCTION_TO_A_LONG_RANDOM_STRING"
+SECRET_KEY = settings.secret_key
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 

@@ -13,13 +13,25 @@ git clone https://github.com/parhamfa/wgmik-server.git
 cd wgmik-server
 cp env.example .env
 # edit .env and set SECRET_KEY to something non-trivial
+# (optional but recommended) set INITIAL_ADMIN_PASSWORD to a known value
 docker compose up --build
 ```
 
 - **Web UI**: `http://localhost:5173`
 - **API**: `http://localhost:8000`
 
-The SQLite DB is persisted in a named docker volume (`wgmik_data`).
+On a fresh install (empty DB), the backend will create an initial admin user:
+
+- `INITIAL_ADMIN_USERNAME` (default: `admin`)
+- `INITIAL_ADMIN_PASSWORD` (if empty, a random password is generated and printed once in the API logs)
+
+To retrieve an auto-generated password:
+
+```bash
+docker compose logs api
+```
+
+The SQLite DB is persisted in `./data` (bind-mounted into the container).
 
 Stop:
 
