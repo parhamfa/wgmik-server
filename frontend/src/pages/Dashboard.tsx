@@ -451,7 +451,7 @@ export default function Dashboard() {
         <div className="p-0">
 	          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-2 gap-2">
 	            <div className="text-sm text-gray-700 dark:text-gray-200">Usage</div>
-	            <div className="flex flex-wrap items-center gap-3 text-xs text-gray-600 dark:text-gray-300">
+	            <div className="flex flex-wrap items-center gap-3 text-xs text-gray-600 dark:text-gray-300 justify-end">
 	              <div className="flex items-center gap-2">
 	                <span>Auto refresh</span>
                 <input
@@ -482,7 +482,7 @@ export default function Dashboard() {
 	                  <option value="days">days</option>
 	                </select>
 	              </div>
-	              <div className="w-full flex flex-wrap items-center gap-2">
+	              <div className="basis-full flex flex-wrap items-center gap-2 justify-end">
 	                <span>Time frame</span>
 	                <input
 	                  type="datetime-local"
