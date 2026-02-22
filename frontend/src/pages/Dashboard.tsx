@@ -499,19 +499,20 @@ export default function Dashboard() {
 	                  disabled={allTime}
 	                  className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
 	                />
-	                <label className="inline-flex items-center gap-2">
-	                  <input
-	                    type="checkbox"
-	                    checked={allTime}
-	                    onChange={(e) => {
-	                      const next = e.target.checked;
-	                      setAllTime(next);
-	                      if (next) { setTimeFrom(""); setTimeTo(""); }
-	                    }}
-	                    disabled={scopeUnit !== "days"}
-	                  />
-	                  <span className={scopeUnit !== "days" ? "opacity-60" : ""}>All time</span>
-	                </label>
+	                {scopeUnit === "days" ? (
+	                  <label className="inline-flex items-center gap-2">
+	                    <input
+	                      type="checkbox"
+	                      checked={allTime}
+	                      onChange={(e) => {
+	                        const next = e.target.checked;
+	                        setAllTime(next);
+	                        if (next) { setTimeFrom(""); setTimeTo(""); }
+	                      }}
+	                    />
+	                    <span>All time</span>
+	                  </label>
+	                ) : null}
 	                <button
 	                  type="button"
 	                  onClick={() => { setAllTime(false); setTimeFrom(""); setTimeTo(""); }}
