@@ -54,6 +54,10 @@ export default function PeerDetail() {
   const quotaDraftInitRef = React.useRef(false);
   const userEditedRef = React.useRef(false);
 
+  const [timeFrom, setTimeFrom] = React.useState<string>("");
+  const [timeTo, setTimeTo] = React.useState<string>("");
+  const [allTime, setAllTime] = React.useState<boolean>(false);
+
   const [quotaDraft, setQuotaDraft] = React.useState<{ limitGb: number; valid_from: string; valid_until: string }>({
     limitGb: 0,
     valid_from: "",
@@ -108,6 +112,20 @@ export default function PeerDetail() {
   const timezone = settings?.timezone ?? "UTC";
   const showKindPills = settings?.show_kind_pills ?? true;
 
+  const toIso = React.useCallback((v: string) => {
+    if (!v) return undefined;
+    const d = new Date(v);
+    if (!Number.isFinite(d.getTime())) return undefined;
+    return d.toISOString();
+  }, []);
+  const startIso = toIso(timeFrom);
+  const endIso = toIso(timeTo);
+  const timeFrameActive = allTime || !!startIso || !!endIso;
+
+  React.useEffect(() => {
+    if (scopeUnit !== "days" && allTime) setAllTime(false);
+  }, [scopeUnit, allTime]);
+
   const fetchActions = React.useCallback(async (limit: number) => {
     const lim = Math.max(1, Math.min(200, limit || 25));
     try {
@@ -140,11 +158,18 @@ export default function PeerDetail() {
     try {
       if (!peerId) return;
       if (scopeUnit === "days") {
+        if (allTime) {
+          const points = await getPeerUsage(peerId, { window: "daily", allTime: true });
+          setUsage(points);
+          return;
+        }
+        if (startIso || endIso) {
+          const points = await getPeerUsage(peerId, { window: "daily", start: startIso, end: endIso });
+          setUsage(points);
+          return;
+        }
         const points = await getPeerUsage(peerId, { window: "daily" });
-        const trimmed =
-          scopeValue > 0 && points.length > scopeValue
-            ? points.slice(points.length - scopeValue)
-            : points;
+        const trimmed = scopeValue > 0 && points.length > scopeValue ? points.slice(points.length - scopeValue) : points;
         setUsage(trimmed);
       } else {
         const seconds =
@@ -152,13 +177,18 @@ export default function PeerDetail() {
             ? Math.max(1, scopeValue) * 60
             : Math.max(1, scopeValue) * 3600;
         const interval = scopeUnit === "minutes" ? 60 : 3600;
+        if (startIso || endIso) {
+          const points = await getPeerUsage(peerId, { window: "raw", seconds: startIso ? undefined : seconds, interval, start: startIso, end: endIso });
+          setUsage(points);
+          return;
+        }
         const points = await getPeerUsage(peerId, { window: "raw", seconds, interval });
         setUsage(points);
       }
     } catch {
       setUsage([]);
     }
-  }, [peerId, scopeUnit, scopeValue]);
+  }, [peerId, scopeUnit, scopeValue, allTime, startIso, endIso]);
 
 
 
@@ -496,11 +526,11 @@ export default function PeerDetail() {
 
             {/* Usage (moved to top) */}
             <div className="p-0 mt-2">
-              <div className="flex items-center justify-between mb-2">
-                <div className="text-sm text-gray-700 dark:text-gray-200">Usage</div>
-                <div className="flex flex-wrap items-center gap-4 text-xs text-gray-600 dark:text-gray-300">
-                  <div className="flex items-center gap-2">
-                    <span>Auto refresh</span>
+	              <div className="flex items-center justify-between mb-2">
+	                <div className="text-sm text-gray-700 dark:text-gray-200">Usage</div>
+	                <div className="flex flex-wrap items-center gap-4 text-xs text-gray-600 dark:text-gray-300">
+	                  <div className="flex items-center gap-2">
+	                    <span>Auto refresh</span>
                     <input
                       type="number"
                       min={5}
@@ -510,27 +540,66 @@ export default function PeerDetail() {
                     />
                     <span>s</span>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <span>Last</span>
-                    <input
-                      type="number"
-                      min={1}
-                      value={scopeValue}
-                      onChange={(e) => update({ peer_default_scope_value: Math.max(1, Number(e.target.value) || 1) })}
-                      className="w-14 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                    />
-                    <select
-                      value={scopeUnit}
-                      onChange={(e) => update({ peer_default_scope_unit: e.target.value as ScopeUnit })}
-                      className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
-                    >
-                      <option value="minutes">minutes</option>
-                      <option value="hours">hours</option>
-                      <option value="days">days</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
+	                  <div className="flex items-center gap-2">
+	                    <span>Last</span>
+	                    <input
+	                      type="number"
+	                      min={1}
+	                      value={scopeValue}
+	                      onChange={(e) => update({ peer_default_scope_value: Math.max(1, Number(e.target.value) || 1) })}
+	                      className="w-14 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+	                    />
+	                    <select
+	                      value={scopeUnit}
+	                      onChange={(e) => update({ peer_default_scope_unit: e.target.value as ScopeUnit })}
+	                      className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
+	                    >
+	                      <option value="minutes">minutes</option>
+	                      <option value="hours">hours</option>
+	                      <option value="days">days</option>
+	                    </select>
+	                  </div>
+	                  <div className="w-full flex flex-wrap items-center gap-2">
+	                    <span>Time frame</span>
+	                    <input
+	                      type="datetime-local"
+	                      value={timeFrom}
+	                      onChange={(e) => setTimeFrom(e.target.value)}
+	                      disabled={allTime}
+	                      className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
+	                    />
+	                    <span>to</span>
+	                    <input
+	                      type="datetime-local"
+	                      value={timeTo}
+	                      onChange={(e) => setTimeTo(e.target.value)}
+	                      disabled={allTime}
+	                      className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
+	                    />
+	                    <label className="inline-flex items-center gap-2">
+	                      <input
+	                        type="checkbox"
+	                        checked={allTime}
+	                        onChange={(e) => {
+	                          const next = e.target.checked;
+	                          setAllTime(next);
+	                          if (next) { setTimeFrom(""); setTimeTo(""); }
+	                        }}
+	                        disabled={scopeUnit !== "days"}
+	                      />
+	                      <span className={scopeUnit !== "days" ? "opacity-60" : ""}>All time</span>
+	                    </label>
+	                    <button
+	                      type="button"
+	                      onClick={() => { setAllTime(false); setTimeFrom(""); setTimeTo(""); }}
+	                      disabled={!timeFrameActive}
+	                      className="rounded-full border border-gray-200 dark:border-gray-800 px-3 py-1 text-xs bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
+	                    >
+	                      Clear
+	                    </button>
+	                  </div>
+	                </div>
+	              </div>
               <div className="h-56">
                 {usage.length === 0 ? (
                   <div className="h-full flex items-center justify-center text-sm text-gray-500 dark:text-gray-400">No data</div>
@@ -1008,5 +1077,3 @@ export default function PeerDetail() {
     </div>
   );
 }
-
-

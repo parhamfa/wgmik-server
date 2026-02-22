@@ -26,6 +26,22 @@ except ImportError:  # pragma: no cover - optional dependency
 router = APIRouter(prefix="/api", tags=["api"])
 
 
+def _dt_to_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _normalize_time_range(
+    start: Optional[datetime], end: Optional[datetime]
+) -> tuple[Optional[datetime], Optional[datetime]]:
+    start_utc = _dt_to_utc(start) if start is not None else None
+    end_utc = _dt_to_utc(end) if end is not None else None
+    if start_utc is not None and end_utc is not None and end_utc < start_utc:
+        raise HTTPException(status_code=400, detail="end must be >= start")
+    return start_utc, end_utc
+
+
 # --- Authentication & Users ---
 
 def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
@@ -1133,6 +1149,9 @@ def get_peer_usage(
     window: str = "daily",
     seconds: Optional[int] = None,
     interval: Optional[int] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    all_time: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1141,22 +1160,34 @@ def get_peer_usage(
     window=raw: last `seconds` worth of UsageSample deltas, labelled by time of day.
     interval: if set, group samples into buckets of `interval` seconds (e.g. 60 or 3600).
     """
+    start_utc, end_utc = _normalize_time_range(start, end)
+
     if window == "daily":
-        rows = (
-            db.query(UsageDaily)
-            .filter(UsageDaily.peer_id == peer_id)
-            .order_by(UsageDaily.day.asc())
-            .all()
-        )
+        q = db.query(UsageDaily).filter(UsageDaily.peer_id == peer_id)
+        if not all_time and (start_utc is not None or end_utc is not None):
+            if start_utc is not None:
+                q = q.filter(UsageDaily.day >= start_utc.date().strftime("%Y-%m-%d"))
+            if end_utc is not None:
+                q = q.filter(UsageDaily.day <= end_utc.date().strftime("%Y-%m-%d"))
+        rows = q.order_by(UsageDaily.day.asc()).all()
         return [UsagePointDTO(day=r.day, rx=r.rx, tx=r.tx) for r in rows]
 
     if window == "raw":
-        # Default to last hour if not specified
-        lookback = seconds if seconds and seconds > 0 else 3600
-        cutoff = datetime.utcnow() - timedelta(seconds=lookback)
+        now_utc = datetime.now(timezone.utc)
+        end_dt = end_utc or now_utc
+        if start_utc is not None:
+            cutoff = start_utc
+        else:
+            # Default to last hour if not specified
+            lookback = seconds if seconds and seconds > 0 else 3600
+            cutoff = end_dt - timedelta(seconds=lookback)
         samples = (
             db.query(UsageSample)
-            .filter(UsageSample.peer_id == peer_id, UsageSample.ts >= cutoff)
+            .filter(
+                UsageSample.peer_id == peer_id,
+                UsageSample.ts >= cutoff.replace(tzinfo=None),
+                UsageSample.ts <= end_dt.replace(tzinfo=None),
+            )
             .order_by(UsageSample.ts.asc())
             .all()
         )
@@ -1301,34 +1332,64 @@ class MonthlySummaryPointDTO(BaseModel):
 
 
 @router.get("/summary/month", response_model=List[MonthlySummaryPointDTO])
-def get_monthly_summary(days: int = 14, router_id: Optional[int] = None, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Aggregate total RX/TX per day for the last N days across selected peers."""
+def get_monthly_summary(
+    days: int = 14,
+    router_id: Optional[int] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    all_time: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Aggregate total RX/TX per day across selected peers.
+    - Default: last `days` days (filled with zeros like before).
+    - If `start`/`end` are provided: filter by day range (returns only days with data).
+    - If `all_time=true`: return all available days (returns only days with data).
+    """
+    start_utc, end_utc = _normalize_time_range(start, end)
+
+    base = (
+        db.query(
+            UsageDaily.day.label("day"),
+            func.coalesce(func.sum(UsageDaily.rx), 0).label("rx"),
+            func.coalesce(func.sum(UsageDaily.tx), 0).label("tx"),
+        )
+        .join(Peer, UsageDaily.peer_id == Peer.id)
+        .filter(Peer.selected == True)
+    )
+    if router_id is not None:
+        base = base.filter(Peer.router_id == router_id)
+
+    if all_time or start_utc is not None or end_utc is not None:
+        q = base
+        if start_utc is not None:
+            q = q.filter(UsageDaily.day >= start_utc.date().strftime("%Y-%m-%d"))
+        if end_utc is not None:
+            q = q.filter(UsageDaily.day <= end_utc.date().strftime("%Y-%m-%d"))
+        rows = q.group_by(UsageDaily.day).order_by(UsageDaily.day.asc()).all()
+        return [MonthlySummaryPointDTO(day=r.day, rx=int(r.rx or 0), tx=int(r.tx or 0)) for r in rows]
+
     try:
         days = int(days)
     except Exception:
         days = 14
     days = max(1, min(180, days))
     today = datetime.utcnow().date()
-    points: List[MonthlySummaryPointDTO] = []
-    for offset in range(days):
-        day = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
-        # Join through Peer -> Router so we can filter on selected peers
-        q = (
-            db.query(UsageDaily)
-            .join(Peer, UsageDaily.peer_id == Peer.id)
-            .join(Router, Peer.router_id == Router.id)
-            .filter(UsageDaily.day == day)
-            .filter(Peer.selected == True)
-        )
-        if router_id is not None:
-            q = q.filter(Peer.router_id == router_id)
-        rows = q.all()
-        total_rx = sum(r.rx for r in rows)
-        total_tx = sum(r.tx for r in rows)
-        points.append(MonthlySummaryPointDTO(day=day, rx=total_rx, tx=total_tx))
-    # Return ascending by day
-    points.sort(key=lambda p: p.day)
-    return points
+    day_keys = [(today - timedelta(days=o)).strftime("%Y-%m-%d") for o in range(days)]
+
+    rows = (
+        base.filter(UsageDaily.day.in_(day_keys))
+        .group_by(UsageDaily.day)
+        .order_by(UsageDaily.day.asc())
+        .all()
+    )
+    by_day = {r.day: (int(r.rx or 0), int(r.tx or 0)) for r in rows}
+    out: List[MonthlySummaryPointDTO] = []
+    for day in sorted(day_keys):
+        rx, tx = by_day.get(day, (0, 0))
+        out.append(MonthlySummaryPointDTO(day=day, rx=rx, tx=tx))
+    return out
 
 
 class PeerUsageSummaryDTO(BaseModel):
@@ -1338,21 +1399,39 @@ class PeerUsageSummaryDTO(BaseModel):
 
 
 @router.get("/summary/peers", response_model=List[PeerUsageSummaryDTO])
-def get_peers_summary(days: Optional[int] = None, seconds: Optional[int] = None, router_id: Optional[int] = None, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_peers_summary(
+    days: Optional[int] = None,
+    seconds: Optional[int] = None,
+    router_id: Optional[int] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    all_time: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
     Aggregate total RX/TX per peer for the specified window.
     - If `days` is provided (e.g. 1, 7, 30), aggregates UsageDaily.
     - If `seconds` is provided (e.g. 3600), aggregates raw UsageSample deltas.
     - If neither, defaults to days=1.
     """
+    start_utc, end_utc = _normalize_time_range(start, end)
     summary: dict[int, dict[str, int]] = {}  # peer_id -> {rx, tx}
 
     if seconds and seconds > 0:
         # RAW WINDOW (deltas from UsageSample)
-        seconds = max(60, min(7 * 24 * 3600, seconds))
+        seconds = max(60, min(7 * 24 * 3600, int(seconds)))
         now_utc = datetime.now(timezone.utc)
-        cutoff = now_utc - timedelta(seconds=seconds)
+        end_dt = end_utc or now_utc
+        if start_utc is not None:
+            cutoff = start_utc
+            span = (end_dt - cutoff).total_seconds()
+            if span > 7 * 24 * 3600:
+                raise HTTPException(status_code=400, detail="raw window max span is 7 days")
+        else:
+            cutoff = end_dt - timedelta(seconds=seconds)
         cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
         
         router_filter = f"AND p.router_id = {int(router_id)}" if router_id else ""
         
@@ -1366,6 +1445,7 @@ def get_peers_summary(days: Optional[int] = None, seconds: Optional[int] = None,
             FROM usage_samples u
             JOIN peers p ON u.peer_id = p.id
             WHERE u.ts >= :cutoff
+              AND u.ts <= :end
               AND p.selected = 1
               {router_filter}
         ),
@@ -1396,7 +1476,7 @@ def get_peers_summary(days: Optional[int] = None, seconds: Optional[int] = None,
         GROUP BY peer_id
         """)
 
-        result = db.execute(query, {"cutoff": cutoff_str})
+        result = db.execute(query, {"cutoff": cutoff_str, "end": end_str})
         for r in result:
              peer_id = r[0]
              s = summary.setdefault(peer_id, {"rx": 0, "tx": 0})
@@ -1405,25 +1485,31 @@ def get_peers_summary(days: Optional[int] = None, seconds: Optional[int] = None,
             
     else:
         # DAILY WINDOW (UsageDaily)
-        d = days if days and days > 0 else 1
-        d = max(1, min(180, d))
-        today = datetime.utcnow().date()
-        date_strs = [(today - timedelta(days=o)).strftime("%Y-%m-%d") for o in range(d)]
-        
         q = (
-            db.query(UsageDaily.peer_id, UsageDaily.rx, UsageDaily.tx)
+            db.query(
+                UsageDaily.peer_id.label("peer_id"),
+                func.coalesce(func.sum(UsageDaily.rx), 0).label("rx"),
+                func.coalesce(func.sum(UsageDaily.tx), 0).label("tx"),
+            )
             .join(Peer, UsageDaily.peer_id == Peer.id)
             .filter(Peer.selected == True)
-            .filter(UsageDaily.day.in_(date_strs))
         )
         if router_id is not None:
             q = q.filter(Peer.router_id == router_id)
-            
-        rows = q.all()
+        if not all_time:
+            if start_utc is not None:
+                q = q.filter(UsageDaily.day >= start_utc.date().strftime("%Y-%m-%d"))
+            if end_utc is not None:
+                q = q.filter(UsageDaily.day <= end_utc.date().strftime("%Y-%m-%d"))
+            if start_utc is None and end_utc is None:
+                d = days if days and days > 0 else 1
+                d = max(1, min(180, int(d)))
+                start_day = (datetime.utcnow().date() - timedelta(days=d - 1)).strftime("%Y-%m-%d")
+                q = q.filter(UsageDaily.day >= start_day)
+
+        rows = q.group_by(UsageDaily.peer_id).all()
         for r in rows:
-            s = summary.setdefault(r.peer_id, {"rx": 0, "tx": 0})
-            s["rx"] += r.rx
-            s["tx"] += r.tx
+            summary[int(r.peer_id)] = {"rx": int(r.rx or 0), "tx": int(r.tx or 0)}
 
     return [
         PeerUsageSummaryDTO(peer_id=pid, rx=vals["rx"], tx=vals["tx"])
@@ -1437,16 +1523,34 @@ class SummaryRawPointDTO(BaseModel):
 
 
 @router.get("/summary/raw", response_model=List[SummaryRawPointDTO])
-def get_summary_raw(seconds: int = 3600, router_id: Optional[int] = None, interval: Optional[int] = None, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Aggregate raw UsageSample deltas across selected peers for the last N seconds."""
+def get_summary_raw(
+    seconds: int = 3600,
+    router_id: Optional[int] = None,
+    interval: Optional[int] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Aggregate raw UsageSample deltas across selected peers for the last N seconds (or start/end)."""
+    start_utc, end_utc = _normalize_time_range(start, end)
     try:
         seconds = int(seconds)
     except Exception:
         seconds = 3600
     seconds = max(60, min(7 * 24 * 3600, seconds))
     now_utc = datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(seconds=seconds)
+    end_dt = end_utc or now_utc
+    if start_utc is not None:
+        cutoff = start_utc
+        span = (end_dt - cutoff).total_seconds()
+        if span > 7 * 24 * 3600:
+            raise HTTPException(status_code=400, detail="raw window max span is 7 days")
+        seconds = int(max(60, min(7 * 24 * 3600, span)))
+    else:
+        cutoff = end_dt - timedelta(seconds=seconds)
     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     interval = interval if interval and interval > 0 else 0
     if interval <= 0:
@@ -1474,6 +1578,7 @@ def get_summary_raw(seconds: int = 3600, router_id: Optional[int] = None, interv
         FROM usage_samples u
         JOIN peers p ON u.peer_id = p.id
         WHERE u.ts >= :cutoff
+          AND u.ts <= :end
           AND p.selected = 1
           {router_filter}
     ),
@@ -1505,7 +1610,7 @@ def get_summary_raw(seconds: int = 3600, router_id: Optional[int] = None, interv
     ORDER BY bucket
     """)
 
-    result = db.execute(query, {"cutoff": cutoff_str, "interval": interval})
+    result = db.execute(query, {"cutoff": cutoff_str, "end": end_str, "interval": interval})
     rows = result.fetchall()
 
     out: List[SummaryRawPointDTO] = []
@@ -1564,4 +1669,3 @@ def get_dashboard_metrics(db: Session = Depends(get_db)):
         disk_percent=60.0,
         uptime_seconds=3600
     )
-

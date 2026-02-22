@@ -227,11 +227,14 @@ export type PeerUsageSummaryDTO = {
 };
 export type PeerUsageSummary = PeerUsageSummaryDTO; // Alias
 
-export async function getPeersSummary(opts: { seconds?: number; days?: number; routerId?: number | null }): Promise<PeerUsageSummaryDTO[]> {
+export async function getPeersSummary(opts: { seconds?: number; days?: number; routerId?: number | null; start?: string; end?: string; allTime?: boolean }): Promise<PeerUsageSummaryDTO[]> {
   const params = new URLSearchParams();
   if (opts.seconds) params.set("seconds", String(opts.seconds));
   if (opts.days) params.set("days", String(opts.days));
   if (opts.routerId) params.set("router_id", String(opts.routerId));
+  if (opts.start) params.set("start", opts.start);
+  if (opts.end) params.set("end", opts.end);
+  if (opts.allTime) params.set("all_time", "true");
   const rows = await fetchJson(`/api/summary/peers?${params.toString()}`);
   return rows.map((r: any) => ({
     peer_id: r.peer_id,
@@ -249,32 +252,38 @@ export type SummaryRawPointDTO = {
 };
 export type SummaryRawPoint = SummaryRawPointDTO; // Alias
 
-export async function getSummaryRaw(seconds: number, routerId?: number | null, interval?: number): Promise<SummaryRawPointDTO[]> {
-  let url = `/api/summary/raw?seconds=${seconds}`;
-  if (routerId) url += `&router_id=${routerId}`;
-  if (interval && interval > 0) {
-    url += `&interval=${interval}`;
-  }
-  return fetchJson(url);
+export async function getSummaryRaw(seconds: number, routerId?: number | null, interval?: number, start?: string, end?: string): Promise<SummaryRawPointDTO[]> {
+  const params = new URLSearchParams({ seconds: String(seconds) });
+  if (routerId) params.set("router_id", String(routerId));
+  if (interval && interval > 0) params.set("interval", String(interval));
+  if (start) params.set("start", start);
+  if (end) params.set("end", end);
+  return fetchJson(`/api/summary/raw?${params.toString()}`);
 }
 
 // RESTORED: getMonthlySummary + MonthlySummaryPoint
 export type MonthlySummaryPoint = { day: string; rx: number; tx: number };
-export async function getMonthlySummary(days?: number, routerId?: number | null): Promise<MonthlySummaryPoint[]> {
+export async function getMonthlySummary(days?: number, routerId?: number | null, opts?: { start?: string; end?: string; allTime?: boolean }): Promise<MonthlySummaryPoint[]> {
   const params = new URLSearchParams();
   if (days && days > 0) params.set("days", String(days));
   if (routerId && routerId > 0) params.set("router_id", String(routerId));
+  if (opts?.start) params.set("start", opts.start);
+  if (opts?.end) params.set("end", opts.end);
+  if (opts?.allTime) params.set("all_time", "true");
   const q = params.toString();
   return fetchJson(`/api/summary/month${q ? `?${q}` : ""}`);
 }
 
 // RESTORED: getPeerUsage + UsagePoint
 export type UsagePoint = { day: string; rx: number; tx: number };
-export async function getPeerUsage(peerId: number, opts?: { window?: "daily" | "raw"; seconds?: number, interval?: number }): Promise<UsagePoint[]> {
+export async function getPeerUsage(peerId: number, opts?: { window?: "daily" | "raw"; seconds?: number, interval?: number; start?: string; end?: string; allTime?: boolean }): Promise<UsagePoint[]> {
   const window = opts?.window || "daily";
   const params = new URLSearchParams({ window });
   if (opts?.seconds && opts.seconds > 0) params.set("seconds", String(opts.seconds));
   if (opts?.interval && opts.interval > 0) params.set("interval", String(opts.interval));
+  if (opts?.start) params.set("start", opts.start);
+  if (opts?.end) params.set("end", opts.end);
+  if (opts?.allTime) params.set("all_time", "true");
   return fetchJson(`/api/peers/${peerId}/usage?${params.toString()}`);
 }
 

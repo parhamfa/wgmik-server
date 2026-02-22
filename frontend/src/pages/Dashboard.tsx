@@ -48,6 +48,9 @@ export default function Dashboard() {
   }));
   const [metrics, setMetrics] = React.useState<Metrics | null>(null);
   const [timezone, setTimezone] = React.useState<string>("UTC");
+  const [timeFrom, setTimeFrom] = React.useState<string>("");
+  const [timeTo, setTimeTo] = React.useState<string>("");
+  const [allTime, setAllTime] = React.useState<boolean>(false);
 
   // Settings Hook
   const { settings, update } = useAutoSaveSettings();
@@ -59,8 +62,21 @@ export default function Dashboard() {
   const refreshSec = settings?.dashboard_refresh_seconds ?? 30;
   const scopeValue = settings?.dashboard_scope_value ?? 14;
   const scopeUnit = (settings?.dashboard_scope_unit as ScopeUnit) ?? "days";
+  const toIso = React.useCallback((v: string) => {
+    if (!v) return undefined;
+    const d = new Date(v);
+    if (!Number.isFinite(d.getTime())) return undefined;
+    return d.toISOString();
+  }, []);
+  const startIso = toIso(timeFrom);
+  const endIso = toIso(timeTo);
+  const timeFrameActive = allTime || !!startIso || !!endIso;
   // User asked for "status filter and sort", not text search. I'll keep text search local.
   const [localFilterText, setLocalFilterText] = React.useState("");
+
+  React.useEffect(() => {
+    if (scopeUnit !== "days" && allTime) setAllTime(false);
+  }, [scopeUnit, allTime]);
 
   const filterStatus = (settings?.dashboard_filter_status as "all" | "online" | "offline" | "enabled" | "disabled") ?? "all";
   const sortBy = (settings?.dashboard_sort_by as "name" | "last_seen" | "created" | "usage") ?? "created";
@@ -232,36 +248,70 @@ export default function Dashboard() {
 
   const loadMonthly = React.useCallback(async () => {
     try {
-      const rows = await getMonthlySummary(scopeUnit === "days" ? scopeValue : undefined, activeRouterId);
+      if (scopeUnit !== "days") { setMonthly([]); return; }
+      if (allTime) {
+        const rows = await getMonthlySummary(undefined, activeRouterId, { allTime: true });
+        setMonthly(rows);
+        return;
+      }
+      if (startIso || endIso) {
+        const rows = await getMonthlySummary(undefined, activeRouterId, { start: startIso, end: endIso });
+        setMonthly(rows);
+        return;
+      }
+      const rows = await getMonthlySummary(scopeValue, activeRouterId);
       setMonthly(rows);
     } catch {
       setMonthly([]);
     }
-  }, [scopeUnit, scopeValue, activeRouterId]);
+  }, [scopeUnit, scopeValue, activeRouterId, allTime, startIso, endIso]);
 
   const loadRaw = React.useCallback(async () => {
     try {
       if (scopeUnit === "days") { setRaw([]); return; }
-      const seconds = scopeUnit === "minutes"
+      const baseSeconds = scopeUnit === "minutes"
         ? Math.max(1, scopeValue) * 60
         : Math.max(1, scopeValue) * 3600;
       const interval = scopeUnit === "minutes" ? 60 : 3600;
-      const rows = await getSummaryRaw(seconds, activeRouterId, interval);
+      const seconds = (() => {
+        if (!startIso) return baseSeconds;
+        const startMs = new Date(startIso).getTime();
+        const endMs = new Date(endIso || new Date().toISOString()).getTime();
+        if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return baseSeconds;
+        return Math.max(60, Math.floor((endMs - startMs) / 1000));
+      })();
+      const rows = await getSummaryRaw(seconds, activeRouterId, interval, startIso, endIso);
       setRaw(rows);
     } catch {
       setRaw([]);
     }
-  }, [scopeUnit, scopeValue, activeRouterId]);
+  }, [scopeUnit, scopeValue, activeRouterId, startIso, endIso]);
 
   const loadUsageMap = React.useCallback(async () => {
     try {
       const opts: any = { routerId: activeRouterId };
       if (scopeUnit === "days") {
-        opts.days = scopeValue;
+        if (allTime) {
+          opts.allTime = true;
+        } else if (startIso || endIso) {
+          opts.start = startIso;
+          opts.end = endIso;
+        } else {
+          opts.days = scopeValue;
+        }
       } else {
-        opts.seconds = scopeUnit === "minutes"
+        const baseSeconds = scopeUnit === "minutes"
           ? Math.max(1, scopeValue) * 60
           : Math.max(1, scopeValue) * 3600;
+        opts.seconds = (() => {
+          if (!startIso) return baseSeconds;
+          const startMs = new Date(startIso).getTime();
+          const endMs = new Date(endIso || new Date().toISOString()).getTime();
+          if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return baseSeconds;
+          return Math.max(60, Math.floor((endMs - startMs) / 1000));
+        })();
+        opts.start = startIso;
+        opts.end = endIso;
       }
       const sums = await getPeersSummary(opts);
       const m: Record<number, { rx: number; tx: number }> = {};
@@ -270,7 +320,7 @@ export default function Dashboard() {
     } catch {
       setPeerUsageMap({});
     }
-  }, [scopeUnit, scopeValue, activeRouterId]);
+  }, [scopeUnit, scopeValue, activeRouterId, allTime, startIso, endIso]);
 
   const loadMetrics = React.useCallback(async () => {
     try {
@@ -399,11 +449,11 @@ export default function Dashboard() {
       <h1 className="text-xl font-semibold text-gray-900 dark:text-gray-100 mb-4">Overview</h1>
       <div className="mx-auto my-12 md:my-16 w-full max-w-[960px] rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 p-6 grid gap-6">
         <div className="p-0">
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-2 gap-2">
-            <div className="text-sm text-gray-700 dark:text-gray-200">Usage</div>
-            <div className="flex flex-wrap items-center gap-3 text-xs text-gray-600 dark:text-gray-300">
-              <div className="flex items-center gap-2">
-                <span>Auto refresh</span>
+	          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-2 gap-2">
+	            <div className="text-sm text-gray-700 dark:text-gray-200">Usage</div>
+	            <div className="flex flex-wrap items-center gap-3 text-xs text-gray-600 dark:text-gray-300">
+	              <div className="flex items-center gap-2">
+	                <span>Auto refresh</span>
                 <input
                   type="number"
                   min={5}
@@ -413,27 +463,66 @@ export default function Dashboard() {
                 />
                 <span>s</span>
               </div>
-              <div className="flex items-center gap-2">
-                <span>Last</span>
-                <input
-                  type="number"
-                  min={1}
-                  value={scopeValue}
-                  onChange={(e) => update({ dashboard_scope_value: Math.max(1, Number(e.target.value) || 1) })}
-                  className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                />
-                <select
-                  value={scopeUnit}
-                  onChange={(e) => update({ dashboard_scope_unit: e.target.value })}
-                  className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
-                >
-                  <option value="minutes">minutes</option>
-                  <option value="hours">hours</option>
-                  <option value="days">days</option>
-                </select>
-              </div>
-            </div>
-          </div>
+	              <div className="flex items-center gap-2">
+	                <span>Last</span>
+	                <input
+	                  type="number"
+	                  min={1}
+	                  value={scopeValue}
+	                  onChange={(e) => update({ dashboard_scope_value: Math.max(1, Number(e.target.value) || 1) })}
+	                  className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+	                />
+	                <select
+	                  value={scopeUnit}
+	                  onChange={(e) => update({ dashboard_scope_unit: e.target.value })}
+	                  className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
+	                >
+	                  <option value="minutes">minutes</option>
+	                  <option value="hours">hours</option>
+	                  <option value="days">days</option>
+	                </select>
+	              </div>
+	              <div className="w-full flex flex-wrap items-center gap-2">
+	                <span>Time frame</span>
+	                <input
+	                  type="datetime-local"
+	                  value={timeFrom}
+	                  onChange={(e) => setTimeFrom(e.target.value)}
+	                  disabled={allTime}
+	                  className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
+	                />
+	                <span>to</span>
+	                <input
+	                  type="datetime-local"
+	                  value={timeTo}
+	                  onChange={(e) => setTimeTo(e.target.value)}
+	                  disabled={allTime}
+	                  className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
+	                />
+	                <label className="inline-flex items-center gap-2">
+	                  <input
+	                    type="checkbox"
+	                    checked={allTime}
+	                    onChange={(e) => {
+	                      const next = e.target.checked;
+	                      setAllTime(next);
+	                      if (next) { setTimeFrom(""); setTimeTo(""); }
+	                    }}
+	                    disabled={scopeUnit !== "days"}
+	                  />
+	                  <span className={scopeUnit !== "days" ? "opacity-60" : ""}>All time</span>
+	                </label>
+	                <button
+	                  type="button"
+	                  onClick={() => { setAllTime(false); setTimeFrom(""); setTimeTo(""); }}
+	                  disabled={!timeFrameActive}
+	                  className="rounded-full border border-gray-200 dark:border-gray-800 px-3 py-1 text-xs bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
+	                >
+	                  Clear
+	                </button>
+	              </div>
+	            </div>
+	          </div>
           <div className="h-56">
             {(scopeUnit === "days" ? monthly.length === 0 : raw.length === 0) ? (
               <div className="h-full flex items-center justify-center text-sm text-gray-500 dark:text-gray-400">No usage data yet</div>
@@ -866,5 +955,3 @@ export default function Dashboard() {
     </div >
   );
 }
-
-
