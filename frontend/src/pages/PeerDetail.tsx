@@ -1,7 +1,8 @@
 import React from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
-import { listSavedPeers, getPeerUsage, listRouters, routerPeers, patchPeer, getPeerQuota, patchPeerQuota, resetPeerMetrics, deletePeer, reconcilePeer, getPeerActions, type PeerAction, getSettings, type SavedPeer, type UsagePoint, type Router, type PeerView, type Quota } from "../api";
+import QRCode from "react-qr-code";
+import { listSavedPeers, getPeerUsage, listRouters, routerPeers, routerInterfaceDetail, patchPeer, getPeerQuota, patchPeerQuota, resetPeerMetrics, deletePeer, reconcilePeer, getPeerActions, type PeerAction, getSettings, type SavedPeer, type UsagePoint, type Router, type PeerView, type Quota, type WGInterfaceConfig } from "../api";
 import { useAutoSaveSettings, type ScopeUnit } from "../useAutoSaveSettings";
 
 function Card({ className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) {
@@ -45,6 +46,8 @@ export default function PeerDetail() {
   const [actionsErr, setActionsErr] = React.useState("");
   const [actionsLimit, setActionsLimit] = React.useState<number>(3);
   const [actionsHasMore, setActionsHasMore] = React.useState<boolean>(false);
+  const [router, setRouter] = React.useState<Router | null>(null);
+  const [ifaceCfg, setIfaceCfg] = React.useState<WGInterfaceConfig | null>(null);
   const [quota, setQuota] = React.useState<Quota | null>(null);
   const [quotaErr, setQuotaErr] = React.useState("");
   const [quotaSaveState, setQuotaSaveState] = React.useState<"idle" | "dirty" | "saving" | "saved" | "error">("idle");
@@ -57,6 +60,15 @@ export default function PeerDetail() {
   const [timeFrom, setTimeFrom] = React.useState<string>("");
   const [timeTo, setTimeTo] = React.useState<string>("");
   const [allTime, setAllTime] = React.useState<boolean>(false);
+
+  const [clientCfg, setClientCfg] = React.useState(() => ({
+    privateKey: "",
+    dns: "8.8.8.8, 1.1.1.1",
+    mtu: "1280",
+    persistentKeepalive: "25",
+    allowedIps: "0.0.0.0/0, ::/0",
+  }));
+  const [showPrivateKey, setShowPrivateKey] = React.useState(false);
 
   const [quotaDraft, setQuotaDraft] = React.useState<{ limitGb: number; valid_from: string; valid_until: string }>({
     limitGb: 0,
@@ -81,21 +93,34 @@ export default function PeerDetail() {
     while (x >= 1024 && u < units.length - 1) { x /= 1024; u++; }
     return `${x.toFixed(x >= 100 ? 0 : x >= 10 ? 1 : 2)} ${units[u]} `;
   };
-  React.useEffect(() => {
-    (async () => {
-      try {
-        const peers = await listSavedPeers();
-        const p = peers.find(x => x.id === peerId) || null;
-        setPeer(p);
-        // fetch router name for display
-        try {
-          const routers: Router[] = await listRouters();
-          const r = routers.find(r => r.id === (p?.router_id || 0));
-          setRouterName(r?.name || "");
-        } catch { }
-      } catch { setPeer(null); }
-    })();
-  }, [peerId]);
+	  React.useEffect(() => {
+	    (async () => {
+	      try {
+	        const peers = await listSavedPeers();
+	        const p = peers.find(x => x.id === peerId) || null;
+	        setPeer(p);
+	        // fetch router name for display
+	        try {
+	          const routers: Router[] = await listRouters();
+	          const r = routers.find(r => r.id === (p?.router_id || 0));
+	          setRouterName(r?.name || "");
+	          setRouter(r || null);
+	        } catch { }
+	      } catch { setPeer(null); }
+	    })();
+	  }, [peerId]);
+
+	  React.useEffect(() => {
+	    if (!peer) { setIfaceCfg(null); return; }
+	    (async () => {
+	      try {
+	        const cfg = await routerInterfaceDetail(peer.router_id, peer.interface);
+	        setIfaceCfg(cfg);
+	      } catch {
+	        setIfaceCfg(null);
+	      }
+	    })();
+	  }, [peer?.router_id, peer?.interface]);
 
   const refreshPeer = React.useCallback(async () => {
     const peers = await listSavedPeers();
@@ -111,6 +136,57 @@ export default function PeerDetail() {
   const scopeUnit = (settings?.peer_default_scope_unit as ScopeUnit) ?? "days";
   const timezone = settings?.timezone ?? "UTC";
   const showKindPills = settings?.show_kind_pills ?? true;
+
+  const clientConfig = React.useMemo(() => {
+    if (!peer) return "";
+    const priv = (clientCfg.privateKey || "").trim();
+    const addr = (peer.allowed_address || "").trim();
+    const dns = (clientCfg.dns || "").trim();
+    const mtu = (clientCfg.mtu || "").trim();
+    const keepalive = (clientCfg.persistentKeepalive || "").trim();
+    const allowedIps = (clientCfg.allowedIps || "").trim();
+
+    const serverPublicKey = (ifaceCfg?.public_key || "").trim() || "SERVER_PUBLIC_KEY";
+    const endpointHost = (ifaceCfg?.public_host || "").trim() || (router?.host || "").trim();
+    const endpointPort = ifaceCfg?.listen_port || 51820;
+    const endpoint = endpointHost ? `${endpointHost}:${endpointPort}` : "HOST:PORT";
+
+    const lines = [
+      "[Interface]",
+      `PrivateKey = ${priv || "YOUR_PRIVATE_KEY"}`,
+      ...(addr ? [`Address = ${addr}`] : []),
+      ...(dns ? [`DNS = ${dns}`] : []),
+      ...(() => {
+        if (!mtu) return [];
+        const n = Number(mtu);
+        if (!Number.isFinite(n) || n <= 0) return [];
+        return [`MTU = ${Math.floor(n)}`];
+      })(),
+      "",
+      "[Peer]",
+      `PublicKey = ${serverPublicKey}`,
+      `Endpoint = ${endpoint}`,
+      ...(allowedIps ? [`AllowedIPs = ${allowedIps}`] : []),
+      ...(() => {
+        if (!keepalive) return [];
+        const n = Number(keepalive);
+        if (!Number.isFinite(n) || n <= 0) return [];
+        return [`PersistentKeepalive = ${Math.floor(n)}`];
+      })(),
+    ];
+    return lines.join("\n");
+  }, [peer?.id, peer?.allowed_address, clientCfg.privateKey, clientCfg.dns, clientCfg.mtu, clientCfg.persistentKeepalive, clientCfg.allowedIps, ifaceCfg?.public_key, ifaceCfg?.public_host, ifaceCfg?.listen_port, router?.host]);
+
+  const isValidWgPrivateKey = React.useMemo(() => {
+    const pk = (clientCfg.privateKey || "").trim();
+    if (!pk) return false;
+    try {
+      const bin = atob(pk);
+      return bin.length === 32;
+    } catch {
+      return false;
+    }
+  }, [clientCfg.privateKey]);
 
   const toIso = React.useCallback((v: string) => {
     if (!v) return undefined;
@@ -853,11 +929,11 @@ export default function PeerDetail() {
               </div>
               {quotaErr && <div className="text-sm text-red-600">{quotaErr}</div>}
             </div>
-            {/* Details */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
-              <div className="grid grid-cols-2 gap-x-4 gap-y-2">
-                <div className="text-gray-500 dark:text-gray-400">Interface</div>
-                <LockedField value={peer.interface} />
+	            {/* Details */}
+	            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
+	              <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+	                <div className="text-gray-500 dark:text-gray-400">Interface</div>
+	                <LockedField value={peer.interface} />
                 <div className="text-gray-500 dark:text-gray-400">Router</div>
                 <LockedField value={routerName || `#${peer.router_id} `} />
                 <div className="text-gray-500 dark:text-gray-400">Public key</div>
@@ -874,15 +950,120 @@ export default function PeerDetail() {
                 <LockedField value={peer.disabled ? 'Yes' : 'No'} />
                 <div className="text-gray-500 dark:text-gray-400">Monthly download (TX)</div>
                 <LockedField value={fmtBytes(usage.reduce((a, b) => a + (b.tx || 0), 0))} />
-                <div className="text-gray-500 dark:text-gray-400">Monthly upload (RX)</div>
-                <LockedField value={fmtBytes(usage.reduce((a, b) => a + (b.rx || 0), 0))} />
-              </div>
-            </div>
+	                <div className="text-gray-500 dark:text-gray-400">Monthly upload (RX)</div>
+	                <LockedField value={fmtBytes(usage.reduce((a, b) => a + (b.rx || 0), 0))} />
+	              </div>
+	            </div>
 
-            {/* Activity log */}
-            <div className="grid gap-3 mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
-              <div className="flex items-center justify-between">
-                <div className="text-sm text-gray-700 dark:text-gray-200">Activity log</div>
+	            {/* Client config */}
+	            <div className="grid gap-3 mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
+	              <div className="flex items-center justify-between">
+	                <div className="text-sm text-gray-700 dark:text-gray-200">Client config</div>
+	                <button
+	                  type="button"
+	                  onClick={async () => {
+	                    try {
+	                      await navigator.clipboard.writeText(clientConfig);
+	                    } catch {
+	                      // ignore
+	                    }
+	                  }}
+	                  className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+	                >
+	                  Copy
+	                </button>
+	              </div>
+	              <div className="text-xs text-gray-500 dark:text-gray-400">
+	                Private key is not stored by the server. Paste your client private key to generate a working QR code.
+	              </div>
+	              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+	                <div className="grid gap-3">
+	                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+	                    <div className="grid gap-1">
+	                      <div className="text-gray-500 dark:text-gray-400">Private key</div>
+	                      <div className="flex items-center gap-2">
+	                        <input
+	                          type={showPrivateKey ? "text" : "password"}
+	                          value={clientCfg.privateKey}
+	                          onChange={(e) => setClientCfg((c) => ({ ...c, privateKey: e.target.value }))}
+	                          placeholder="base64 32-byte key"
+	                          className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 font-mono"
+	                        />
+	                        <button
+	                          type="button"
+	                          onClick={() => setShowPrivateKey((s) => !s)}
+	                          className="rounded-full border border-gray-200 dark:border-gray-800 px-3 py-2 text-xs bg-white dark:bg-gray-950"
+	                        >
+	                          {showPrivateKey ? "Hide" : "Show"}
+	                        </button>
+	                      </div>
+	                      {(clientCfg.privateKey || "").trim() && !isValidWgPrivateKey && (
+	                        <div className="text-xs text-rose-600">Private key must be base64 (32 bytes).</div>
+	                      )}
+	                    </div>
+	                    <div className="grid gap-1">
+	                      <div className="text-gray-500 dark:text-gray-400">DNS (optional)</div>
+	                      <input
+	                        type="text"
+	                        value={clientCfg.dns}
+	                        onChange={(e) => setClientCfg((c) => ({ ...c, dns: e.target.value }))}
+	                        className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+	                      />
+	                    </div>
+	                    <div className="grid gap-1">
+	                      <div className="text-gray-500 dark:text-gray-400">MTU (optional)</div>
+	                      <input
+	                        type="text"
+	                        value={clientCfg.mtu}
+	                        onChange={(e) => setClientCfg((c) => ({ ...c, mtu: e.target.value }))}
+	                        className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+	                      />
+	                    </div>
+	                    <div className="grid gap-1">
+	                      <div className="text-gray-500 dark:text-gray-400">Keepalive (optional)</div>
+	                      <input
+	                        type="text"
+	                        value={clientCfg.persistentKeepalive}
+	                        onChange={(e) => setClientCfg((c) => ({ ...c, persistentKeepalive: e.target.value }))}
+	                        className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+	                      />
+	                    </div>
+	                    <div className="grid gap-1 md:col-span-2">
+	                      <div className="text-gray-500 dark:text-gray-400">Allowed IPs (optional)</div>
+	                      <input
+	                        type="text"
+	                        value={clientCfg.allowedIps}
+	                        onChange={(e) => setClientCfg((c) => ({ ...c, allowedIps: e.target.value }))}
+	                        className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+	                      />
+	                    </div>
+	                  </div>
+	                  <div className="grid gap-1">
+	                    <div className="text-gray-500 dark:text-gray-400 text-sm">Config</div>
+	                    <textarea
+	                      readOnly
+	                      value={clientConfig}
+	                      rows={12}
+	                      className="w-full rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 px-3 py-2 text-xs font-mono text-gray-900 dark:text-gray-100 focus:outline-none"
+	                    />
+	                  </div>
+	                </div>
+	                <div className="rounded-3xl ring-1 ring-gray-200 dark:ring-gray-800 bg-white dark:bg-gray-950 p-4 flex items-center justify-center min-h-[240px]">
+	                  {isValidWgPrivateKey ? (
+	                    <QRCode value={clientConfig} size={220} />
+	                  ) : (
+	                    <div className="text-sm text-gray-500 dark:text-gray-400 text-center">
+	                      Paste a valid private key to render a QR code.
+	                    </div>
+	                  )}
+	                </div>
+	              </div>
+	            </div>
+
+	            {/* Activity log */}
+	            <div className="grid gap-3 mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
+	              <div className="flex items-center justify-between">
+	                <div className="text-sm text-gray-700 dark:text-gray-200">Activity log</div>
                 <div className="flex items-center gap-2">
                   <div className="text-xs text-gray-500 dark:text-gray-400">Showing {actionsLimit}</div>
                   {actionsHasMore && actionsLimit < 200 && (
