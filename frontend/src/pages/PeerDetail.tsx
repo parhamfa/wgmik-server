@@ -2,7 +2,7 @@ import React from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import QRCode from "react-qr-code";
-import { listSavedPeers, getPeerUsage, listRouters, routerPeers, routerInterfaceDetail, patchPeer, getPeerQuota, patchPeerQuota, resetPeerMetrics, deletePeer, reconcilePeer, getPeerActions, type PeerAction, getSettings, type SavedPeer, type UsagePoint, type Router, type PeerView, type Quota, type WGInterfaceConfig } from "../api";
+import { listSavedPeers, getPeerUsage, listRouters, routerPeers, routerInterfaceDetail, getPeerClientPrivateKey, patchPeer, getPeerQuota, patchPeerQuota, resetPeerMetrics, deletePeer, reconcilePeer, getPeerActions, type PeerAction, getSettings, type SavedPeer, type UsagePoint, type Router, type PeerView, type Quota, type WGInterfaceConfig } from "../api";
 import { useAutoSaveSettings, type ScopeUnit } from "../useAutoSaveSettings";
 
 function Card({ className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) {
@@ -121,6 +121,22 @@ export default function PeerDetail() {
 	      }
 	    })();
 	  }, [peer?.router_id, peer?.interface]);
+
+	  React.useEffect(() => {
+	    if (!peerId) return;
+	    (async () => {
+	      try {
+	        const res = await getPeerClientPrivateKey(peerId);
+	        if (res?.private_key && !(clientCfg.privateKey || "").trim()) {
+	          setClientCfg((c) => ({ ...c, privateKey: res.private_key || "" }));
+	        }
+	      } catch {
+	        // ignore
+	      }
+	    })();
+	    // Intentionally ignore clientCfg.privateKey in deps: we only want to auto-fill once if empty.
+	    // eslint-disable-next-line react-hooks/exhaustive-deps
+	  }, [peerId]);
 
   const refreshPeer = React.useCallback(async () => {
     const peers = await listSavedPeers();
@@ -974,7 +990,7 @@ export default function PeerDetail() {
 	                </button>
 	              </div>
 	              <div className="text-xs text-gray-500 dark:text-gray-400">
-	                Private key is not stored by the server. Paste your client private key to generate a working QR code.
+	                If this peer was created via the panel, the client private key may be stored encrypted and auto-filled here.
 	              </div>
 	              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
 	                <div className="grid gap-3">

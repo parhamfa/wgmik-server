@@ -16,6 +16,7 @@ import traceback
 from ipaddress import ip_network
 import os
 from zoneinfo import ZoneInfo
+import base64
 
 try:
     import psutil  # type: ignore
@@ -666,6 +667,15 @@ class PeerCreateRouterDTO(BaseModel):
     public_key: str
     allowed_address: str
     comment: Optional[str] = ""
+    private_key: Optional[str] = None
+
+
+def _is_valid_wg_private_key_b64(s: str) -> bool:
+    try:
+        raw = base64.b64decode(s.encode("utf-8"), validate=True)
+        return len(raw) == 32
+    except Exception:
+        return False
 
 
 @router.post("/routers/{router_id}/peers/add", response_model=PeerListDTO)
@@ -737,7 +747,77 @@ def create_router_peer(router_id: int, dto: PeerCreateRouterDTO, db: Session = D
     db.add(row)
     db.commit()
     db.refresh(row)
+
+    # Optional: store client private key encrypted in DB (RouterOS doesn't store peer private keys).
+    if dto.private_key is not None:
+        pk = dto.private_key.strip()
+        if pk == "":
+            kv = db.get(SettingsKV, f"peer_private_key:{row.id}")
+            if kv:
+                db.delete(kv)
+                db.commit()
+        else:
+            if not _is_valid_wg_private_key_b64(pk):
+                raise HTTPException(status_code=400, detail="invalid private_key (must be base64 32 bytes)")
+            box = SecretBox(settings.secret_key)
+            token = box.encrypt(pk)
+            kv = db.get(SettingsKV, f"peer_private_key:{row.id}") or SettingsKV(key=f"peer_private_key:{row.id}", value="")
+            kv.value = token
+            db.add(kv)
+            db.commit()
     return row
+
+
+class PeerPrivateKeyDTO(BaseModel):
+    private_key: Optional[str] = None
+
+
+@router.get("/peers/{peer_id}/client_private_key", response_model=PeerPrivateKeyDTO)
+def get_peer_client_private_key(peer_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    row = db.get(Peer, peer_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="peer not found")
+    kv = db.get(SettingsKV, f"peer_private_key:{peer_id}")
+    if not kv or not (kv.value or "").strip():
+        return PeerPrivateKeyDTO(private_key=None)
+    box = SecretBox(settings.secret_key)
+    dec = box.decrypt(kv.value)
+    return PeerPrivateKeyDTO(private_key=dec)
+
+
+class PeerPrivateKeyUpdateDTO(BaseModel):
+    private_key: Optional[str] = None  # set "" to clear
+
+
+@router.patch("/peers/{peer_id}/client_private_key", response_model=PeerPrivateKeyDTO)
+def patch_peer_client_private_key(peer_id: int, dto: PeerPrivateKeyUpdateDTO, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    row = db.get(Peer, peer_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="peer not found")
+    if dto.private_key is None:
+        kv = db.get(SettingsKV, f"peer_private_key:{peer_id}")
+        if not kv:
+            return PeerPrivateKeyDTO(private_key=None)
+        box = SecretBox(settings.secret_key)
+        return PeerPrivateKeyDTO(private_key=box.decrypt(kv.value))
+
+    pk = dto.private_key.strip()
+    if pk == "":
+        kv = db.get(SettingsKV, f"peer_private_key:{peer_id}")
+        if kv:
+            db.delete(kv)
+            db.commit()
+        return PeerPrivateKeyDTO(private_key=None)
+
+    if not _is_valid_wg_private_key_b64(pk):
+        raise HTTPException(status_code=400, detail="invalid private_key (must be base64 32 bytes)")
+    box = SecretBox(settings.secret_key)
+    token = box.encrypt(pk)
+    kv = db.get(SettingsKV, f"peer_private_key:{peer_id}") or SettingsKV(key=f"peer_private_key:{peer_id}", value="")
+    kv.value = token
+    db.add(kv)
+    db.commit()
+    return PeerPrivateKeyDTO(private_key=pk)
 
 
 @router.post("/routers/{router_id}/test")
@@ -949,6 +1029,11 @@ def delete_peer(peer_id: int, skip_router: bool = False, db: Session = Depends(g
             # Don't lie: if router delete failed, keep DB record.
             raise HTTPException(status_code=502, detail=f"router delete failed: {e}")
             
+    # Remove any stored client secret material for this peer.
+    kv = db.get(SettingsKV, f"peer_private_key:{peer_id}")
+    if kv:
+        db.delete(kv)
+
     db.delete(row)
     db.commit()
     return {"ok": True, "deleted_peer_id": peer_id, "router_deleted": router_deleted}

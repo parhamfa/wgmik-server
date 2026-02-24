@@ -317,6 +317,7 @@ export type PeerCreateRouterDTO = {
   comment: string;
   public_key: string;
   allowed_address: string;
+  private_key?: string;
   preshared_key?: string;
   disabled?: boolean;
 };
@@ -329,6 +330,10 @@ export async function createPeerOnRouter(routerId: number, dto: PeerCreateRouter
   });
 }
 export const createRouterPeer = createPeerOnRouter; // Alias
+
+export async function getPeerClientPrivateKey(peerId: number): Promise<{ private_key: string | null }> {
+  return fetchJson(`/api/peers/${peerId}/client_private_key`);
+}
 
 export type PeerImportItem = { interface: string; public_key: string; selected: boolean };
 export async function importPeers(routerId: number, items: PeerImportItem[]) {

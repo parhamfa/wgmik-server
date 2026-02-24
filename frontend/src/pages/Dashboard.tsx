@@ -851,6 +851,7 @@ export default function Dashboard() {
                           interface: form.interface || "wgmik",
                           name: form.name.trim(),
                           public_key: form.publicKey,
+                          private_key: (form.privateKey || "").trim(),
                           allowed_address: form.allowed.trim(),
                           comment: "",
                         });
@@ -874,7 +875,7 @@ export default function Dashboard() {
                   </button>
                 </div>
                 {addErr && <div className="text-sm text-red-600">{addErr}</div>}
-                <div className="text-xs text-gray-500 dark:text-gray-400">Note: Save creates the peer on RouterOS and stores it in the DB. Private key stays client-side.</div>
+                <div className="text-xs text-gray-500 dark:text-gray-400">Note: Save creates the peer on RouterOS and stores it in the DB. Client private key is stored encrypted so you can see it later.</div>
               </div>
               <div className="grid gap-3">
                 <div className="text-sm text-gray-700 dark:text-gray-200">Client config (QR)</div>
