@@ -195,6 +195,28 @@ class RouterOSApiClient(RouterOSClient):
             except Exception:
                 pass
 
+    def get_wireguard_peer_private_key(self, interface: str, ros_id: str) -> Optional[str]:
+        api = self._conn()
+        try:
+            # Best-effort: list rows and match by .id. Some ROS versions may not return private-key unless requested.
+            try:
+                rows = api(cmd="/interface/wireguard/peers/print", proplist=".id,interface,private-key")
+            except Exception:
+                rows = api(cmd="/interface/wireguard/peers/print")
+            for row in rows or []:
+                if (row.get(".id") or "") != ros_id:
+                    continue
+                if (row.get("interface") or "") != interface:
+                    continue
+                pk = (row.get("private-key") or "").strip()
+                return pk or None
+            return None
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
     def get_primary_ipv4(self) -> str:
         """Return a best-effort primary IPv4 address from /ip/address."""
         api = self._conn()

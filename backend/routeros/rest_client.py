@@ -213,3 +213,27 @@ class RouterOSRestClient(RouterOSClient):
         # RouterOS REST remove endpoint:
         #   POST /rest/interface/wireguard/peers/remove  {"numbers":"*53"}
         self._request("POST", "/interface/wireguard/peers/remove", json={"numbers": ros_id})
+
+    def get_wireguard_peer_private_key(self, interface: str, ros_id: str) -> Optional[str]:
+        # Try item endpoint first (fast path). RouterOS uses ids like "*3".
+        try:
+            row = self._get(f"/interface/wireguard/peers/{ros_id}")
+            if isinstance(row, dict):
+                pk = (row.get("private-key") or "").strip()
+                if pk:
+                    return pk
+        except Exception:
+            pass
+
+        # Fallback: list and match by .id (some versions may not allow item endpoint).
+        try:
+            rows = self._get("/interface/wireguard/peers")
+            if isinstance(rows, list):
+                for r in rows:
+                    if (r.get(".id") or "") == ros_id and (r.get("interface") or "") == interface:
+                        pk = (r.get("private-key") or "").strip()
+                        if pk:
+                            return pk
+        except Exception:
+            pass
+        return None

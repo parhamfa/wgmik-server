@@ -50,6 +50,10 @@ class RouterOSClient:
         """Remove a WireGuard peer by RouterOS internal .id."""
         raise NotImplementedError
 
+    def get_wireguard_peer_private_key(self, interface: str, ros_id: str) -> Optional[str]:
+        """Best-effort read of a peer's private-key from RouterOS (may be blank/unavailable)."""
+        raise NotImplementedError
+
     def get_wireguard_interface(self, interface: str) -> WGInterfaceConfig:
         """Return config for a single WireGuard interface (public key, listen port, etc.)."""
         raise NotImplementedError

@@ -779,11 +779,30 @@ def get_peer_client_private_key(peer_id: int, db: Session = Depends(get_db), cur
     if not row:
         raise HTTPException(status_code=404, detail="peer not found")
     kv = db.get(SettingsKV, f"peer_private_key:{peer_id}")
-    if not kv or not (kv.value or "").strip():
-        return PeerPrivateKeyDTO(private_key=None)
-    box = SecretBox(settings.secret_key)
-    dec = box.decrypt(kv.value)
-    return PeerPrivateKeyDTO(private_key=dec)
+    if kv and (kv.value or "").strip():
+        box = SecretBox(settings.secret_key)
+        dec = box.decrypt(kv.value)
+        if dec:
+            return PeerPrivateKeyDTO(private_key=dec)
+
+    # Fallback: if RouterOS has a private-key stored for this peer, read it and cache encrypted in DB.
+    router = db.get(Router, row.router_id) if row.router_id else None
+    if router and row.ros_id:
+        try:
+            client = make_client(router)
+            pk = client.get_wireguard_peer_private_key(row.interface, row.ros_id)
+            if pk:
+                box = SecretBox(settings.secret_key)
+                token = box.encrypt(pk)
+                kv2 = db.get(SettingsKV, f"peer_private_key:{peer_id}") or SettingsKV(key=f"peer_private_key:{peer_id}", value="")
+                kv2.value = token
+                db.add(kv2)
+                db.commit()
+                return PeerPrivateKeyDTO(private_key=pk)
+        except Exception:
+            pass
+
+    return PeerPrivateKeyDTO(private_key=None)
 
 
 class PeerPrivateKeyUpdateDTO(BaseModel):
