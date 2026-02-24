@@ -725,6 +725,7 @@ def create_router_peer(router_id: int, dto: PeerCreateRouterDTO, db: Session = D
             ros_id = client.add_wireguard_peer(
                 interface=dto.interface,
                 public_key=dto.public_key,
+                private_key=(dto.private_key.strip() if dto.private_key else None),
                 allowed_address=dto.allowed_address,
                 name=dto.name or "",
                 comment=dto.comment or "",

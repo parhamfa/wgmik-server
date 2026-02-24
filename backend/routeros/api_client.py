@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from librouteros import connect
 from .client_base import RouterOSClient, WGPeer, WGInterfaceConfig
 from ipaddress import ip_network
@@ -142,6 +142,7 @@ class RouterOSApiClient(RouterOSClient):
         name: str = "",
         comment: str = "",
         disabled: bool = False,
+        private_key: Optional[str] = None,
     ) -> str:
         api = self._conn()
         try:
@@ -150,6 +151,8 @@ class RouterOSApiClient(RouterOSClient):
                 "public-key": public_key,
                 "allowed-address": allowed_address,
             }
+            if private_key:
+                params["private-key"] = private_key
             if name:
                 params["name"] = name
             if comment:
@@ -222,5 +225,3 @@ class RouterOSApiClient(RouterOSClient):
                 api.close()
             except Exception:
                 pass
-
-

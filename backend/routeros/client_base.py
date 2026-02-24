@@ -41,6 +41,7 @@ class RouterOSClient:
         name: str = "",
         comment: str = "",
         disabled: bool = False,
+        private_key: Optional[str] = None,
     ) -> str:
         """Create a WireGuard peer and return its RouterOS internal .id."""
         raise NotImplementedError
@@ -56,4 +57,3 @@ class RouterOSClient:
     def get_primary_ipv4(self) -> str:
         """Return primary IPv4 address of the router (public if available, otherwise first private)."""
         raise NotImplementedError
-

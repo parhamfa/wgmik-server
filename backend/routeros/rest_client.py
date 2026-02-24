@@ -182,6 +182,7 @@ class RouterOSRestClient(RouterOSClient):
         name: str = "",
         comment: str = "",
         disabled: bool = False,
+        private_key: Optional[str] = None,
     ) -> str:
         # RouterOS REST add expects hyphenated keys and returns {"ret":"*XX"}
         payload = {
@@ -189,6 +190,8 @@ class RouterOSRestClient(RouterOSClient):
             "public-key": public_key,
             "allowed-address": allowed_address,
         }
+        if private_key:
+            payload["private-key"] = private_key
         if name:
             payload["name"] = name
         if comment:
@@ -210,5 +213,3 @@ class RouterOSRestClient(RouterOSClient):
         # RouterOS REST remove endpoint:
         #   POST /rest/interface/wireguard/peers/remove  {"numbers":"*53"}
         self._request("POST", "/interface/wireguard/peers/remove", json={"numbers": ros_id})
-
-
