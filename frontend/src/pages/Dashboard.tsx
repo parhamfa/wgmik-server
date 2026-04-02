@@ -341,13 +341,7 @@ export default function Dashboard() {
   React.useEffect(() => {
     if (setupOk !== true) return;
     if (!settings) return; // Wait for settings to load
-    (async () => {
-      await loadPeers();
-      await loadMonthly();
-      await loadRaw();
-      await loadUsageMap();
-      await loadMetrics();
-    })();
+    Promise.all([loadPeers(), loadMonthly(), loadRaw(), loadUsageMap(), loadMetrics()]);
   }, [setupOk, loadPeers, loadMonthly, loadRaw, loadMetrics, loadUsageMap, settings]); // Re-run when settings (like scope) change
 
   // Auto-refresh dashboard data based on configurable interval
@@ -419,19 +413,21 @@ export default function Dashboard() {
         if (d < 30) return `${d}d ago`;
         return `${mon}mo ago`;
       };
-      for (const g of groups.values()) {
-        try {
-          const live: PeerView[] = await routerPeers(g.routerId, g.iface);
-          for (const l of live) {
-            const saved = g.peers.find(sp => sp.public_key === l.public_key);
-            if (saved) {
-              next[saved.id] = { online: !!l.online, last: formatRel(l.last_handshake), raw_last_handshake: l.last_handshake || 0 };
+      await Promise.all(
+        Array.from(groups.values()).map(async (g) => {
+          try {
+            const live: PeerView[] = await routerPeers(g.routerId, g.iface);
+            for (const l of live) {
+              const saved = g.peers.find(sp => sp.public_key === l.public_key);
+              if (saved) {
+                next[saved.id] = { online: !!l.online, last: formatRel(l.last_handshake), raw_last_handshake: l.last_handshake || 0 };
+              }
             }
+          } catch {
+            // ignore if router not reachable
           }
-        } catch {
-          // ignore if router not reachable
-        }
-      }
+        })
+      );
       setStatusMap(next);
     })();
   }, [setupOk, peers]);

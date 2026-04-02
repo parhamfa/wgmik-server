@@ -1,3 +1,5 @@
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.orm import Session
@@ -11,8 +13,29 @@ from .db import SessionLocal
 from .models import Router, Peer, UsageSample, UsageDaily, UsageMonthly, SettingsKV, Quota, Action
 from .routeros.factory import make_client
 
+logger = logging.getLogger(__name__)
 
 _scheduler: Optional[BackgroundScheduler] = None
+
+
+def _fetch_router_group(router_id: int, iface: str):
+    """Fetch live peers for one (router_id, interface) in its own DB session.
+    Returns (router_id, iface, live_peers) or None on failure.
+    Never raises — errors are logged and suppressed.
+    """
+    db = SessionLocal()
+    try:
+        router = db.get(Router, router_id)
+        if router is None:
+            return None
+        client = make_client(router)
+        live_peers = client.list_wireguard_peers(iface)
+        return (router_id, iface, live_peers)
+    except Exception:
+        logger.exception("Failed to poll router_id=%s iface=%s", router_id, iface)
+        return None
+    finally:
+        db.close()
 
 
 def _poll_once():
@@ -39,21 +62,33 @@ def _poll_once():
             key = (p.router_id, p.interface)
             groups.setdefault(key, []).append(p)
 
+        # Parallel fetch phase: connect to all routers concurrently
+        live_results: Dict[Tuple[int, str], list] = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(groups))) as executor:
+            future_to_key = {
+                executor.submit(_fetch_router_group, router_id, iface): (router_id, iface)
+                for (router_id, iface) in groups
+            }
+            for future in as_completed(future_to_key):
+                result = future.result()  # never raises; None means skip
+                if result is not None:
+                    _, _, live_peers = result
+                    live_results[future_to_key[future]] = live_peers
+
+        # Sequential DB processing phase: write samples, enforce quotas/windows
         router_cache: Dict[int, Router] = {}
 
         for (router_id, iface), group_peers in groups.items():
+            live_peers = live_results.get((router_id, iface))
+            if live_peers is None:
+                continue
             router = router_cache.get(router_id)
             if router is None:
                 router = db.get(Router, router_id)
                 if router is None:
                     continue
                 router_cache[router_id] = router
-            try:
-                client = make_client(router)
-                live_peers = client.list_wireguard_peers(iface)
-            except Exception:
-                # If a router/interface is unreachable, skip this group
-                continue
+            client = make_client(router)
 
             live_by_pub = {lp.public_key: lp for lp in live_peers}
 

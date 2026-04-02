@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "frontend",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": ["-c", "PATH=/opt/homebrew/bin:$PATH npm install --prefix frontend && npm run dev --prefix frontend"],
+      "port": 5173
+    },
+    {
+      "name": "backend",
+      "runtimeExecutable": "/Users/parhamfatemi/Developer/mikrotik/wgmik-server/.venv/bin/python",
+      "runtimeArgs": ["-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"],
+      "port": 8000
+    }
+  ]
+}
