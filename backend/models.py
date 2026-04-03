@@ -1,5 +1,5 @@
 from __future__ import annotations
-from sqlalchemy import Column, Integer, String, Boolean, BigInteger, ForeignKey, UniqueConstraint, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, BigInteger, ForeignKey, UniqueConstraint, DateTime, Index
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from datetime import datetime
 from .db import Base
@@ -62,6 +62,20 @@ class UsageDaily(Base):
     tx: Mapped[int] = mapped_column(BigInteger, default=0)
     __table_args__ = (
         UniqueConstraint("peer_id", "day", name="uq_daily_peer_day"),
+    )
+
+
+class UsageMinute(Base):
+    __tablename__ = "usage_minute"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    peer_id: Mapped[int] = mapped_column(ForeignKey("peers.id", ondelete="CASCADE"))
+    minute_ts: Mapped[datetime] = mapped_column(DateTime)
+    rx: Mapped[int] = mapped_column(BigInteger, default=0)
+    tx: Mapped[int] = mapped_column(BigInteger, default=0)
+    __table_args__ = (
+        UniqueConstraint("peer_id", "minute_ts", name="uq_usage_minute_peer_ts"),
+        Index("ix_usage_minute_minute_ts", "minute_ts"),
     )
 
 

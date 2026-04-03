@@ -282,7 +282,15 @@ function StepLogin({ onSuccess }: { onSuccess: () => void }) {
             onSuccess();
         } catch (err: any) {
             console.error(err);
-            setError("Invalid username or password");
+            const message = String(err?.message || "").trim();
+            if (
+                message === "Incorrect username or password" ||
+                message === "Unauthorized"
+            ) {
+                setError("Invalid username or password");
+            } else {
+                setError(message || "Sign in failed");
+            }
         } finally {
             setBusy(false);
         }

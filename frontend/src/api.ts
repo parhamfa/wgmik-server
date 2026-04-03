@@ -34,7 +34,14 @@ export type SettingsDTO = {
   peer_default_scope_value: number;
   dashboard_scope_unit: string;
   dashboard_scope_value: number;
+  dashboard_router_scope: "all" | "active" | "selected";
+  dashboard_selected_router_ids: number[];
+  dashboard_filter_status: string;
+  dashboard_sort_by: string;
   show_hw_stats: boolean; // Alias field often used
+  raw_sample_retention_hours: number;
+  minute_rollup_retention_days: number;
+  daily_rollup_retention_days: number;
 };
 
 export type QuotaDTO = {
@@ -77,6 +84,16 @@ export type RouterDTO = {
 
 // Aliases for backward compat
 export type Router = RouterDTO;
+
+function applyRouterFilters(params: URLSearchParams, routerId?: number | null, routerIds?: number[] | null) {
+  if (routerIds && routerIds.length > 0) {
+    for (const id of routerIds) {
+      if (id > 0) params.append("router_ids", String(id));
+    }
+    return;
+  }
+  if (routerId && routerId > 0) params.set("router_id", String(routerId));
+}
 
 export type RouterCreateDTO = Omit<RouterDTO, "id"> & {
   password?: string;
@@ -169,9 +186,9 @@ function normalizePeer(p: any): PeerListDTO {
   };
 }
 
-export async function listPeers(routerId: number, selectedOnly = false, iface?: string): Promise<PeerListDTO[]> {
+export async function listPeers(routerId: number, selectedOnly = false, iface?: string, routerIds?: number[] | null): Promise<PeerListDTO[]> {
   const params = new URLSearchParams();
-  if (routerId) params.set("router_id", String(routerId));
+  applyRouterFilters(params, routerId, routerIds);
   if (selectedOnly) params.set("selected_only", "true");
   if (iface) params.set("interface", iface);
 
@@ -190,9 +207,11 @@ export async function listSavedPeers(): Promise<SavedPeer[]> {
   const rows = await fetchJson("/api/peers");
   return rows.map(normalizePeer);
 }
-export async function listSavedPeersSelected(routerId?: number | null): Promise<SavedPeer[]> {
-  const q = routerId ? `?selected_only=true&router_id=${routerId}` : "?selected_only=true";
-  const rows = await fetchJson(`/api/peers${q}`);
+export async function listSavedPeersSelected(routerId?: number | null, routerIds?: number[] | null): Promise<SavedPeer[]> {
+  const params = new URLSearchParams();
+  params.set("selected_only", "true");
+  applyRouterFilters(params, routerId, routerIds);
+  const rows = await fetchJson(`/api/peers?${params.toString()}`);
   return rows.map(normalizePeer);
 }
 
@@ -227,11 +246,39 @@ export type PeerUsageSummaryDTO = {
 };
 export type PeerUsageSummary = PeerUsageSummaryDTO; // Alias
 
-export async function getPeersSummary(opts: { seconds?: number; days?: number; routerId?: number | null; start?: string; end?: string; allTime?: boolean }): Promise<PeerUsageSummaryDTO[]> {
+export type DashboardLiveStatusDTO = {
+  peer_id: number;
+  online: boolean;
+  raw_last_handshake: number;
+};
+
+export type UsageMaintenanceStatusDTO = {
+  running: boolean;
+  phase: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  last_error?: string | null;
+  last_completed_phase?: string | null;
+  resume_cursor?: Record<string, unknown> | null;
+  detail?: string | null;
+  backup_path?: string | null;
+  file_size_before?: number | null;
+  file_size_after?: number | null;
+  backfilled_minutes: number;
+  deleted_samples: number;
+  deleted_minutes: number;
+  deleted_daily: number;
+  backfill_cutoff?: string | null;
+  raw_prune_before?: string | null;
+  minute_prune_before?: string | null;
+  daily_prune_before?: string | null;
+};
+
+export async function getPeersSummary(opts: { seconds?: number; days?: number; routerId?: number | null; routerIds?: number[] | null; start?: string; end?: string; allTime?: boolean }): Promise<PeerUsageSummaryDTO[]> {
   const params = new URLSearchParams();
   if (opts.seconds) params.set("seconds", String(opts.seconds));
   if (opts.days) params.set("days", String(opts.days));
-  if (opts.routerId) params.set("router_id", String(opts.routerId));
+  applyRouterFilters(params, opts.routerId, opts.routerIds);
   if (opts.start) params.set("start", opts.start);
   if (opts.end) params.set("end", opts.end);
   if (opts.allTime) params.set("all_time", "true");
@@ -245,6 +292,13 @@ export async function getPeersSummary(opts: { seconds?: number; days?: number; r
   }));
 }
 
+export async function getDashboardLiveStatus(routerId?: number | null, routerIds?: number[] | null): Promise<DashboardLiveStatusDTO[]> {
+  const params = new URLSearchParams();
+  applyRouterFilters(params, routerId, routerIds);
+  const q = params.toString();
+  return fetchJson(`/api/dashboard/live_status${q ? `?${q}` : ""}`);
+}
+
 export type SummaryRawPointDTO = {
   ts: string;
   rx: number;
@@ -252,9 +306,9 @@ export type SummaryRawPointDTO = {
 };
 export type SummaryRawPoint = SummaryRawPointDTO; // Alias
 
-export async function getSummaryRaw(seconds: number, routerId?: number | null, interval?: number, start?: string, end?: string): Promise<SummaryRawPointDTO[]> {
+export async function getSummaryRaw(seconds: number, routerId?: number | null, interval?: number, start?: string, end?: string, routerIds?: number[] | null): Promise<SummaryRawPointDTO[]> {
   const params = new URLSearchParams({ seconds: String(seconds) });
-  if (routerId) params.set("router_id", String(routerId));
+  applyRouterFilters(params, routerId, routerIds);
   if (interval && interval > 0) params.set("interval", String(interval));
   if (start) params.set("start", start);
   if (end) params.set("end", end);
@@ -263,15 +317,37 @@ export async function getSummaryRaw(seconds: number, routerId?: number | null, i
 
 // RESTORED: getMonthlySummary + MonthlySummaryPoint
 export type MonthlySummaryPoint = { day: string; rx: number; tx: number };
-export async function getMonthlySummary(days?: number, routerId?: number | null, opts?: { start?: string; end?: string; allTime?: boolean }): Promise<MonthlySummaryPoint[]> {
+export async function getMonthlySummary(days?: number, routerId?: number | null, opts?: { start?: string; end?: string; allTime?: boolean; routerIds?: number[] | null }): Promise<MonthlySummaryPoint[]> {
   const params = new URLSearchParams();
   if (days && days > 0) params.set("days", String(days));
-  if (routerId && routerId > 0) params.set("router_id", String(routerId));
+  applyRouterFilters(params, routerId, opts?.routerIds);
   if (opts?.start) params.set("start", opts.start);
   if (opts?.end) params.set("end", opts.end);
   if (opts?.allTime) params.set("all_time", "true");
   const q = params.toString();
   return fetchJson(`/api/summary/month${q ? `?${q}` : ""}`);
+}
+
+export type RouterMonthlySummaryPoint = { router_id: number; day: string; rx: number; tx: number };
+export async function getMonthlySummaryByRouter(days?: number, routerId?: number | null, opts?: { start?: string; end?: string; allTime?: boolean; routerIds?: number[] | null }): Promise<RouterMonthlySummaryPoint[]> {
+  const params = new URLSearchParams();
+  if (days && days > 0) params.set("days", String(days));
+  applyRouterFilters(params, routerId, opts?.routerIds);
+  if (opts?.start) params.set("start", opts.start);
+  if (opts?.end) params.set("end", opts.end);
+  if (opts?.allTime) params.set("all_time", "true");
+  const q = params.toString();
+  return fetchJson(`/api/summary/month/by_router${q ? `?${q}` : ""}`);
+}
+
+export type RouterSummaryRawPoint = { router_id: number; ts: string; rx: number; tx: number };
+export async function getSummaryRawByRouter(seconds: number, routerId?: number | null, interval?: number, start?: string, end?: string, routerIds?: number[] | null): Promise<RouterSummaryRawPoint[]> {
+  const params = new URLSearchParams({ seconds: String(seconds) });
+  applyRouterFilters(params, routerId, routerIds);
+  if (interval && interval > 0) params.set("interval", String(interval));
+  if (start) params.set("start", start);
+  if (end) params.set("end", end);
+  return fetchJson(`/api/summary/raw/by_router?${params.toString()}`);
 }
 
 // RESTORED: getPeerUsage + UsagePoint
@@ -418,4 +494,10 @@ export async function purgeUsage() {
 }
 export async function purgePeers() {
   return fetchJson("/api/admin/purge_peers", { method: "POST" });
+}
+export async function getUsageMaintenanceStatus(): Promise<UsageMaintenanceStatusDTO> {
+  return fetchJson("/api/admin/usage_maintenance");
+}
+export async function runUsageMaintenance(): Promise<UsageMaintenanceStatusDTO> {
+  return fetchJson("/api/admin/usage_maintenance/run", { method: "POST" });
 }

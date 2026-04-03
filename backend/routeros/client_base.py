@@ -27,6 +27,9 @@ class RouterOSClient:
     def list_wireguard_interfaces(self) -> List[str]:
         raise NotImplementedError
 
+    def list_all_wireguard_peers(self) -> List[WGPeer]:
+        raise NotImplementedError
+
     def list_wireguard_peers(self, interface: str) -> List[WGPeer]:
         raise NotImplementedError
 

@@ -21,12 +21,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const [user, setUser] = useState<User | null>(null);
     const [loading, setLoading] = useState(true);
 
-    const refreshUser = async () => {
+    const refreshUser = async (opts?: { throwOnError?: boolean }) => {
         try {
             const u = await fetchJson('/api/auth/me');
             setUser(u);
+            return u;
         } catch (e) {
             setUser(null);
+            if (opts?.throwOnError) throw e;
+            return null;
         } finally {
             setLoading(false);
         }
@@ -42,7 +45,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(creds),
         });
-        await refreshUser();
+        await refreshUser({ throwOnError: true });
     };
 
     const logout = async () => {

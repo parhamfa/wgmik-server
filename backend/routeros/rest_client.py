@@ -141,13 +141,10 @@ class RouterOSRestClient(RouterOSClient):
                 return False
         return bool(value)
 
-    def list_wireguard_peers(self, interface: str) -> List[WGPeer]:
-        # Filter peers by interface
+    def list_all_wireguard_peers(self) -> List[WGPeer]:
         data = self._get("/interface/wireguard/peers")
-        peers = []
+        peers: List[WGPeer] = []
         for row in data:
-            if row.get("interface") != interface:
-                continue
             peers.append(
                 WGPeer(
                     ros_id=row.get(".id", ""),
@@ -163,6 +160,9 @@ class RouterOSRestClient(RouterOSClient):
                 )
             )
         return peers
+
+    def list_wireguard_peers(self, interface: str) -> List[WGPeer]:
+        return [peer for peer in self.list_all_wireguard_peers() if peer.interface == interface]
 
     def set_peer_disabled(self, interface: str, ros_id: str, disabled: bool) -> None:
         # RouterOS REST has an item endpoint, but on some versions it returns 500 for PUT/PATCH.

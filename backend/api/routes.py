@@ -1,15 +1,21 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Response, Request, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func, text
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ..db import get_db, Base, engine, SessionLocal
 from ..settings import settings
 from ..scheduler import update_scheduler_interval
 from ..security import SecretBox
-from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMonthly, UsageSample, Quota, Action, User
+from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User
 from ..auth import verify_password, get_password_hash, create_access_token, verify_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from ..routeros.factory import make_client
+from ..usage_maintenance import (
+    get_usage_maintenance_status,
+    is_usage_maintenance_running,
+    start_usage_maintenance,
+)
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 import traceback
@@ -17,6 +23,7 @@ from ipaddress import ip_network
 import os
 from zoneinfo import ZoneInfo
 import base64
+import json
 
 try:
     import psutil  # type: ignore
@@ -41,6 +48,347 @@ def _normalize_time_range(
     if start_utc is not None and end_utc is not None and end_utc < start_utc:
         raise HTTPException(status_code=400, detail="end must be >= start")
     return start_utc, end_utc
+
+
+def _normalize_router_ids(router_ids: Optional[List[int]]) -> Optional[List[int]]:
+    if router_ids is None:
+        return None
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in router_ids:
+        try:
+            rid = int(raw)
+        except Exception:
+            continue
+        if rid <= 0 or rid in seen:
+            continue
+        seen.add(rid)
+        out.append(rid)
+    return out
+
+
+def _resolve_router_filter(
+    router_id: Optional[int],
+    router_ids: Optional[List[int]],
+) -> tuple[Optional[int], Optional[List[int]]]:
+    normalized_ids = _normalize_router_ids(router_ids)
+    if normalized_ids is not None:
+        return None, normalized_ids
+    if router_id is None:
+        return None, None
+    try:
+        rid = int(router_id)
+    except Exception:
+        return None, None
+    return (rid if rid > 0 else None), None
+
+
+def _apply_router_filter(q, router_id: Optional[int], router_ids: Optional[List[int]]):
+    if router_ids is not None:
+        if not router_ids:
+            return q.filter(False)
+        return q.filter(Peer.router_id.in_(router_ids))
+    if router_id is not None:
+        return q.filter(Peer.router_id == router_id)
+    return q
+
+
+def _router_sql_filter(router_id: Optional[int], router_ids: Optional[List[int]]) -> str:
+    if router_ids is not None:
+        if not router_ids:
+            return "AND 1 = 0"
+        safe_ids = ", ".join(str(int(rid)) for rid in router_ids)
+        return f"AND p.router_id IN ({safe_ids})"
+    if router_id is not None:
+        return f"AND p.router_id = {int(router_id)}"
+    return ""
+
+
+def _require_admin(current_user: User) -> None:
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+
+def _normalize_raw_window(
+    *,
+    seconds: Optional[int],
+    start_utc: Optional[datetime],
+    end_utc: Optional[datetime],
+) -> tuple[int, datetime, datetime]:
+    try:
+        resolved_seconds = int(seconds or 3600)
+    except Exception:
+        resolved_seconds = 3600
+    resolved_seconds = max(60, min(7 * 24 * 3600, resolved_seconds))
+    now_utc = datetime.now(timezone.utc)
+    end_dt = end_utc or now_utc
+    if start_utc is not None:
+        cutoff = start_utc
+        span = (end_dt - cutoff).total_seconds()
+        if span > 7 * 24 * 3600:
+            raise HTTPException(status_code=400, detail="raw window max span is 7 days")
+        resolved_seconds = int(max(60, min(7 * 24 * 3600, span)))
+    else:
+        cutoff = end_dt - timedelta(seconds=resolved_seconds)
+    return resolved_seconds, cutoff, end_dt
+
+
+def _normalize_raw_interval(seconds: int, interval: Optional[int]) -> int:
+    resolved = interval if interval and interval > 0 else 0
+    if resolved > 0:
+        return resolved
+    if seconds <= 3600:
+        return 60
+    if seconds <= 86400:
+        return 3600
+    return 6 * 3600
+
+
+def _floor_to_minute_utc_naive(dt: datetime) -> datetime:
+    return _dt_to_utc(dt).replace(second=0, microsecond=0, tzinfo=None)
+
+
+def _minute_coverage_covers_window_start(
+    db: Session,
+    *,
+    peer_id: Optional[int] = None,
+    router_id: Optional[int] = None,
+    router_ids: Optional[List[int]] = None,
+    selected_only: bool = True,
+    cutoff: datetime,
+    end_dt: datetime,
+) -> bool:
+    q = db.query(func.min(UsageMinute.minute_ts))
+    if peer_id is not None:
+        q = q.filter(UsageMinute.peer_id == peer_id)
+    else:
+        q = q.join(Peer, Peer.id == UsageMinute.peer_id)
+        if selected_only:
+            q = q.filter(Peer.selected == True)
+        q = _apply_router_filter(q, router_id, router_ids)
+    earliest = q.scalar()
+    if earliest is None:
+        return False
+    cutoff_floor = _floor_to_minute_utc_naive(cutoff)
+    if earliest <= cutoff_floor:
+        return True
+
+    raw_q = db.query(UsageSample.id)
+    if peer_id is not None:
+        raw_q = raw_q.filter(
+            UsageSample.peer_id == peer_id,
+            UsageSample.ts >= cutoff.replace(tzinfo=None),
+            UsageSample.ts < earliest,
+        )
+    else:
+        raw_q = (
+            raw_q.join(Peer, Peer.id == UsageSample.peer_id)
+            .filter(
+                UsageSample.ts >= cutoff.replace(tzinfo=None),
+                UsageSample.ts < earliest,
+            )
+        )
+        if selected_only:
+            raw_q = raw_q.filter(Peer.selected == True)
+        raw_q = _apply_router_filter(raw_q, router_id, router_ids)
+    return raw_q.first() is None
+
+
+def _query_raw_peer_summaries(
+    db: Session,
+    *,
+    cutoff: datetime,
+    end_dt: datetime,
+    router_id: Optional[int],
+    router_ids: Optional[List[int]],
+) -> list[tuple[int, int, int]]:
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+    router_filter = _router_sql_filter(router_id, router_ids)
+    query = text(f"""
+    WITH filtered_peers AS (
+        SELECT p.id
+        FROM peers p
+        WHERE p.selected = 1
+          {router_filter}
+    ),
+    filtered_samples AS (
+        SELECT 
+            u.peer_id,
+            u.ts,
+            u.rx,
+            u.tx
+        FROM filtered_peers fp
+        JOIN usage_samples u ON u.peer_id = fp.id
+        WHERE u.ts >= :cutoff
+          AND u.ts <= :end
+    ),
+    deltas AS (
+        SELECT
+            peer_id,
+            ts,
+            rx,
+            tx,
+            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_rx,
+            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_tx
+        FROM filtered_samples
+    )
+    SELECT
+        peer_id,
+        SUM(CASE 
+            WHEN prev_rx IS NULL THEN 0
+            WHEN rx < prev_rx THEN rx
+            ELSE rx - prev_rx 
+        END) as total_rx,
+        SUM(CASE 
+            WHEN prev_tx IS NULL THEN 0
+            WHEN tx < prev_tx THEN tx
+            ELSE tx - prev_tx 
+        END) as total_tx
+    FROM deltas
+    WHERE prev_rx IS NOT NULL
+    GROUP BY peer_id
+    """)
+    return [(int(r[0]), int(r[1] or 0), int(r[2] or 0)) for r in db.execute(query, {"cutoff": cutoff_str, "end": end_str})]
+
+
+def _query_raw_aggregate_buckets(
+    db: Session,
+    *,
+    cutoff: datetime,
+    end_dt: datetime,
+    interval: int,
+    router_id: Optional[int],
+    router_ids: Optional[List[int]],
+) -> list[tuple[int, int, int]]:
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+    router_filter = _router_sql_filter(router_id, router_ids)
+    query = text(f"""
+    WITH filtered_peers AS (
+        SELECT p.id
+        FROM peers p
+        WHERE p.selected = 1
+          {router_filter}
+    ),
+    filtered_samples AS (
+        SELECT 
+            u.peer_id,
+            u.ts,
+            u.rx,
+            u.tx
+        FROM filtered_peers fp
+        JOIN usage_samples u ON u.peer_id = fp.id
+        WHERE u.ts >= :cutoff
+          AND u.ts <= :end
+    ),
+    deltas AS (
+        SELECT
+            peer_id,
+            ts,
+            rx,
+            tx,
+            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_rx,
+            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_tx
+        FROM filtered_samples
+    )
+    SELECT
+        CAST(strftime('%s', ts) / :interval AS INT) * :interval as bucket,
+        SUM(CASE 
+            WHEN prev_rx IS NULL THEN 0
+            WHEN rx < prev_rx THEN rx
+            ELSE rx - prev_rx 
+        END) as d_rx,
+        SUM(CASE 
+            WHEN prev_tx IS NULL THEN 0
+            WHEN tx < prev_tx THEN tx
+            ELSE tx - prev_tx 
+        END) as d_tx
+    FROM deltas
+    WHERE prev_rx IS NOT NULL
+    GROUP BY bucket
+    ORDER BY bucket
+    """)
+    return [(int(r[0]), int(r[1] or 0), int(r[2] or 0)) for r in db.execute(query, {"cutoff": cutoff_str, "end": end_str, "interval": interval}).fetchall()]
+
+
+def _query_raw_router_buckets(
+    db: Session,
+    *,
+    cutoff: datetime,
+    end_dt: datetime,
+    interval: int,
+    router_id: Optional[int],
+    router_ids: Optional[List[int]],
+) -> list[tuple[int, int, int, int]]:
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+    router_filter = _router_sql_filter(router_id, router_ids)
+    query = text(f"""
+    WITH filtered_peers AS (
+        SELECT
+            p.id,
+            p.router_id
+        FROM peers p
+        WHERE p.selected = 1
+          {router_filter}
+    ),
+    filtered_samples AS (
+        SELECT
+            fp.router_id,
+            u.peer_id,
+            u.ts,
+            u.rx,
+            u.tx
+        FROM filtered_peers fp
+        JOIN usage_samples u ON u.peer_id = fp.id
+        WHERE u.ts >= :cutoff
+          AND u.ts <= :end
+    ),
+    deltas AS (
+        SELECT
+            router_id,
+            peer_id,
+            ts,
+            rx,
+            tx,
+            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_rx,
+            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_tx
+        FROM filtered_samples
+    )
+    SELECT
+        router_id,
+        CAST(strftime('%s', ts) / :interval AS INT) * :interval as bucket,
+        SUM(CASE
+            WHEN prev_rx IS NULL THEN 0
+            WHEN rx < prev_rx THEN rx
+            ELSE rx - prev_rx
+        END) as d_rx,
+        SUM(CASE
+            WHEN prev_tx IS NULL THEN 0
+            WHEN tx < prev_tx THEN tx
+            ELSE tx - prev_tx
+        END) as d_tx
+    FROM deltas
+    WHERE prev_rx IS NOT NULL
+    GROUP BY router_id, bucket
+    ORDER BY router_id, bucket
+    """)
+    return [
+        (int(r[0]), int(r[1]), int(r[2] or 0), int(r[3] or 0))
+        for r in db.execute(query, {"cutoff": cutoff_str, "end": end_str, "interval": interval}).fetchall()
+    ]
+
+
+def _peer_is_online(last_handshake: Optional[int], disabled: bool) -> bool:
+    if not last_handshake or disabled:
+        return False
+    return last_handshake <= settings.online_threshold_seconds
+
+
+def _fetch_all_router_peers(router_row: Router):
+    client = make_client(router_row)
+    return router_row.id, client.list_all_wireguard_peers()
 
 
 # --- Authentication & Users ---
@@ -191,9 +539,14 @@ class SettingsDTO(BaseModel):
     peer_default_scope_value: int
     dashboard_scope_unit: str
     dashboard_scope_value: int
+    dashboard_router_scope: str
+    dashboard_selected_router_ids: List[int]
     dashboard_filter_status: str
     dashboard_sort_by: str
     peer_refresh_seconds: int
+    raw_sample_retention_hours: int
+    minute_rollup_retention_days: int
+    daily_rollup_retention_days: int
 
 
 class MetricsDTO(BaseModel):
@@ -262,9 +615,14 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
         "peer_default_scope_value": 14,
         "dashboard_scope_unit": "days",
         "dashboard_scope_value": 14,
+        "dashboard_router_scope": "all",
+        "dashboard_selected_router_ids": [],
         "dashboard_filter_status": "all",
         "dashboard_sort_by": "created",
         "peer_refresh_seconds": 30,
+        "raw_sample_retention_hours": 24,
+        "minute_rollup_retention_days": 90,
+        "daily_rollup_retention_days": 0,
     }
     # Overlay any values persisted in SettingsKV
     for key in (
@@ -275,18 +633,38 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
         "peer_default_scope_value",
         "dashboard_scope_unit",
         "dashboard_scope_value",
+        "dashboard_router_scope",
+        "dashboard_selected_router_ids",
         "dashboard_filter_status",
         "dashboard_sort_by",
         "peer_refresh_seconds",
+        "raw_sample_retention_hours",
+        "minute_rollup_retention_days",
+        "daily_rollup_retention_days",
     ):
         kv = db.get(SettingsKV, key)
         if not kv:
             continue
-        if key in ("dashboard_refresh_seconds", "peer_default_scope_value", "dashboard_scope_value", "peer_refresh_seconds"):
+        if key in (
+            "dashboard_refresh_seconds",
+            "peer_default_scope_value",
+            "dashboard_scope_value",
+            "peer_refresh_seconds",
+            "raw_sample_retention_hours",
+            "minute_rollup_retention_days",
+            "daily_rollup_retention_days",
+        ):
             try:
                 data[key] = int(kv.value)
             except ValueError:
                 continue
+        elif key == "dashboard_selected_router_ids":
+            try:
+                parsed = json.loads(kv.value)
+                if isinstance(parsed, list):
+                    data[key] = [rid for rid in _normalize_router_ids(parsed) or []]
+            except Exception:
+                data[key] = []
         elif key in ("show_kind_pills", "show_hw_stats"):
             data[key] = kv.value.lower() == "true"
         else:
@@ -300,11 +678,22 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
                 data["dashboard_scope_value"] = int(legacy.value)
             except ValueError:
                 pass
+    data["raw_sample_retention_hours"] = max(1, min(24 * 365, int(data["raw_sample_retention_hours"])))
+    data["minute_rollup_retention_days"] = max(1, min(3650, int(data["minute_rollup_retention_days"])))
+    data["daily_rollup_retention_days"] = max(0, min(36500, int(data["daily_rollup_retention_days"])))
     return SettingsDTO(**data)
 
 
 @router.put("/settings", response_model=SettingsDTO)
 def update_settings(dto: SettingsDTO, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if is_usage_maintenance_running(db):
+        current = get_settings(db, current_user)
+        if (
+            int(dto.raw_sample_retention_hours) != int(current.raw_sample_retention_hours)
+            or int(dto.minute_rollup_retention_days) != int(current.minute_rollup_retention_days)
+            or int(dto.daily_rollup_retention_days) != int(current.daily_rollup_retention_days)
+        ):
+            raise HTTPException(status_code=409, detail="Retention settings are locked while usage maintenance is running")
     # Persist overrides to SettingsKV (both core and UI prefs)
     overrides = {
         # Core settings
@@ -320,9 +709,14 @@ def update_settings(dto: SettingsDTO, db: Session = Depends(get_db), current_use
         "peer_default_scope_value": str(dto.peer_default_scope_value),
         "dashboard_scope_unit": dto.dashboard_scope_unit,
         "dashboard_scope_value": str(dto.dashboard_scope_value),
+        "dashboard_router_scope": dto.dashboard_router_scope,
+        "dashboard_selected_router_ids": json.dumps(_normalize_router_ids(dto.dashboard_selected_router_ids) or []),
         "dashboard_filter_status": dto.dashboard_filter_status,
         "dashboard_sort_by": dto.dashboard_sort_by,
         "peer_refresh_seconds": str(dto.peer_refresh_seconds),
+        "raw_sample_retention_hours": str(max(1, min(24 * 365, int(dto.raw_sample_retention_hours)))),
+        "minute_rollup_retention_days": str(max(1, min(3650, int(dto.minute_rollup_retention_days)))),
+        "daily_rollup_retention_days": str(max(0, min(36500, int(dto.daily_rollup_retention_days)))),
     }
 
     for k, v in overrides.items():
@@ -561,21 +955,18 @@ def list_peers(router_id: int, interface: str, db: Session = Depends(get_db), cu
         rows = client.list_wireguard_peers(interface)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"router connection failed: {e}")
-    out: List[PeerDTO] = []
-    for p in rows:
-        online = False
-        if p.last_handshake and not p.disabled:
-            # p.last_handshake is age in seconds since last handshake
-            # Disabled peers should never be considered online
-            online = p.last_handshake <= settings.online_threshold_seconds
-        # check if exists
-        existing = db.query(Peer).filter(
+    existing_by_pub = {
+        row.public_key: row.id
+        for row in db.query(Peer.id, Peer.public_key).filter(
             Peer.router_id == router_id,
             Peer.interface == interface,
-            Peer.public_key == p.public_key,
-        ).first()
+        ).all()
+    }
+    out: List[PeerDTO] = []
+    for p in rows:
+        online = _peer_is_online(p.last_handshake, p.disabled)
         out.append(PeerDTO(
-            id=existing.id if existing else None,
+            id=existing_by_pub.get(p.public_key),
             interface=p.interface,
             name=p.name,
             public_key=p.public_key,
@@ -606,6 +997,69 @@ class PeerListDTO(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DashboardLiveStatusDTO(BaseModel):
+    peer_id: int
+    online: bool
+    raw_last_handshake: int
+
+
+@router.get("/dashboard/live_status", response_model=List[DashboardLiveStatusDTO])
+def get_dashboard_live_status(
+    router_id: Optional[int] = None,
+    router_ids: Optional[List[int]] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    router_id, router_ids = _resolve_router_filter(router_id, router_ids)
+    rows = _apply_router_filter(
+        db.query(
+            Peer.id.label("peer_id"),
+            Peer.router_id.label("router_id"),
+            Peer.interface.label("interface"),
+            Peer.public_key.label("public_key"),
+        ).filter(Peer.selected == True),
+        router_id,
+        router_ids,
+    ).all()
+    if not rows:
+        return []
+
+    peer_lookup: dict[int, dict[tuple[str, str], int]] = {}
+    for row in rows:
+        peer_lookup.setdefault(int(row.router_id), {})[(row.interface, row.public_key)] = int(row.peer_id)
+
+    routers = db.query(Router).filter(Router.id.in_(list(peer_lookup.keys()))).all()
+    if not routers:
+        return []
+
+    out: list[DashboardLiveStatusDTO] = []
+    max_workers = min(max(len(routers), 1), 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_fetch_all_router_peers, router_row): router_row.id
+            for router_row in routers
+        }
+        for future in as_completed(future_map):
+            router_row_id = future_map[future]
+            try:
+                _, live_rows = future.result()
+            except Exception:
+                continue
+            lookup = peer_lookup.get(router_row_id, {})
+            for live_peer in live_rows:
+                peer_id = lookup.get((live_peer.interface, live_peer.public_key))
+                if peer_id is None:
+                    continue
+                out.append(
+                    DashboardLiveStatusDTO(
+                        peer_id=peer_id,
+                        online=_peer_is_online(live_peer.last_handshake, live_peer.disabled),
+                        raw_last_handshake=int(live_peer.last_handshake or 0),
+                    )
+                )
+    return out
 
 
 @router.post("/routers/{router_id}/peers/import")
@@ -876,6 +1330,7 @@ def sync_router(router_id: int, db: Session = Depends(get_db), current_user: Use
     client = make_client(router)
     try:
         ifaces = client.list_wireguard_interfaces()
+        live_rows = client.list_all_wireguard_peers()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"router connection failed: {e}")
 
@@ -888,66 +1343,61 @@ def sync_router(router_id: int, db: Session = Depends(get_db), current_user: Use
     created = 0
     now_utc = datetime.now(timezone.utc)
 
-    for iface in ifaces:
-        try:
-            live = client.list_wireguard_peers(iface)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"router connection failed: {e}")
-        for lp in live:
-            key = (iface, lp.public_key)
-            seen.add(key)
-            row = by_key.get(key)
-            if row:
-                changed = False
-                if lp.ros_id and row.ros_id != lp.ros_id:
-                    row.ros_id = lp.ros_id
-                    changed = True
-                if (row.name or "") != (lp.name or ""):
-                    row.name = lp.name or ""
-                    changed = True
-                if (row.allowed_address or "") != (lp.allowed_address or ""):
-                    row.allowed_address = lp.allowed_address or ""
-                    changed = True
-                if bool(row.disabled) != bool(lp.disabled):
-                    row.disabled = bool(lp.disabled)
-                    changed = True
-                    db.add(
-                        Action(
-                            peer_id=row.id,
-                            ts=now_utc,
-                            action="router_disable" if row.disabled else "router_enable",
-                            note="Detected router state change during sync",
-                        )
-                    )
-                if changed:
-                    updated += 1
-            else:
-                disabled = lp.disabled
-                if isinstance(disabled, str):
-                    disabled = disabled.strip().lower() in ("1", "true", "yes", "on", "enabled")
-                row = Peer(
-                    router_id=router_id,
-                    interface=iface,
-                    ros_id=lp.ros_id or "",
-                    name=lp.name or "",
-                    public_key=lp.public_key,
-                    allowed_address=lp.allowed_address,
-                    comment="",
-                    disabled=bool(disabled),
-                    selected=False,
-                )
-                db.add(row)
-                db.flush()
-                by_key[key] = row
-                created += 1
+    for lp in live_rows:
+        key = (lp.interface, lp.public_key)
+        seen.add(key)
+        row = by_key.get(key)
+        if row:
+            changed = False
+            if lp.ros_id and row.ros_id != lp.ros_id:
+                row.ros_id = lp.ros_id
+                changed = True
+            if (row.name or "") != (lp.name or ""):
+                row.name = lp.name or ""
+                changed = True
+            if (row.allowed_address or "") != (lp.allowed_address or ""):
+                row.allowed_address = lp.allowed_address or ""
+                changed = True
+            if bool(row.disabled) != bool(lp.disabled):
+                row.disabled = bool(lp.disabled)
+                changed = True
                 db.add(
                     Action(
                         peer_id=row.id,
                         ts=now_utc,
-                        action="router_discovered",
-                        note="Discovered on router during sync (selected=false)",
+                        action="router_disable" if row.disabled else "router_enable",
+                        note="Detected router state change during sync",
                     )
                 )
+            if changed:
+                updated += 1
+        else:
+            disabled = lp.disabled
+            if isinstance(disabled, str):
+                disabled = disabled.strip().lower() in ("1", "true", "yes", "on", "enabled")
+            row = Peer(
+                router_id=router_id,
+                interface=lp.interface,
+                ros_id=lp.ros_id or "",
+                name=lp.name or "",
+                public_key=lp.public_key,
+                allowed_address=lp.allowed_address,
+                comment="",
+                disabled=bool(disabled),
+                selected=False,
+            )
+            db.add(row)
+            db.flush()
+            by_key[key] = row
+            created += 1
+            db.add(
+                Action(
+                    peer_id=row.id,
+                    ts=now_utc,
+                    action="router_discovered",
+                    note="Discovered on router during sync (selected=false)",
+                )
+            )
 
     # Mark missing peers as unselected (keeps history)
     missing = 0
@@ -983,10 +1433,17 @@ def sync_router(router_id: int, db: Session = Depends(get_db), current_user: Use
 
 
 @router.get("/peers", response_model=List[PeerListDTO])
-def list_saved_peers(router_id: Optional[int] = None, interface: Optional[str] = None, selected_only: bool = False, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def list_saved_peers(
+    router_id: Optional[int] = None,
+    router_ids: Optional[List[int]] = Query(None),
+    interface: Optional[str] = None,
+    selected_only: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    router_id, router_ids = _resolve_router_filter(router_id, router_ids)
     q = db.query(Peer)
-    if router_id is not None:
-        q = q.filter(Peer.router_id == router_id)
+    q = _apply_router_filter(q, router_id, router_ids)
     if interface is not None:
         q = q.filter(Peer.interface == interface)
     if selected_only:
@@ -1262,8 +1719,8 @@ def get_peer_usage(
 ):
     """
     window=daily: aggregate per day from UsageDaily (existing behaviour).
-    window=raw: last `seconds` worth of UsageSample deltas, labelled by time of day.
-    interval: if set, group samples into buckets of `interval` seconds (e.g. 60 or 3600).
+    window=raw: aggregate minute rollups for the requested window. If minute rollups
+    do not exist yet for the window, fall back to raw samples.
     """
     start_utc, end_utc = _normalize_time_range(start, end)
 
@@ -1278,14 +1735,52 @@ def get_peer_usage(
         return [UsagePointDTO(day=r.day, rx=r.rx, tx=r.tx) for r in rows]
 
     if window == "raw":
-        now_utc = datetime.now(timezone.utc)
-        end_dt = end_utc or now_utc
-        if start_utc is not None:
-            cutoff = start_utc
-        else:
-            # Default to last hour if not specified
-            lookback = seconds if seconds and seconds > 0 else 3600
-            cutoff = end_dt - timedelta(seconds=lookback)
+        resolved_seconds, cutoff, end_dt = _normalize_raw_window(
+            seconds=seconds,
+            start_utc=start_utc,
+            end_utc=end_utc,
+        )
+        resolved_interval = _normalize_raw_interval(resolved_seconds, interval)
+
+        if _minute_coverage_covers_window_start(
+            db,
+            peer_id=peer_id,
+            selected_only=False,
+            cutoff=cutoff,
+            end_dt=end_dt,
+        ):
+            query = text(
+                """
+                SELECT
+                    CAST(strftime('%s', minute_ts) / :interval AS INT) * :interval as bucket,
+                    COALESCE(SUM(rx), 0) as d_rx,
+                    COALESCE(SUM(tx), 0) as d_tx
+                FROM usage_minute
+                WHERE peer_id = :peer_id
+                  AND minute_ts >= :cutoff
+                  AND minute_ts <= :end
+                GROUP BY bucket
+                ORDER BY bucket
+                """
+            )
+            rows = db.execute(
+                query,
+                {
+                    "peer_id": peer_id,
+                    "cutoff": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+                    "end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "interval": resolved_interval,
+                },
+            ).fetchall()
+            return [
+                UsagePointDTO(
+                    day=datetime.fromtimestamp(int(r[0]), tz=timezone.utc).isoformat(),
+                    rx=int(r[1] or 0),
+                    tx=int(r[2] or 0),
+                )
+                for r in rows
+            ]
+
         samples = (
             db.query(UsageSample)
             .filter(
@@ -1296,43 +1791,27 @@ def get_peer_usage(
             .order_by(UsageSample.ts.asc())
             .all()
         )
-
-        interval = interval if interval and interval > 0 else 0
         buckets: dict[datetime, list[int]] = {}
-        points: List[UsagePointDTO] = []
         prev: Optional[UsageSample] = None
-
         for s in samples:
             if prev is None:
                 prev = s
                 continue
-            # Compute deltas, guard against counter resets
-            drx = s.rx - prev.rx if s.rx >= prev.rx else 0
-            dtx = s.tx - prev.tx if s.tx >= prev.tx else 0
+            drx = s.rx if s.rx < prev.rx else s.rx - prev.rx
+            dtx = s.tx if s.tx < prev.tx else s.tx - prev.tx
             prev = s
             if drx <= 0 and dtx <= 0:
                 continue
-            
-            # Use ISO8601 UTC timestamp so frontend can apply timezone formatting
-            # If interval > 0, we bucket by time slice
-            if interval > 0:
-                ts = s.ts.replace(tzinfo=timezone.utc)
-                ts_timestamp = ts.timestamp()
-                # Floor time to nearest interval
-                bucket_ts_val = ts_timestamp - (ts_timestamp % interval)
-                bucket_dt = datetime.fromtimestamp(bucket_ts_val, tz=timezone.utc)
-                b = buckets.setdefault(bucket_dt, [0, 0])
-                b[0] += drx
-                b[1] += dtx
-            else:
-                label = s.ts.replace(tzinfo=timezone.utc).isoformat()
-                points.append(UsagePointDTO(day=label, rx=drx, tx=dtx))
-        
-        if interval > 0:
-            for ts, (rx_sum, tx_sum) in sorted(buckets.items(), key=lambda kv: kv[0]):
-                points.append(UsagePointDTO(day=ts.isoformat(), rx=rx_sum, tx=tx_sum))
-                
-        return points
+            ts = s.ts.replace(tzinfo=timezone.utc)
+            bucket_ts_val = int(ts.timestamp() // resolved_interval) * resolved_interval
+            bucket_dt = datetime.fromtimestamp(bucket_ts_val, tz=timezone.utc)
+            bucket = buckets.setdefault(bucket_dt, [0, 0])
+            bucket[0] += int(drx or 0)
+            bucket[1] += int(dtx or 0)
+        return [
+            UsagePointDTO(day=ts.isoformat(), rx=vals[0], tx=vals[1])
+            for ts, vals in sorted(buckets.items(), key=lambda item: item[0])
+        ]
 
     raise HTTPException(status_code=400, detail="window must be 'daily' or 'raw'")
 
@@ -1345,12 +1824,14 @@ def reset_peer_metrics(peer_id: int, db: Session = Depends(get_db), current_user
     if not peer:
         raise HTTPException(status_code=404, detail="peer not found")
     deleted_samples = db.query(UsageSample).filter(UsageSample.peer_id == peer_id).delete()
+    deleted_minutes = db.query(UsageMinute).filter(UsageMinute.peer_id == peer_id).delete()
     deleted_daily = db.query(UsageDaily).filter(UsageDaily.peer_id == peer_id).delete()
     deleted_monthly = db.query(UsageMonthly).filter(UsageMonthly.peer_id == peer_id).delete()
     db.commit()
     return {
         "ok": True,
         "deleted_samples": deleted_samples,
+        "deleted_minutes": deleted_minutes,
         "deleted_daily": deleted_daily,
         "deleted_monthly": deleted_monthly,
     }
@@ -1440,6 +1921,7 @@ class MonthlySummaryPointDTO(BaseModel):
 def get_monthly_summary(
     days: int = 14,
     router_id: Optional[int] = None,
+    router_ids: Optional[List[int]] = Query(None),
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     all_time: bool = False,
@@ -1452,6 +1934,7 @@ def get_monthly_summary(
     - If `start`/`end` are provided: filter by day range (returns only days with data).
     - If `all_time=true`: return all available days (returns only days with data).
     """
+    router_id, router_ids = _resolve_router_filter(router_id, router_ids)
     start_utc, end_utc = _normalize_time_range(start, end)
 
     base = (
@@ -1463,8 +1946,7 @@ def get_monthly_summary(
         .join(Peer, UsageDaily.peer_id == Peer.id)
         .filter(Peer.selected == True)
     )
-    if router_id is not None:
-        base = base.filter(Peer.router_id == router_id)
+    base = _apply_router_filter(base, router_id, router_ids)
 
     if all_time or start_utc is not None or end_utc is not None:
         q = base
@@ -1497,6 +1979,75 @@ def get_monthly_summary(
     return out
 
 
+class RouterMonthlySummaryPointDTO(BaseModel):
+    router_id: int
+    day: str
+    rx: int
+    tx: int
+
+
+@router.get("/summary/month/by_router", response_model=List[RouterMonthlySummaryPointDTO])
+def get_monthly_summary_by_router(
+    days: int = 14,
+    router_id: Optional[int] = None,
+    router_ids: Optional[List[int]] = Query(None),
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    all_time: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    router_id, router_ids = _resolve_router_filter(router_id, router_ids)
+    start_utc, end_utc = _normalize_time_range(start, end)
+
+    base = (
+        db.query(
+            Peer.router_id.label("router_id"),
+            UsageDaily.day.label("day"),
+            func.coalesce(func.sum(UsageDaily.rx), 0).label("rx"),
+            func.coalesce(func.sum(UsageDaily.tx), 0).label("tx"),
+        )
+        .join(Peer, UsageDaily.peer_id == Peer.id)
+        .filter(Peer.selected == True)
+    )
+    base = _apply_router_filter(base, router_id, router_ids)
+
+    if all_time or start_utc is not None or end_utc is not None:
+        q = base
+        if start_utc is not None:
+            q = q.filter(UsageDaily.day >= start_utc.date().strftime("%Y-%m-%d"))
+        if end_utc is not None:
+            q = q.filter(UsageDaily.day <= end_utc.date().strftime("%Y-%m-%d"))
+        rows = (
+            q.group_by(Peer.router_id, UsageDaily.day)
+            .order_by(Peer.router_id.asc(), UsageDaily.day.asc())
+            .all()
+        )
+        return [
+            RouterMonthlySummaryPointDTO(router_id=int(r.router_id), day=r.day, rx=int(r.rx or 0), tx=int(r.tx or 0))
+            for r in rows
+        ]
+
+    try:
+        days = int(days)
+    except Exception:
+        days = 14
+    days = max(1, min(180, days))
+    today = datetime.utcnow().date()
+    day_keys = [(today - timedelta(days=o)).strftime("%Y-%m-%d") for o in range(days)]
+
+    rows = (
+        base.filter(UsageDaily.day.in_(day_keys))
+        .group_by(Peer.router_id, UsageDaily.day)
+        .order_by(Peer.router_id.asc(), UsageDaily.day.asc())
+        .all()
+    )
+    return [
+        RouterMonthlySummaryPointDTO(router_id=int(r.router_id), day=r.day, rx=int(r.rx or 0), tx=int(r.tx or 0))
+        for r in rows
+    ]
+
+
 class PeerUsageSummaryDTO(BaseModel):
     peer_id: int
     rx: int
@@ -1508,6 +2059,7 @@ def get_peers_summary(
     days: Optional[int] = None,
     seconds: Optional[int] = None,
     router_id: Optional[int] = None,
+    router_ids: Optional[List[int]] = Query(None),
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     all_time: bool = False,
@@ -1520,73 +2072,55 @@ def get_peers_summary(
     - If `seconds` is provided (e.g. 3600), aggregates raw UsageSample deltas.
     - If neither, defaults to days=1.
     """
+    router_id, router_ids = _resolve_router_filter(router_id, router_ids)
     start_utc, end_utc = _normalize_time_range(start, end)
     summary: dict[int, dict[str, int]] = {}  # peer_id -> {rx, tx}
 
     if seconds and seconds > 0:
-        # RAW WINDOW (deltas from UsageSample)
-        seconds = max(60, min(7 * 24 * 3600, int(seconds)))
-        now_utc = datetime.now(timezone.utc)
-        end_dt = end_utc or now_utc
-        if start_utc is not None:
-            cutoff = start_utc
-            span = (end_dt - cutoff).total_seconds()
-            if span > 7 * 24 * 3600:
-                raise HTTPException(status_code=400, detail="raw window max span is 7 days")
-        else:
-            cutoff = end_dt - timedelta(seconds=seconds)
-        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-        end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-        
-        router_filter = f"AND p.router_id = {int(router_id)}" if router_id else ""
-        
-        query = text(f"""
-        WITH filtered_samples AS (
-            SELECT 
-                u.peer_id,
-                u.ts,
-                u.rx,
-                u.tx
-            FROM usage_samples u
-            JOIN peers p ON u.peer_id = p.id
-            WHERE u.ts >= :cutoff
-              AND u.ts <= :end
-              AND p.selected = 1
-              {router_filter}
-        ),
-        deltas AS (
-            SELECT
-                peer_id,
-                ts,
-                rx,
-                tx,
-                LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_rx,
-                LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_tx
-            FROM filtered_samples
+        resolved_seconds, cutoff, end_dt = _normalize_raw_window(
+            seconds=seconds,
+            start_utc=start_utc,
+            end_utc=end_utc,
         )
-        SELECT
-            peer_id,
-            SUM(CASE 
-                WHEN prev_rx IS NULL THEN 0
-                WHEN rx < prev_rx THEN rx
-                ELSE rx - prev_rx 
-            END) as total_rx,
-            SUM(CASE 
-                WHEN prev_tx IS NULL THEN 0
-                WHEN tx < prev_tx THEN tx
-                ELSE tx - prev_tx 
-            END) as total_tx
-        FROM deltas
-        WHERE prev_rx IS NOT NULL
-        GROUP BY peer_id
-        """)
-
-        result = db.execute(query, {"cutoff": cutoff_str, "end": end_str})
-        for r in result:
-             peer_id = r[0]
-             s = summary.setdefault(peer_id, {"rx": 0, "tx": 0})
-             s["rx"] += int(r[1] or 0)
-             s["tx"] += int(r[2] or 0)
+        if _minute_coverage_covers_window_start(
+            db,
+            router_id=router_id,
+            router_ids=router_ids,
+            cutoff=cutoff,
+            end_dt=end_dt,
+        ):
+            router_filter = _router_sql_filter(router_id, router_ids)
+            query = text(f"""
+            SELECT
+                m.peer_id,
+                COALESCE(SUM(m.rx), 0) as total_rx,
+                COALESCE(SUM(m.tx), 0) as total_tx
+            FROM usage_minute m
+            JOIN peers p ON p.id = m.peer_id
+            WHERE p.selected = 1
+              {router_filter}
+              AND m.minute_ts >= :cutoff
+              AND m.minute_ts <= :end
+            GROUP BY m.peer_id
+            """)
+            result = db.execute(
+                query,
+                {
+                    "cutoff": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+                    "end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
+            for r in result:
+                summary[int(r[0])] = {"rx": int(r[1] or 0), "tx": int(r[2] or 0)}
+        else:
+            for peer_id, rx, tx in _query_raw_peer_summaries(
+                db,
+                cutoff=cutoff,
+                end_dt=end_dt,
+                router_id=router_id,
+                router_ids=router_ids,
+            ):
+                summary[peer_id] = {"rx": rx, "tx": tx}
             
     else:
         # DAILY WINDOW (UsageDaily)
@@ -1599,8 +2133,7 @@ def get_peers_summary(
             .join(Peer, UsageDaily.peer_id == Peer.id)
             .filter(Peer.selected == True)
         )
-        if router_id is not None:
-            q = q.filter(Peer.router_id == router_id)
+        q = _apply_router_filter(q, router_id, router_ids)
         if not all_time:
             if start_utc is not None:
                 q = q.filter(UsageDaily.day >= start_utc.date().strftime("%Y-%m-%d"))
@@ -1631,125 +2164,220 @@ class SummaryRawPointDTO(BaseModel):
 def get_summary_raw(
     seconds: int = 3600,
     router_id: Optional[int] = None,
+    router_ids: Optional[List[int]] = Query(None),
     interval: Optional[int] = None,
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Aggregate raw UsageSample deltas across selected peers for the last N seconds (or start/end)."""
+    """Aggregate minute rollups across selected peers for the requested raw-range window."""
+    router_id, router_ids = _resolve_router_filter(router_id, router_ids)
     start_utc, end_utc = _normalize_time_range(start, end)
-    try:
-        seconds = int(seconds)
-    except Exception:
-        seconds = 3600
-    seconds = max(60, min(7 * 24 * 3600, seconds))
-    now_utc = datetime.now(timezone.utc)
-    end_dt = end_utc or now_utc
-    if start_utc is not None:
-        cutoff = start_utc
-        span = (end_dt - cutoff).total_seconds()
-        if span > 7 * 24 * 3600:
-            raise HTTPException(status_code=400, detail="raw window max span is 7 days")
-        seconds = int(max(60, min(7 * 24 * 3600, span)))
-    else:
-        cutoff = end_dt - timedelta(seconds=seconds)
-    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-    end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    interval = interval if interval and interval > 0 else 0
-    if interval <= 0:
-        # dynamic default
-        if seconds <= 3600: interval = 60
-        elif seconds <= 86400: interval = 3600
-        else: interval = 6 * 3600
-
-    # CTE to calculate deltas. 
-    # Logic: 
-    # 1. Filter samples by time and selected peers/router.
-    # 2. Use LAG to find previous rx/tx.
-    # 3. Calculate delta (handle resets/wrapping).
-    # 4. Filter out first row (prev IS NULL) effectively.
-    
-    router_filter = f"AND p.router_id = {int(router_id)}" if router_id else ""
-    
-    query = text(f"""
-    WITH filtered_samples AS (
-        SELECT 
-            u.peer_id,
-            u.ts,
-            u.rx,
-            u.tx
-        FROM usage_samples u
-        JOIN peers p ON u.peer_id = p.id
-        WHERE u.ts >= :cutoff
-          AND u.ts <= :end
-          AND p.selected = 1
-          {router_filter}
-    ),
-    deltas AS (
-        SELECT
-            peer_id,
-            ts,
-            rx,
-            tx,
-            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_rx,
-            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_tx
-        FROM filtered_samples
+    resolved_seconds, cutoff, end_dt = _normalize_raw_window(
+        seconds=seconds,
+        start_utc=start_utc,
+        end_utc=end_utc,
     )
-    SELECT
-        CAST(strftime('%s', ts) / :interval AS INT) * :interval as bucket,
-        SUM(CASE 
-            WHEN prev_rx IS NULL THEN 0
-            WHEN rx < prev_rx THEN rx
-            ELSE rx - prev_rx 
-        END) as d_rx,
-        SUM(CASE 
-            WHEN prev_tx IS NULL THEN 0
-            WHEN tx < prev_tx THEN tx
-            ELSE tx - prev_tx 
-        END) as d_tx
-    FROM deltas
-    WHERE prev_rx IS NOT NULL
-    GROUP BY bucket
-    ORDER BY bucket
-    """)
-
-    result = db.execute(query, {"cutoff": cutoff_str, "end": end_str, "interval": interval})
-    rows = result.fetchall()
+    resolved_interval = _normalize_raw_interval(resolved_seconds, interval)
+    if _minute_coverage_covers_window_start(
+        db,
+        router_id=router_id,
+        router_ids=router_ids,
+        cutoff=cutoff,
+        end_dt=end_dt,
+    ):
+        router_filter = _router_sql_filter(router_id, router_ids)
+        query = text(f"""
+        SELECT
+            CAST(strftime('%s', m.minute_ts) / :interval AS INT) * :interval as bucket,
+            COALESCE(SUM(m.rx), 0) as d_rx,
+            COALESCE(SUM(m.tx), 0) as d_tx
+        FROM usage_minute m
+        JOIN peers p ON p.id = m.peer_id
+        WHERE p.selected = 1
+          {router_filter}
+          AND m.minute_ts >= :cutoff
+          AND m.minute_ts <= :end
+        GROUP BY bucket
+        ORDER BY bucket
+        """)
+        rows = db.execute(
+            query,
+            {
+                "cutoff": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+                "end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "interval": resolved_interval,
+            },
+        ).fetchall()
+    else:
+        rows = _query_raw_aggregate_buckets(
+            db,
+            cutoff=cutoff,
+            end_dt=end_dt,
+            interval=resolved_interval,
+            router_id=router_id,
+            router_ids=router_ids,
+        )
 
     out: List[SummaryRawPointDTO] = []
     for r in rows:
-        bucket_ts = r[0]
-        rx = r[1] or 0
-        tx = r[2] or 0
-        dt = datetime.fromtimestamp(bucket_ts, tz=timezone.utc)
-        out.append(SummaryRawPointDTO(ts=dt.isoformat(), rx=rx, tx=tx))
+        dt = datetime.fromtimestamp(int(r[0]), tz=timezone.utc)
+        out.append(SummaryRawPointDTO(ts=dt.isoformat(), rx=int(r[1] or 0), tx=int(r[2] or 0)))
         
     return out
+
+
+class RouterSummaryRawPointDTO(BaseModel):
+    router_id: int
+    ts: str
+    rx: int
+    tx: int
+
+
+@router.get("/summary/raw/by_router", response_model=List[RouterSummaryRawPointDTO])
+def get_summary_raw_by_router(
+    seconds: int = 3600,
+    router_id: Optional[int] = None,
+    router_ids: Optional[List[int]] = Query(None),
+    interval: Optional[int] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    router_id, router_ids = _resolve_router_filter(router_id, router_ids)
+    start_utc, end_utc = _normalize_time_range(start, end)
+    resolved_seconds, cutoff, end_dt = _normalize_raw_window(
+        seconds=seconds,
+        start_utc=start_utc,
+        end_utc=end_utc,
+    )
+    resolved_interval = _normalize_raw_interval(resolved_seconds, interval)
+    if _minute_coverage_covers_window_start(
+        db,
+        router_id=router_id,
+        router_ids=router_ids,
+        cutoff=cutoff,
+        end_dt=end_dt,
+    ):
+        router_filter = _router_sql_filter(router_id, router_ids)
+        query = text(f"""
+        SELECT
+            p.router_id,
+            CAST(strftime('%s', m.minute_ts) / :interval AS INT) * :interval as bucket,
+            COALESCE(SUM(m.rx), 0) as d_rx,
+            COALESCE(SUM(m.tx), 0) as d_tx
+        FROM usage_minute m
+        JOIN peers p ON p.id = m.peer_id
+        WHERE p.selected = 1
+          {router_filter}
+          AND m.minute_ts >= :cutoff
+          AND m.minute_ts <= :end
+        GROUP BY p.router_id, bucket
+        ORDER BY p.router_id, bucket
+        """)
+        rows = db.execute(
+            query,
+            {
+                "cutoff": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+                "end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "interval": resolved_interval,
+            },
+        ).fetchall()
+    else:
+        rows = _query_raw_router_buckets(
+            db,
+            cutoff=cutoff,
+            end_dt=end_dt,
+            interval=resolved_interval,
+            router_id=router_id,
+            router_ids=router_ids,
+        )
+    out: List[RouterSummaryRawPointDTO] = []
+    for r in rows:
+        dt = datetime.fromtimestamp(int(r[1]), tz=timezone.utc)
+        out.append(
+            RouterSummaryRawPointDTO(
+                router_id=int(r[0]),
+                ts=dt.isoformat(),
+                rx=int(r[2] or 0),
+                tx=int(r[3] or 0),
+            )
+        )
+    return out
+
+
+class UsageMaintenanceStatusDTO(BaseModel):
+    running: bool
+    phase: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    last_error: Optional[str] = None
+    last_completed_phase: Optional[str] = None
+    resume_cursor: Optional[dict] = None
+    detail: Optional[str] = None
+    backup_path: Optional[str] = None
+    file_size_before: Optional[int] = None
+    file_size_after: Optional[int] = None
+    backfilled_minutes: int = 0
+    deleted_samples: int = 0
+    deleted_minutes: int = 0
+    deleted_daily: int = 0
+    backfill_cutoff: Optional[str] = None
+    raw_prune_before: Optional[str] = None
+    minute_prune_before: Optional[str] = None
+    daily_prune_before: Optional[str] = None
+
+
+@router.get("/admin/usage_maintenance", response_model=UsageMaintenanceStatusDTO)
+def read_usage_maintenance_status(
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    return UsageMaintenanceStatusDTO(**get_usage_maintenance_status())
+
+
+@router.post("/admin/usage_maintenance/run", response_model=UsageMaintenanceStatusDTO, status_code=202)
+def run_usage_maintenance(
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    try:
+        started, status = start_usage_maintenance()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not started:
+        raise HTTPException(status_code=409, detail="Usage maintenance is already running")
+    return UsageMaintenanceStatusDTO(**status)
 
 
 @router.post("/admin/purge_usage")
 def purge_usage(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Delete all usage samples and rollups, keep peers/routers/settings."""
+    _require_admin(current_user)
     deleted_samples = db.query(UsageSample).delete()
+    deleted_minutes = db.query(UsageMinute).delete()
     deleted_daily = db.query(UsageDaily).delete()
     deleted_monthly = db.query(UsageMonthly).delete()
     db.commit()
     return {
         "ok": True,
         "deleted_samples": deleted_samples,
+        "deleted_minutes": deleted_minutes,
         "deleted_daily": deleted_daily,
         "deleted_monthly": deleted_monthly,
     }
 
 
 @router.post("/admin/purge_peers")
-def purge_peers(db: Session = Depends(get_db)):
+def purge_peers(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Delete all peers (and cascading usage/quotas), keep routers/settings."""
+    _require_admin(current_user)
     deleted_peers = db.query(Peer).delete()
     # Cascades will remove usage + quotas via FK; ensure rollups are cleared
     db.query(UsageSample).delete()
+    db.query(UsageMinute).delete()
     db.query(UsageDaily).delete()
     db.query(UsageMonthly).delete()
     db.query(Quota).delete()

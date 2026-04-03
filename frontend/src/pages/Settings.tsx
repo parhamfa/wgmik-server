@@ -1,6 +1,6 @@
 import React from "react";
 import { Link } from "react-router-dom";
-import { getSettings, putSettings, listRouters, getActiveRouter, setActiveRouter, createRouter, updateRouter, deleteRouter, testRouter, syncRouter, purgeUsage, purgePeers, fetchJson, type Router, type RouterProto } from "../api";
+import { getSettings, putSettings, listRouters, getActiveRouter, setActiveRouter, createRouter, updateRouter, deleteRouter, testRouter, syncRouter, purgeUsage, purgePeers, getUsageMaintenanceStatus, runUsageMaintenance, fetchJson, type Router, type RouterProto, type UsageMaintenanceStatusDTO } from "../api";
 
 function getUtcOffsetMinutes(timeZone: string, date: Date) {
   // Robust cross-browser offset calc without relying on timeZoneName formatting.
@@ -39,6 +39,18 @@ function fmtUtcOffset(offsetMinutes: number) {
   return `${sign}${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
 }
 
+function formatBytes(bytes?: number | null) {
+  if (!bytes || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx += 1;
+  }
+  return `${value >= 10 || idx === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[idx]}`;
+}
+
 export default function SettingsPage() {
   const [form, setForm] = React.useState({
     poll_interval_seconds: 30,
@@ -52,7 +64,14 @@ export default function SettingsPage() {
     peer_default_scope_value: 14,
     dashboard_scope_unit: "days",
     dashboard_scope_value: 14,
+    dashboard_router_scope: "all" as "all" | "active" | "selected",
+    dashboard_selected_router_ids: [] as number[],
+    dashboard_filter_status: "all",
+    dashboard_sort_by: "created",
     peer_refresh_seconds: 30,
+    raw_sample_retention_hours: 24,
+    minute_rollup_retention_days: 90,
+    daily_rollup_retention_days: 0,
   });
   const [err, setErr] = React.useState("");
   const [saveState, setSaveState] = React.useState<"idle" | "dirty" | "saving" | "saved" | "error">("idle");
@@ -86,6 +105,7 @@ export default function SettingsPage() {
   const [maintErr, setMaintErr] = React.useState("");
   const [confirmAction, setConfirmAction] = React.useState<"usage" | "peers" | null>(null);
   const [confirmDeleteRouter, setConfirmDeleteRouter] = React.useState<Router | null>(null);
+  const [usageMaintenance, setUsageMaintenance] = React.useState<UsageMaintenanceStatusDTO | null>(null);
 
   // User management state
   interface User { id: number; username: string; is_admin: boolean; created_at: string; }
@@ -194,6 +214,22 @@ export default function SettingsPage() {
 
   React.useEffect(() => { loadSettings(); }, [loadSettings]);
   React.useEffect(() => { loadRouters(); }, [loadRouters]);
+  const loadUsageMaintenance = React.useCallback(async () => {
+    try {
+      const status = await getUsageMaintenanceStatus();
+      setUsageMaintenance(status);
+    } catch {
+      setUsageMaintenance(null);
+    }
+  }, []);
+  React.useEffect(() => { loadUsageMaintenance(); }, [loadUsageMaintenance]);
+  React.useEffect(() => {
+    if (!usageMaintenance?.running) return;
+    const timer = window.setInterval(() => {
+      loadUsageMaintenance();
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [usageMaintenance?.running, loadUsageMaintenance]);
   React.useEffect(() => {
     (async () => {
       try {
@@ -242,6 +278,7 @@ export default function SettingsPage() {
   };
 
   React.useEffect(() => { loadUsers(); }, [loadUsers]);
+  const retentionLocked = !!usageMaintenance?.running;
 
   function openRouterModal(row?: Router) {
     if (row) {
@@ -499,6 +536,74 @@ export default function SettingsPage() {
                 <span className="text-gray-500 dark:text-gray-400">seconds</span>
               </div>
             </div>
+            <div className="grid gap-3 pt-4 border-t border-gray-100 dark:border-gray-800">
+              <div>
+                <div className="text-xs font-semibold text-gray-900 dark:text-gray-100">Usage retention and rollups</div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  Recommended defaults for a 5-second polling setup. Raw samples should stay short-lived, minute buckets should cover charting, and daily totals can remain long-term. These values now drive the usage maintenance job.
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
+                <span className="text-gray-500 dark:text-gray-400">Keep raw samples for</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={8760}
+                  className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                  value={form.raw_sample_retention_hours}
+                  disabled={retentionLocked}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      raw_sample_retention_hours: Math.max(1, Math.min(8760, Number(e.target.value || 1))),
+                    })
+                  }
+                />
+                <span className="text-gray-500 dark:text-gray-400">hours</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
+                <span className="text-gray-500 dark:text-gray-400">Keep minute rollups for</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={3650}
+                  className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                  value={form.minute_rollup_retention_days}
+                  disabled={retentionLocked}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      minute_rollup_retention_days: Math.max(1, Math.min(3650, Number(e.target.value || 1))),
+                    })
+                  }
+                />
+                <span className="text-gray-500 dark:text-gray-400">days</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
+                <span className="text-gray-500 dark:text-gray-400">Keep daily rollups for</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={36500}
+                  className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                  value={form.daily_rollup_retention_days}
+                  disabled={retentionLocked}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      daily_rollup_retention_days: Math.max(0, Math.min(36500, Number(e.target.value || 0))),
+                    })
+                  }
+                />
+                <span className="text-gray-500 dark:text-gray-400">days</span>
+                <span className="text-[11px] text-gray-400 dark:text-gray-500">0 means keep forever</span>
+              </div>
+              {retentionLocked && (
+                <div className="text-[11px] text-amber-700 dark:text-amber-300">
+                  Retention values are locked while usage maintenance is running.
+                </div>
+              )}
+            </div>
           </div>
           {err && <div className="text-sm text-red-600">{err}</div>}
         </div>
@@ -607,21 +712,70 @@ export default function SettingsPage() {
           )}
         </div>
       </div>
-      <div className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5">
+      <div className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 mb-6">
         <div className="flex items-center justify-between mb-3">
           <div>
             <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">Data maintenance</div>
-            <div className="text-xs text-gray-500 dark:text-gray-400">Danger zone: permanently remove stored usage and peers.</div>
+            <div className="text-xs text-gray-500 dark:text-gray-400">Run controlled cleanup or use the destructive purge actions below.</div>
           </div>
+          <button
+            type="button"
+            disabled={maintBusy !== null || !!usageMaintenance?.running}
+            onClick={async () => {
+              setMaintErr("");
+              setMaintMsg("");
+              try {
+                setMaintBusy("run_usage_maintenance");
+                const status = await runUsageMaintenance();
+                setUsageMaintenance(status);
+                setMaintMsg("Usage maintenance started. The scheduler is paused until it finishes.");
+              } catch (e: any) {
+                setMaintErr(e?.message || "Failed to start usage maintenance");
+                await loadUsageMaintenance();
+              } finally {
+                setMaintBusy(null);
+              }
+            }}
+            className="rounded-full bg-gray-900 text-white px-4 py-1.5 text-xs shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+          >
+            {usageMaintenance?.running ? "Maintenance running" : maintBusy === "run_usage_maintenance" ? "Starting..." : "Run maintenance now"}
+          </button>
         </div>
         {maintMsg && <div className="text-sm text-green-700 mb-3">{maintMsg}</div>}
         {maintErr && <div className="text-sm text-red-600 mb-3">{maintErr}</div>}
+        <div className="rounded-2xl ring-1 ring-gray-200 dark:ring-gray-800 bg-gray-50 dark:bg-gray-950 p-4 mb-4 grid gap-2">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="font-medium text-gray-900 dark:text-gray-100">Usage maintenance status:</span>
+            <span className={`rounded-full px-2.5 py-1 ${usageMaintenance?.running ? "bg-amber-100 text-amber-800 dark:bg-amber-500/10 dark:text-amber-300" : "bg-gray-200 text-gray-800 dark:bg-gray-800 dark:text-gray-200"}`}>
+              {usageMaintenance?.running ? `Running · ${usageMaintenance.phase}` : `Idle · ${usageMaintenance?.last_completed_phase || "never run"}`}
+            </span>
+          </div>
+          <div className="text-xs text-gray-600 dark:text-gray-300">
+            {usageMaintenance?.detail || "This backfills minute rollups, prunes old data by policy, and compacts the SQLite database file."}
+          </div>
+          <div className="flex flex-wrap gap-x-4 gap-y-2 text-[11px] text-gray-500 dark:text-gray-400">
+            <span>Backfilled minute rows: {usageMaintenance?.backfilled_minutes ?? 0}</span>
+            <span>Deleted raw samples: {usageMaintenance?.deleted_samples ?? 0}</span>
+            <span>Deleted minute rollups: {usageMaintenance?.deleted_minutes ?? 0}</span>
+            <span>Deleted daily rollups: {usageMaintenance?.deleted_daily ?? 0}</span>
+            <span>DB size before: {formatBytes(usageMaintenance?.file_size_before ?? null)}</span>
+            <span>DB size after: {formatBytes(usageMaintenance?.file_size_after ?? null)}</span>
+          </div>
+          {(usageMaintenance?.started_at || usageMaintenance?.finished_at || usageMaintenance?.last_error || usageMaintenance?.backup_path) && (
+            <div className="grid gap-1 text-[11px] text-gray-500 dark:text-gray-400">
+              {usageMaintenance?.started_at && <div>Started: {new Date(usageMaintenance.started_at).toLocaleString()}</div>}
+              {usageMaintenance?.finished_at && <div>Finished: {new Date(usageMaintenance.finished_at).toLocaleString()}</div>}
+              {usageMaintenance?.backup_path && <div>Backup: {usageMaintenance.backup_path}</div>}
+              {usageMaintenance?.last_error && <div className="text-rose-600 dark:text-rose-300">Last error: {usageMaintenance.last_error}</div>}
+            </div>
+          )}
+        </div>
         <div className="grid gap-3 text-sm">
           <div className="flex items-center justify-between">
-            <div className="text-xs text-gray-600 dark:text-gray-300">Purge all usage data (samples, daily and monthly rollups). Peers and routers stay.</div>
+            <div className="text-xs text-gray-600 dark:text-gray-300">Purge all usage data (raw samples, minute, daily and monthly rollups). Peers and routers stay.</div>
             <button
               type="button"
-              disabled={maintBusy !== null}
+              disabled={maintBusy !== null || !!usageMaintenance?.running}
               onClick={() => { setMaintErr(""); setMaintMsg(""); setConfirmAction("usage"); }}
               className="rounded-full bg-rose-50 text-rose-700 px-4 py-1.5 text-xs shadow hover:bg-rose-100 disabled:opacity-50"
             >
@@ -632,7 +786,7 @@ export default function SettingsPage() {
             <div className="text-xs text-gray-600 dark:text-gray-300">Delete all peers (and their quotas/usages). Routers remain configured.</div>
             <button
               type="button"
-              disabled={maintBusy !== null}
+              disabled={maintBusy !== null || !!usageMaintenance?.running}
               onClick={() => { setMaintErr(""); setMaintMsg(""); setConfirmAction("peers"); }}
               className="rounded-full bg-rose-600 text-white px-4 py-1.5 text-xs shadow hover:bg-rose-700 disabled:opacity-50"
             >
@@ -855,5 +1009,3 @@ export default function SettingsPage() {
     </div>
   );
 }
-
-

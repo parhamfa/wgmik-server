@@ -95,14 +95,12 @@ class RouterOSApiClient(RouterOSClient):
             except Exception:
                 pass
 
-    def list_wireguard_peers(self, interface: str) -> List[WGPeer]:
+    def list_all_wireguard_peers(self) -> List[WGPeer]:
         peers: List[WGPeer] = []
         api = self._conn()
         try:
             rows = api(cmd="/interface/wireguard/peers/print")
             for row in rows:
-                if row.get("interface") != interface:
-                    continue
                 peers.append(
                     WGPeer(
                         ros_id=row.get(".id", ""),
@@ -123,6 +121,9 @@ class RouterOSApiClient(RouterOSClient):
                 api.close()
             except Exception:
                 pass
+
+    def list_wireguard_peers(self, interface: str) -> List[WGPeer]:
+        return [peer for peer in self.list_all_wireguard_peers() if peer.interface == interface]
 
     def set_peer_disabled(self, interface: str, ros_id: str, disabled: bool) -> None:
         api = self._conn()

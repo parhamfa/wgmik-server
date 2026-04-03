@@ -1,5 +1,6 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import datetime, timezone
@@ -8,8 +9,9 @@ from typing import Optional, Dict, Tuple
 
 from .settings import settings
 from .db import SessionLocal
-from .models import Router, Peer, UsageSample, UsageDaily, UsageMonthly, SettingsKV, Quota, Action
+from .models import Router, Peer, UsageSample, UsageMinute, UsageDaily, UsageMonthly, SettingsKV, Quota, Action
 from .routeros.factory import make_client
+from .usage_storage import floor_to_minute_utc, upsert_usage_minute
 
 
 _scheduler: Optional[BackgroundScheduler] = None
@@ -154,6 +156,9 @@ def _poll_once():
 
                 # Update rollups only when there's actual traffic in this poll
                 if delta_rx != 0 or delta_tx != 0:
+                    minute_ts = floor_to_minute_utc(now_utc)
+                    upsert_usage_minute(db, peer.id, minute_ts, delta_rx, delta_tx)
+
                     # Update / upsert UsageDaily
                     daily = (
                         db.query(UsageDaily)
@@ -314,6 +319,9 @@ def _poll_once():
                             db.add(Action(peer_id=peer.id, ts=now_utc, action=enable_action, note=enable_note + " (no ros_id)"))
 
         db.commit()
+    except OperationalError as exc:
+        db.rollback()
+        print(f"Polling skipped due to database error: {exc}")
     finally:
         db.close()
 
@@ -332,7 +340,10 @@ def ensure_scheduler() -> BackgroundScheduler:
             )
         finally:
             db.close()
-        _scheduler = BackgroundScheduler(timezone="UTC")
+        _scheduler = BackgroundScheduler(
+            timezone="UTC",
+            job_defaults={"coalesce": True, "max_instances": 1},
+        )
         _scheduler.add_job(
             _poll_once,
             IntervalTrigger(seconds=interval),
@@ -361,3 +372,21 @@ def update_scheduler_interval(seconds: int) -> None:
         )
 
 
+def pause_scheduler() -> None:
+    global _scheduler
+    if _scheduler is None:
+        return
+    try:
+        _scheduler.pause_job("polling-job")
+    except Exception:
+        pass
+
+
+def resume_scheduler() -> None:
+    global _scheduler
+    if _scheduler is None:
+        return
+    try:
+        _scheduler.resume_job("polling-job")
+    except Exception:
+        pass
