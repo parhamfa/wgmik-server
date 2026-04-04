@@ -9,6 +9,10 @@ __pycache__/
 /frontend/dist/
 /frontend/tsconfig.tsbuildinfo
 
+# Playwright / local test artifacts (not source)
+/output/playwright/
+/test-results/
+
 # Environment and secrets
 .env
 .env.*
