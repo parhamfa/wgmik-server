@@ -5,6 +5,8 @@ import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
 import SettingsPage from "./pages/Settings";
 import PeerDetail from "./pages/PeerDetail";
 import DashboardPage from "./pages/Dashboard";
+import FairUsagePage from "./pages/FairUsage";
+import TelegramPage from "./pages/Telegram";
 import NotFound from "./pages/NotFound";
 import "./styles.css";
 
@@ -116,7 +118,9 @@ function App() {
           <Route element={<RequireAuth />}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/fair-usage" element={<FairUsagePage />} />
             <Route path="/peer/:id" element={<PeerDetail />} />
+            <Route path="/telegram" element={<TelegramPage />} />
 
           </Route>
 

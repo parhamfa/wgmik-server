@@ -2,7 +2,7 @@ import React from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import QRCode from "react-qr-code";
-import { listSavedPeers, getPeerUsage, listRouters, routerPeers, routerInterfaceDetail, getPeerClientPrivateKey, patchPeer, getPeerQuota, patchPeerQuota, resetPeerMetrics, deletePeer, reconcilePeer, getPeerActions, type PeerAction, getSettings, type SavedPeer, type UsagePoint, type Router, type PeerView, type Quota, type WGInterfaceConfig } from "../api";
+import { listSavedPeers, getPeerUsage, listRouters, routerPeers, routerInterfaceDetail, getPeerClientPrivateKey, patchPeer, getPeerQuota, patchPeerQuota, resetPeerMetrics, deletePeer, reconcilePeer, getPeerActions, type PeerAction, getSettings, type SavedPeer, type UsagePoint, type Router, type PeerView, type Quota, type WGInterfaceConfig, getFairUsagePeerStatus, resetFairUsagePeer, type FairUsagePeerStatusDTO } from "../api";
 import { useAutoSaveSettings, type ScopeUnit } from "../useAutoSaveSettings";
 
 function Card({ className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) {
@@ -56,6 +56,9 @@ export default function PeerDetail() {
   const quotaPendingRef = React.useRef(false);
   const quotaDraftInitRef = React.useRef(false);
   const userEditedRef = React.useRef(false);
+
+  const [fuStatus, setFuStatus] = React.useState<FairUsagePeerStatusDTO | null>(null);
+  const [fuResetBusy, setFuResetBusy] = React.useState(false);
 
   const [timeFrom, setTimeFrom] = React.useState<string>("");
   const [timeTo, setTimeTo] = React.useState<string>("");
@@ -240,6 +243,15 @@ export default function PeerDetail() {
     }
   }, [peerId]);
 
+  const loadFuStatus = React.useCallback(async () => {
+    try {
+      const s = await getFairUsagePeerStatus(peerId);
+      setFuStatus(s);
+    } catch {
+      setFuStatus(null);
+    }
+  }, [peerId]);
+
   const loadPeer = React.useCallback(async () => {
     const peers = await listSavedPeers();
     const p = peers.find((x) => x.id === peerId) || null;
@@ -328,7 +340,8 @@ export default function PeerDetail() {
   React.useEffect(() => {
     loadQuota();
     loadUsage();
-  }, [loadQuota, loadUsage]);
+    loadFuStatus();
+  }, [loadQuota, loadUsage, loadFuStatus]);
 
   // Auto-refresh peer usage at roughly the poll interval (default 30s)
   React.useEffect(() => {
@@ -337,9 +350,10 @@ export default function PeerDetail() {
       loadPeer();
       loadQuota();
       loadUsage();
+      loadFuStatus();
     }, refreshSec * 1000);
     return () => window.clearInterval(id);
-  }, [refreshSec, loadPeer, loadQuota, loadUsage]);
+  }, [refreshSec, loadPeer, loadQuota, loadUsage, loadFuStatus]);
 
   const serverQuotaDraft = React.useMemo(() => {
     if (!quota) return null;
@@ -806,145 +820,127 @@ export default function PeerDetail() {
                 })()}
               </div>
             </div>
-            {/* Quota management */}
-            <div className="grid gap-5 mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
-              <div className="flex items-center justify-between">
-                <div className="text-sm text-gray-700 dark:text-gray-200">Quota</div>
-                <div className="flex items-center gap-3">
-                  {quotaSaveState !== "idle" && (
-                    <div
-                      className={[
-                        "text-xs",
-                        quotaSaveState === "saving" ? "text-gray-500 dark:text-gray-400"
-                          : quotaSaveState === "saved" ? "text-green-700 dark:text-green-300"
-                            : quotaSaveState === "error" ? "text-rose-600 dark:text-rose-300"
-                              : "text-amber-700 dark:text-amber-300",
-                      ].join(" ")}
-                    >
-                      {quotaSaveState === "saving"
-                        ? "Saving…"
-                        : quotaSaveState === "saved"
-                          ? "Saved"
-                          : quotaSaveState === "error"
-                            ? "Error"
-                            : "Unsaved"}
-                    </div>
-                  )}
-                  {isQuotaDirty && serverQuotaDraft && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setQuotaErr("");
-                        setQuotaSaveState("idle");
-                        setQuotaDraft(serverQuotaDraft);
-                        userEditedRef.current = false;
-                      }}
-                      className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
-                    >
-                      Revert
-                    </button>
+            {/* Fair Usage Status */}
+            {fuStatus && fuStatus.rule_id ? (
+              <div className="grid gap-4 mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-gray-500 dark:text-gray-400">
+                      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                    </svg>
+                    <span className="text-sm text-gray-700 dark:text-gray-200">Fair Usage</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className={`rounded-full px-2.5 py-0.5 text-[11px] ${fuStatus.throttled ? "bg-amber-100 text-amber-800 dark:bg-amber-500/10 dark:text-amber-300" : "bg-green-100 text-green-800 dark:bg-green-500/10 dark:text-green-300"}`}>
+                      {fuStatus.throttled ? "Throttled" : "Normal"}
+                    </span>
+                    <span className="rounded-full bg-gray-100 text-gray-700 px-2 py-0.5 text-[11px] dark:bg-gray-800 dark:text-gray-300">
+                      {fuStatus.scope_label}
+                    </span>
+                    <span className="rounded-full bg-indigo-50 text-indigo-700 px-2 py-0.5 text-[11px] dark:bg-indigo-500/10 dark:text-indigo-300 capitalize">
+                      {fuStatus.scope_type}
+                    </span>
+                  </div>
+                </div>
+                <div className="text-xs text-gray-600 dark:text-gray-300">
+                  Rule: <span className="font-medium text-gray-900 dark:text-gray-100">{fuStatus.rule_name}</span>
+                  {fuStatus.throttled && (
+                    <span className="ml-2 text-amber-700 dark:text-amber-300">
+                      Limited to {(fuStatus.throttle_download_kbps / 1000).toFixed(1)}/{(fuStatus.throttle_upload_kbps / 1000).toFixed(1)} Mbps
+                    </span>
                   )}
                 </div>
-              </div>
-              <div className="grid gap-5 md:grid-cols-2">
-                <div className="grid gap-3">
-                  <label className="text-xs text-gray-500 dark:text-gray-400">Monthly data limit (GB)</label>
-                  <div className="flex items-center gap-3">
-                    <input
-                      type="number"
-                      min={0}
-                      step={1}
-                      className="w-32 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
-                      value={quotaDraft.limitGb}
-                      onChange={(e) => {
-                        const gb = Math.max(0, Number(e.target.value || 0));
-                        userEditedRef.current = true;
-                        setQuotaDraft((d) => ({ ...d, limitGb: gb }));
-                      }}
-                    />
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div>
+                    <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
+                      <span>{fuStatus.quota_mode === "combined" ? "Total usage" : "Download"}</span>
+                      <span>
+                        {(() => {
+                          const used = fuStatus.quota_mode === "combined" ? fuStatus.used_rx + fuStatus.used_tx : fuStatus.used_rx;
+                          const limit = fuStatus.download_quota_bytes;
+                          const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+                          return `${fmtBytes(used)} / ${fmtBytes(limit)} (${pct}%)`;
+                        })()}
+                      </span>
+                    </div>
+                    <div className="h-2 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full ${fuStatus.throttled ? "bg-amber-500" : "bg-gray-900 dark:bg-gray-100"}`}
+                        style={{
+                          width: `${(() => {
+                            const used = fuStatus.quota_mode === "combined" ? fuStatus.used_rx + fuStatus.used_tx : fuStatus.used_rx;
+                            return Math.min(100, Math.round((used / Math.max(1, fuStatus.download_quota_bytes)) * 100));
+                          })()}%`,
+                        }}
+                      />
+                    </div>
                   </div>
-                  {/* Consumption bar */}
-                  {quota && quotaDraft.limitGb > 0 ? (
-                    <div className="mt-1">
+                  {fuStatus.quota_mode === "independent" && fuStatus.upload_quota_bytes ? (
+                    <div>
                       <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
-                        <span>Usage</span>
+                        <span>Upload</span>
                         <span>
-                          {(() => {
-                            const limitBytes = quotaDraft.limitGb * 1024 * 1024 * 1024;
-                            return `${(((quota.used_rx + quota.used_tx) / Math.max(1, limitBytes)).toLocaleString(undefined, { style: "percent", minimumFractionDigits: 0 }))} `;
-                          })()}
+                          {fmtBytes(fuStatus.used_tx)} / {fmtBytes(fuStatus.upload_quota_bytes)} ({Math.min(100, Math.round((fuStatus.used_tx / Math.max(1, fuStatus.upload_quota_bytes)) * 100))}%)
                         </span>
                       </div>
                       <div className="h-2 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
                         <div
-                          className="h-full bg-gray-900 dark:bg-gray-100"
-                          style={{
-                            width: `${(() => {
-                              const limitBytes = quotaDraft.limitGb * 1024 * 1024 * 1024;
-                              return Math.min(100, Math.round(((quota.used_rx + quota.used_tx) / Math.max(1, limitBytes)) * 100));
-                            })()
-                              }% `,
-                          }}
+                          className={`h-full ${fuStatus.throttled ? "bg-amber-500" : "bg-gray-900 dark:bg-gray-100"}`}
+                          style={{ width: `${Math.min(100, Math.round((fuStatus.used_tx / Math.max(1, fuStatus.upload_quota_bytes)) * 100))}%` }}
                         />
                       </div>
                     </div>
-                  ) : <div className="text-xs text-gray-500 dark:text-gray-400">Unlimited (no quota)</div>}
+                  ) : null}
                 </div>
-                <div className="grid gap-3">
-                  <label className="text-xs text-gray-500 dark:text-gray-400">Access window (optional)</label>
-                  <div className="grid grid-cols-2 gap-2">
-                    <input
-                      type="datetime-local"
-                      className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
-                      value={quotaDraft.valid_from}
-                      onChange={(e) => {
-                        userEditedRef.current = true;
-                        setQuotaDraft((d) => ({ ...d, valid_from: e.target.value }));
+                <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+                  {fuStatus.next_reset && (
+                    <span>
+                      Resets:{" "}
+                      {fuStatus.scope_period_unit === "hour"
+                        ? new Date(fuStatus.next_reset).toLocaleString(undefined, {
+                            month: "short",
+                            day: "numeric",
+                            year: "numeric",
+                            hour: "numeric",
+                            minute: "2-digit",
+                          })
+                        : new Date(fuStatus.next_reset).toLocaleDateString(undefined, {
+                            month: "short",
+                            day: "numeric",
+                            year: "numeric",
+                          })}
+                    </span>
+                  )}
+                  {fuStatus.throttled && (
+                    <button
+                      type="button"
+                      disabled={fuResetBusy}
+                      onClick={async () => {
+                        setFuResetBusy(true);
+                        try {
+                          await resetFairUsagePeer(peerId);
+                          await loadFuStatus();
+                        } catch { }
+                        setFuResetBusy(false);
                       }}
-                    />
-                    <input
-                      type="datetime-local"
-                      className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
-                      value={quotaDraft.valid_until}
-                      onChange={(e) => {
-                        userEditedRef.current = true;
-                        setQuotaDraft((d) => ({ ...d, valid_until: e.target.value }));
-                      }}
-                    />
-                  </div>
-                  {/* Time window bar */}
-                  {quotaDraft.valid_from || quotaDraft.valid_until ? (
-                    <div className="mt-1">
-                      <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
-                        <span>Window</span>
-                        <span>
-                          {(() => {
-                            const fmt = (val?: string | null) => {
-                              if (!val) return "—";
-                              try {
-                                const d = new Date(val);
-                                return new Intl.DateTimeFormat(undefined, {
-                                  timeZone: timezone || "UTC",
-                                  dateStyle: "short",
-                                  timeStyle: "short",
-                                }).format(d);
-                              } catch {
-                                return val;
-                              }
-                            };
-                            return `${fmt(quotaDraft.valid_from)} → ${fmt(quotaDraft.valid_until)} `;
-                          })()}
-                        </span>
-                      </div>
-                      <div className="h-2 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
-                        <div className="h-full bg-gray-900 dark:bg-gray-100" style={{ width: `${Math.round((windowProgress ?? 0) * 100)}% ` }} />
-                      </div>
-                    </div>
-                  ) : <div className="text-xs text-gray-500 dark:text-gray-400">No access window set</div>}
+                      className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                    >
+                      {fuResetBusy ? "Resetting..." : "Reset throttle"}
+                    </button>
+                  )}
                 </div>
               </div>
-              {quotaErr && <div className="text-sm text-red-600">{quotaErr}</div>}
-            </div>
+            ) : (
+              <div className="mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
+                <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                  </svg>
+                  No fair usage rule applies to this peer.
+                  <a href="/fair-usage" className="text-indigo-600 hover:underline dark:text-indigo-400">Manage rules</a>
+                </div>
+              </div>
+            )}
 	            {/* Details */}
 	            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
 	              <div className="grid grid-cols-2 gap-x-4 gap-y-2">

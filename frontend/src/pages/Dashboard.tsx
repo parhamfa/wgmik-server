@@ -33,9 +33,43 @@ type RouterScope = "all" | "active" | "selected";
 type PeerStatus = { online: boolean; last: string; raw_last_handshake: number };
 type UsageTotals = { rx: number; tx: number };
 
+const ROUTER_PEER_PREVIEW_COUNT = 6;
+const FILTER_STATUS_VALUES = new Set(["all", "online", "offline", "enabled", "disabled"]);
+
 function Card({ className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) {
   const base = "rounded-3xl overflow-hidden ring-1 ring-gray-200 ring-offset-2 ring-offset-gray-50 bg-white shadow-md hover:shadow-lg transition transform hover:-translate-y-0.5 dark:ring-gray-800 dark:ring-offset-gray-950 dark:bg-gray-900";
   return <div className={`${base} ${className}`} {...props} />;
+}
+
+function FairUsageShieldIcon({ throttled }: { throttled: boolean }) {
+  const path = "M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z";
+  if (throttled) {
+    return (
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="currentColor"
+        className="h-4 w-4 text-amber-500 dark:text-amber-400"
+        aria-hidden
+      >
+        <path d={path} />
+      </svg>
+    );
+  }
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="none"
+      className="h-4 w-4 text-gray-400 dark:text-gray-500"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d={path} />
+    </svg>
+  );
 }
 
 function fmtBytes(n: number) {
@@ -284,14 +318,18 @@ export default function Dashboard() {
   const [rawByRouter, setRawByRouter] = React.useState<RouterSummaryRawPoint[]>([]);
   const [peers, setPeers] = React.useState<SavedPeer[]>([]);
   const [peerUsageMap, setPeerUsageMap] = React.useState<Record<number, UsageTotals>>({});
+  const [fairUsageByPeer, setFairUsageByPeer] = React.useState<Record<number, boolean>>({});
+  const [fairUsageThrottledByPeer, setFairUsageThrottledByPeer] = React.useState<Record<number, boolean>>({});
   const [statusMap, setStatusMap] = React.useState<Record<number, PeerStatus>>({});
   const [metrics, setMetrics] = React.useState<Metrics | null>(null);
   const [timeFrom, setTimeFrom] = React.useState("");
   const [timeTo, setTimeTo] = React.useState("");
   const [allTime, setAllTime] = React.useState(false);
   const [localFilterText, setLocalFilterText] = React.useState("");
+  const [expandedRouters, setExpandedRouters] = React.useState<Record<number, boolean>>({});
 
   const [showAdd, setShowAdd] = React.useState(false);
+  const [fabOpen, setFabOpen] = React.useState(false);
   const [addBusy, setAddBusy] = React.useState(false);
   const [addErr, setAddErr] = React.useState("");
   const [interfaceOptions, setInterfaceOptions] = React.useState<string[]>([]);
@@ -319,7 +357,9 @@ export default function Dashboard() {
   const timezone = settings?.timezone ?? "UTC";
   const showKindPills = settings?.show_kind_pills ?? true;
   const showHwStats = settings?.show_hw_stats ?? true;
-  const filterStatus = (settings?.dashboard_filter_status as "all" | "online" | "offline" | "enabled" | "disabled") ?? "all";
+  const filterStatus = FILTER_STATUS_VALUES.has(settings?.dashboard_filter_status ?? "")
+    ? (settings?.dashboard_filter_status as "all" | "online" | "offline" | "enabled" | "disabled")
+    : "all";
   const sortBy = (settings?.dashboard_sort_by as "name" | "last_seen" | "created" | "usage") ?? "created";
   const rawScope = ((settings?.dashboard_router_scope as RouterScope | undefined) ?? "all");
   const rawSelectedRouterIds = normalizeRouterIds(settings?.dashboard_selected_router_ids);
@@ -501,6 +541,10 @@ export default function Dashboard() {
       .filter((section) => !hasPeerFilters || section.peers.length > 0);
   }, [inScopeRouters, filteredPeers, peerUsageMap, statusMap, routerMonthlyMap, routerRawMap, hasPeerFilters]);
 
+  const toggleRouterExpanded = React.useCallback((routerId: number) => {
+    setExpandedRouters((current) => ({ ...current, [routerId]: !current[routerId] }));
+  }, []);
+
   const loadPeers = React.useCallback(async (signature: string) => {
     try {
       const rows = await listSavedPeersSelected(undefined, inScopeRouterIds);
@@ -613,11 +657,21 @@ export default function Dashboard() {
       const sums = await getPeersSummary(opts);
       if (signature !== scopeSignatureRef.current) return;
       const next: Record<number, UsageTotals> = {};
-      for (const sum of sums) next[sum.peer_id] = { rx: sum.rx, tx: sum.tx };
+      const nextFu: Record<number, boolean> = {};
+      const nextFuTh: Record<number, boolean> = {};
+      for (const sum of sums) {
+        next[sum.peer_id] = { rx: sum.rx, tx: sum.tx };
+        nextFu[sum.peer_id] = sum.has_fair_usage === true;
+        nextFuTh[sum.peer_id] = sum.fair_usage_throttled === true;
+      }
       setPeerUsageMap(next);
+      setFairUsageByPeer(nextFu);
+      setFairUsageThrottledByPeer(nextFuTh);
     } catch {
       if (signature !== scopeSignatureRef.current) return;
       setPeerUsageMap({});
+      setFairUsageByPeer({});
+      setFairUsageThrottledByPeer({});
     }
   }, [scopeUnit, scopeValue, allTime, startIso, endIso, inScopeRouterIds, rangeSeconds]);
 
@@ -1073,114 +1127,186 @@ export default function Dashboard() {
           </div>
         ) : (
           routerSections.map((section) => (
-            <div key={section.router.id} className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 p-6 grid gap-5">
-              <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
-                <div>
-                  <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">{section.router.name}</div>
-                  <div className="text-xs text-gray-500 dark:text-gray-400">
-                    {section.router.proto.toUpperCase()} · {section.router.host}:{section.router.port} · {section.router.username}
-                  </div>
-                </div>
-                <div className="flex flex-wrap items-center gap-3 text-xs text-gray-600 dark:text-gray-300">
-                  <span>Peers <span className="font-medium text-gray-800 dark:text-gray-100">{section.peers.length}</span></span>
-                  <span>Online <span className="font-medium text-gray-800 dark:text-gray-100">{section.online}</span></span>
-                  <span>Disabled <span className="font-medium text-gray-800 dark:text-gray-100">{section.disabled}</span></span>
-                  <span>Down <span className="font-medium text-gray-800 dark:text-gray-100">{fmtBytes(section.totals.tx)}</span></span>
-                  <span>Up <span className="font-medium text-gray-800 dark:text-gray-100">{fmtBytes(section.totals.rx)}</span></span>
-                </div>
-              </div>
+            (() => {
+              const canCollapsePeers = section.peers.length > ROUTER_PEER_PREVIEW_COUNT;
+              const peersExpanded = canCollapsePeers ? !!expandedRouters[section.router.id] : true;
+              const visiblePeers = peersExpanded ? section.peers : section.peers.slice(0, ROUTER_PEER_PREVIEW_COUNT);
+              const hiddenPeerCount = Math.max(0, section.peers.length - visiblePeers.length);
 
-              <LazySectionBody placeholderHeight={section.peers.length > 0 ? 420 : 220}>
-                <div className="grid gap-5">
-                  <div className="h-52">
-                    <MemoUsageChart
-                      scopeUnit={scopeUnit}
-                      monthly={section.monthly}
-                      raw={section.raw}
-                      timezone={timezone}
-                      emptyLabel="No usage data for this router in the current timeframe"
-                    />
-                  </div>
-
-                  {section.peers.length === 0 ? (
-                    <div className="text-sm text-gray-500 dark:text-gray-400">No matching peers on this router.</div>
-                  ) : (
-                    <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
-                      {section.peers.map((peer) => {
-                        const usage = peerUsageMap[peer.id] || { rx: 0, tx: 0 };
-                        const status = statusMap[peer.id];
-                        return (
-                          <Card
-                            key={peer.id}
-                            className="p-4 ring-gray-300 shadow hover:shadow-lg hover:-translate-y-0.5 cursor-pointer rounded-xl"
-                            onClick={() => navigate(`/peer/${peer.id}`)}
-                          >
-                            <div className="flex items-center justify-between gap-3">
-                              <div className="min-w-0">
-                                <div className="text-sm text-gray-500 dark:text-gray-400">{peer.name}</div>
-                                <div className="text-lg text-gray-900 dark:text-gray-100 truncate" title={(peer.allowed_address || "").replace(/\/32/g, "")}>
-                                  {(peer.allowed_address || "").replace(/\/32/g, "")}
-                                </div>
-                                <div className="mt-2 text-[11px] text-gray-500 dark:text-gray-400">
-                                  {routersById[peer.router_id]?.name || `Router #${peer.router_id}`} · {peer.interface}
-                                </div>
-                              </div>
-                              <div className="flex flex-col items-end gap-2">
-                                <div className="text-xs text-gray-500 dark:text-gray-400">
-                                  <span title="Usage in selected timeframe">↓ {fmtBytes(usage.tx)} · ↑ {fmtBytes(usage.rx)}</span>
-                                </div>
-                                <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs ${peer.disabled ? "bg-rose-100 text-rose-800" : "bg-indigo-100 text-indigo-800"}`}>
-                                  <span className={`inline-block w-2 h-2 rounded-full ${peer.disabled ? "bg-rose-500" : "bg-indigo-500"}`} />
-                                  {peer.disabled ? "Deactivated" : "Active"}
-                                </span>
-                                {showKindPills && (() => {
-                                  const addr = peer.allowed_address.trim();
-                                  const outbound = addr === "0.0.0.0/0" || addr === "::/0";
-                                  return (
-                                    <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs ${outbound ? "bg-amber-100 text-amber-800" : "bg-blue-100 text-blue-800"}`}>
-                                      <span className={`inline-block w-2 h-2 rounded-full ${outbound ? "bg-amber-500" : "bg-blue-500"}`} />
-                                      {outbound ? "Outbound" : "Inbound"}
-                                    </span>
-                                  );
-                                })()}
-                                <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs ${
-                                  status
-                                    ? (status.online ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-200")
-                                    : "bg-amber-100 text-amber-800 dark:bg-amber-500/10 dark:text-amber-300"
-                                }`}>
-                                  <span className={`inline-block w-2 h-2 rounded-full ${
-                                    status
-                                      ? (status.online ? "bg-green-500" : "bg-gray-400 dark:bg-gray-500")
-                                      : "bg-amber-500"
-                                  }`} />
-                                  {status ? (status.online ? "Online" : `Last seen ${status.last}`) : "Status unavailable"}
-                                </span>
-                              </div>
-                            </div>
-                          </Card>
-                        );
-                      })}
+              return (
+                <div key={section.router.id} className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 p-6 grid gap-5">
+                  <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                    <div>
+                      <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">{section.router.name}</div>
+                      <div className="text-xs text-gray-500 dark:text-gray-400">
+                        {section.router.proto.toUpperCase()} · {section.router.host}:{section.router.port} · {section.router.username}
+                      </div>
                     </div>
-                  )}
+                    <div className="flex flex-wrap items-center gap-3 text-xs text-gray-600 dark:text-gray-300">
+                      <span>Peers <span className="font-medium text-gray-800 dark:text-gray-100">{section.peers.length}</span></span>
+                      <span>Online <span className="font-medium text-gray-800 dark:text-gray-100">{section.online}</span></span>
+                      <span>Disabled <span className="font-medium text-gray-800 dark:text-gray-100">{section.disabled}</span></span>
+                      <span>Down <span className="font-medium text-gray-800 dark:text-gray-100">{fmtBytes(section.totals.tx)}</span></span>
+                      <span>Up <span className="font-medium text-gray-800 dark:text-gray-100">{fmtBytes(section.totals.rx)}</span></span>
+                    </div>
+                  </div>
+
+                  <LazySectionBody placeholderHeight={section.peers.length > 0 ? 420 : 220}>
+                    <div className="grid gap-5">
+                      <div className="h-52">
+                        <MemoUsageChart
+                          scopeUnit={scopeUnit}
+                          monthly={section.monthly}
+                          raw={section.raw}
+                          timezone={timezone}
+                          emptyLabel="No usage data for this router in the current timeframe"
+                        />
+                      </div>
+
+                      {section.peers.length === 0 ? (
+                        <div className="text-sm text-gray-500 dark:text-gray-400">No matching peers on this router.</div>
+                      ) : (
+                        <div className="grid gap-4">
+                          <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+                            {visiblePeers.map((peer) => {
+                              const usage = peerUsageMap[peer.id] || { rx: 0, tx: 0 };
+                              const status = statusMap[peer.id];
+                              return (
+                                <Card
+                                  key={peer.id}
+                                  className="p-4 ring-gray-300 shadow hover:shadow-lg hover:-translate-y-0.5 cursor-pointer rounded-xl"
+                                  onClick={() => navigate(`/peer/${peer.id}`)}
+                                >
+                                  <div className="flex items-center justify-between gap-3">
+                                    <div className="min-w-0">
+                                      <div className="text-sm text-gray-500 dark:text-gray-400">{peer.name}</div>
+                                      <div className="text-lg text-gray-900 dark:text-gray-100 truncate" title={(peer.allowed_address || "").replace(/\/32/g, "")}>
+                                        {(peer.allowed_address || "").replace(/\/32/g, "")}
+                                      </div>
+                                      <div className="mt-2 text-[11px] text-gray-500 dark:text-gray-400">
+                                        {routersById[peer.router_id]?.name || `Router #${peer.router_id}`} · {peer.interface}
+                                      </div>
+                                    </div>
+                                    <div className="flex flex-col items-end gap-2">
+                                      <div className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400">
+                                        {fairUsageByPeer[peer.id] ? (
+                                          <span
+                                            className="shrink-0"
+                                            title={
+                                              fairUsageThrottledByPeer[peer.id]
+                                                ? "Fair usage: throttled"
+                                                : "Fair usage limit applies (not throttled)"
+                                            }
+                                          >
+                                            <FairUsageShieldIcon throttled={fairUsageThrottledByPeer[peer.id]} />
+                                          </span>
+                                        ) : null}
+                                        <span title="Usage in selected timeframe">↓ {fmtBytes(usage.tx)} · ↑ {fmtBytes(usage.rx)}</span>
+                                      </div>
+                                      <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs ${peer.disabled ? "bg-rose-100 text-rose-800" : "bg-indigo-100 text-indigo-800"}`}>
+                                        <span className={`inline-block w-2 h-2 rounded-full ${peer.disabled ? "bg-rose-500" : "bg-indigo-500"}`} />
+                                        {peer.disabled ? "Deactivated" : "Active"}
+                                      </span>
+                                      {showKindPills && (() => {
+                                        const addr = peer.allowed_address.trim();
+                                        const outbound = addr === "0.0.0.0/0" || addr === "::/0";
+                                        return (
+                                          <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs ${outbound ? "bg-amber-100 text-amber-800" : "bg-blue-100 text-blue-800"}`}>
+                                            <span className={`inline-block w-2 h-2 rounded-full ${outbound ? "bg-amber-500" : "bg-blue-500"}`} />
+                                            {outbound ? "Outbound" : "Inbound"}
+                                          </span>
+                                        );
+                                      })()}
+                                      <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs ${
+                                        status
+                                          ? (status.online ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-200")
+                                          : "bg-amber-100 text-amber-800 dark:bg-amber-500/10 dark:text-amber-300"
+                                      }`}>
+                                        <span className={`inline-block w-2 h-2 rounded-full ${
+                                          status
+                                            ? (status.online ? "bg-green-500" : "bg-gray-400 dark:bg-gray-500")
+                                            : "bg-amber-500"
+                                        }`} />
+                                        {status ? (status.online ? "Online" : `Last seen ${status.last}`) : "Status unavailable"}
+                                      </span>
+                                    </div>
+                                  </div>
+                                </Card>
+                              );
+                            })}
+                          </div>
+
+                          {canCollapsePeers && (
+                            <div className="flex justify-center pt-1">
+                                <button
+                                  type="button"
+                                  onClick={() => toggleRouterExpanded(section.router.id)}
+                                  className="group inline-flex items-center gap-2 rounded-full border border-gray-200/80 bg-gray-50/90 px-4 py-2 text-sm font-medium text-gray-700 shadow-sm backdrop-blur transition hover:-translate-y-0.5 hover:bg-white hover:shadow-md dark:border-gray-700 dark:bg-gray-800/90 dark:text-gray-200 dark:hover:bg-gray-800"
+                                >
+                                  <span>{peersExpanded ? "Show less" : `Show ${hiddenPeerCount} more peer${hiddenPeerCount === 1 ? "" : "s"}`}</span>
+                                  <svg
+                                    viewBox="0 0 20 20"
+                                    fill="none"
+                                    className={`h-4 w-4 transition-transform ${peersExpanded ? "rotate-180" : ""}`}
+                                    aria-hidden="true"
+                                  >
+                                    <path
+                                      d="M5 7.5 10 12.5 15 7.5"
+                                      stroke="currentColor"
+                                      strokeWidth="1.8"
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                    />
+                                  </svg>
+                                </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </LazySectionBody>
                 </div>
-              </LazySectionBody>
-            </div>
+              );
+            })()
           ))
         )}
       </div>
 
-      <div className="fixed left-4 bottom-4 flex flex-col items-start gap-2">
-        <a href="/settings" className="h-12 w-12 rounded-full bg-white text-gray-900 ring-1 ring-gray-300 shadow flex items-center justify-center hover:shadow-md dark:bg-gray-900 dark:text-gray-100 dark:ring-gray-700">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="3" />
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c0 .66.26 1.3.73 1.77.47.47 1.11.73 1.77.73H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-          </svg>
-        </a>
+      {fabOpen && <div className="fixed inset-0 z-40" onClick={() => setFabOpen(false)} />}
+      <div className="fixed left-4 bottom-4 z-50 flex flex-col-reverse items-start gap-2">
         {showHwStats && (
           <div className="rounded-full bg-white/95 text-[11px] text-gray-800 px-3 py-1 shadow ring-1 ring-gray-200 dark:bg-gray-900/95 dark:text-gray-200 dark:ring-gray-800">
             {metrics ? `CPU ${metrics.cpu_percent != null ? Math.round(metrics.cpu_percent) : "-"}% · Mem ${metrics.mem_percent != null ? Math.round(metrics.mem_percent) : "-"}%` : "CPU/Mem: ..."}
           </div>
         )}
+        <button
+          onClick={() => setFabOpen(o => !o)}
+          className={`h-12 w-12 rounded-full bg-white text-gray-900 ring-1 ring-gray-300 shadow flex items-center justify-center hover:shadow-md dark:bg-gray-900 dark:text-gray-100 dark:ring-gray-700 transition-transform duration-200 ${fabOpen ? "rotate-45" : ""}`}
+        >
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+        </button>
+
+        <div className={`flex flex-col gap-2 transition-all duration-200 origin-bottom ${fabOpen ? "scale-100 opacity-100" : "scale-75 opacity-0 pointer-events-none"}`}>
+          <a href="/settings" className="h-10 w-10 rounded-full bg-white text-gray-900 ring-1 ring-gray-300 shadow flex items-center justify-center hover:shadow-md dark:bg-gray-900 dark:text-gray-100 dark:ring-gray-700 transition-all duration-150" title="Settings" style={{ transitionDelay: fabOpen ? "50ms" : "0ms" }}>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c0 .66.26 1.3.73 1.77.47.47 1.11.73 1.77.73H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+          </a>
+          <a href="/fair-usage" className="h-10 w-10 rounded-full bg-white text-gray-900 ring-1 ring-gray-300 shadow flex items-center justify-center hover:shadow-md dark:bg-gray-900 dark:text-gray-100 dark:ring-gray-700 transition-all duration-150" title="Fair Usage" style={{ transitionDelay: fabOpen ? "100ms" : "0ms" }}>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+            </svg>
+          </a>
+          <a href="/telegram" className="h-10 w-10 rounded-full bg-white text-gray-900 ring-1 ring-gray-300 shadow flex items-center justify-center hover:shadow-md dark:bg-gray-900 dark:text-gray-100 dark:ring-gray-700 transition-all duration-150" title="Telegram Bot" style={{ transitionDelay: fabOpen ? "150ms" : "0ms" }}>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 2L11 13" /><path d="M22 2L15 22L11 13L2 9L22 2Z" />
+            </svg>
+          </a>
+        </div>
       </div>
 
       {showAdd && (

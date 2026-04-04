@@ -8,7 +8,7 @@ from ..db import get_db, Base, engine, SessionLocal
 from ..settings import settings
 from ..scheduler import update_scheduler_interval
 from ..security import SecretBox
-from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User
+from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User, FairUsageRule, FairUsageAssignment, FairUsageState
 from ..auth import verify_password, get_password_hash, create_access_token, verify_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from ..routeros.factory import make_client
 from ..usage_maintenance import (
@@ -16,6 +16,17 @@ from ..usage_maintenance import (
     is_usage_maintenance_running,
     start_usage_maintenance,
 )
+from ..fair_usage_sync import apply_fair_usage_policy, FairUsageRouterError, get_effective_fair_usage_rule, peer_ids_with_applicable_fair_usage
+from ..fair_usage_usage import (
+    SCOPE_UNIT_MAX,
+    app_zoneinfo,
+    compute_next_reset_utc_for_rule,
+    format_scope_label,
+    normalize_scope_period,
+    peer_scope_usage_for_rule,
+    sync_legacy_time_scope_field,
+)
+from ..usage_bucketing import aggregate_rows_to_local_buckets, aggregate_router_rows_to_local_buckets
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 import traceback
@@ -148,6 +159,20 @@ def _floor_to_minute_utc_naive(dt: datetime) -> datetime:
     return _dt_to_utc(dt).replace(second=0, microsecond=0, tzinfo=None)
 
 
+def _ts_cell_to_utc_naive(val: object) -> datetime:
+    """SQLite text() queries often return timestamps as str; ORM returns datetime."""
+    if isinstance(val, datetime):
+        return val.replace(tzinfo=None) if val.tzinfo else val
+    if isinstance(val, str):
+        s = val.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            return datetime.fromisoformat(s + "T00:00:00")
+        return datetime.fromisoformat(s.replace(" ", "T", 1))
+    raise TypeError(f"expected datetime-like, got {type(val)}")
+
+
 def _minute_coverage_covers_window_start(
     db: Session,
     *,
@@ -252,15 +277,15 @@ def _query_raw_peer_summaries(
     return [(int(r[0]), int(r[1] or 0), int(r[2] or 0)) for r in db.execute(query, {"cutoff": cutoff_str, "end": end_str})]
 
 
-def _query_raw_aggregate_buckets(
+def _query_raw_sample_delta_rows(
     db: Session,
     *,
     cutoff: datetime,
     end_dt: datetime,
-    interval: int,
     router_id: Optional[int],
     router_ids: Optional[List[int]],
-) -> list[tuple[int, int, int]]:
+) -> list[tuple[datetime, int, int]]:
+    """Per-sample traffic deltas for aggregate chart; caller buckets in app timezone."""
     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
     router_filter = _router_sql_filter(router_id, router_ids)
@@ -272,7 +297,7 @@ def _query_raw_aggregate_buckets(
           {router_filter}
     ),
     filtered_samples AS (
-        SELECT 
+        SELECT
             u.peer_id,
             u.ts,
             u.rx,
@@ -293,34 +318,35 @@ def _query_raw_aggregate_buckets(
         FROM filtered_samples
     )
     SELECT
-        CAST(strftime('%s', ts) / :interval AS INT) * :interval as bucket,
-        SUM(CASE 
-            WHEN prev_rx IS NULL THEN 0
+        ts,
+        CASE
             WHEN rx < prev_rx THEN rx
-            ELSE rx - prev_rx 
-        END) as d_rx,
-        SUM(CASE 
-            WHEN prev_tx IS NULL THEN 0
+            ELSE rx - prev_rx
+        END as d_rx,
+        CASE
             WHEN tx < prev_tx THEN tx
-            ELSE tx - prev_tx 
-        END) as d_tx
+            ELSE tx - prev_tx
+        END as d_tx
     FROM deltas
     WHERE prev_rx IS NOT NULL
-    GROUP BY bucket
-    ORDER BY bucket
+    ORDER BY ts
     """)
-    return [(int(r[0]), int(r[1] or 0), int(r[2] or 0)) for r in db.execute(query, {"cutoff": cutoff_str, "end": end_str, "interval": interval}).fetchall()]
+    out: list[tuple[datetime, int, int]] = []
+    for r in db.execute(query, {"cutoff": cutoff_str, "end": end_str}).fetchall():
+        ts_naive = _ts_cell_to_utc_naive(r[0])
+        out.append((ts_naive, int(r[1] or 0), int(r[2] or 0)))
+    return out
 
 
-def _query_raw_router_buckets(
+def _query_raw_router_sample_delta_rows(
     db: Session,
     *,
     cutoff: datetime,
     end_dt: datetime,
-    interval: int,
     router_id: Optional[int],
     router_ids: Optional[List[int]],
-) -> list[tuple[int, int, int, int]]:
+) -> list[tuple[int, datetime, int, int]]:
+    """Per-sample deltas per router for by-router chart; caller buckets in app timezone."""
     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
     router_filter = _router_sql_filter(router_id, router_ids)
@@ -358,26 +384,24 @@ def _query_raw_router_buckets(
     )
     SELECT
         router_id,
-        CAST(strftime('%s', ts) / :interval AS INT) * :interval as bucket,
-        SUM(CASE
-            WHEN prev_rx IS NULL THEN 0
+        ts,
+        CASE
             WHEN rx < prev_rx THEN rx
             ELSE rx - prev_rx
-        END) as d_rx,
-        SUM(CASE
-            WHEN prev_tx IS NULL THEN 0
+        END as d_rx,
+        CASE
             WHEN tx < prev_tx THEN tx
             ELSE tx - prev_tx
-        END) as d_tx
+        END as d_tx
     FROM deltas
     WHERE prev_rx IS NOT NULL
-    GROUP BY router_id, bucket
-    ORDER BY router_id, bucket
+    ORDER BY router_id, ts
     """)
-    return [
-        (int(r[0]), int(r[1]), int(r[2] or 0), int(r[3] or 0))
-        for r in db.execute(query, {"cutoff": cutoff_str, "end": end_str, "interval": interval}).fetchall()
-    ]
+    out: list[tuple[int, datetime, int, int]] = []
+    for r in db.execute(query, {"cutoff": cutoff_str, "end": end_str}).fetchall():
+        ts_naive = _ts_cell_to_utc_naive(r[1])
+        out.append((int(r[0]), ts_naive, int(r[2] or 0), int(r[3] or 0)))
+    return out
 
 
 def _peer_is_online(last_handshake: Optional[int], disabled: bool) -> bool:
@@ -532,6 +556,7 @@ class SettingsDTO(BaseModel):
     online_threshold_seconds: int
     monthly_reset_day: int
     timezone: str
+    week_start_day: int
     show_kind_pills: bool
     show_hw_stats: bool
     dashboard_refresh_seconds: int
@@ -608,6 +633,7 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
         "online_threshold_seconds": settings.online_threshold_seconds,
         "monthly_reset_day": settings.monthly_reset_day,
         "timezone": settings.timezone,
+        "week_start_day": 0,
         "show_kind_pills": True,
         "show_hw_stats": True,
         "dashboard_refresh_seconds": 30,
@@ -626,6 +652,7 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
     }
     # Overlay any values persisted in SettingsKV
     for key in (
+        "week_start_day",
         "show_kind_pills",
         "show_hw_stats",
         "dashboard_refresh_seconds",
@@ -646,6 +673,7 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
         if not kv:
             continue
         if key in (
+            "week_start_day",
             "dashboard_refresh_seconds",
             "peer_default_scope_value",
             "dashboard_scope_value",
@@ -701,6 +729,7 @@ def update_settings(dto: SettingsDTO, db: Session = Depends(get_db), current_use
         "online_threshold_seconds": str(dto.online_threshold_seconds),
         "monthly_reset_day": str(dto.monthly_reset_day),
         "timezone": dto.timezone,
+        "week_start_day": str(max(0, min(6, int(dto.week_start_day)))),
         # UI preferences
         "show_kind_pills": str(dto.show_kind_pills).lower(),
         "show_hw_stats": str(dto.show_hw_stats).lower(),
@@ -1601,99 +1630,20 @@ def get_last_actions(peer_ids: str, db: Session = Depends(get_db), current_user:
 @router.post("/peers/{peer_id}/reconcile", response_model=PeerListDTO)
 def reconcile_peer(peer_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """
-    Apply current quota + access-window policy to a peer immediately (enable/disable on RouterOS),
-    and sync DB state to the router result.
+    Apply current fair-usage policy to a peer immediately (throttle/unthrottle via Simple Queue on RouterOS).
+    Uses the same logic as the scheduler tick (limits sync + missing-queue repair).
     """
     peer = db.get(Peer, peer_id)
     if not peer:
         raise HTTPException(status_code=404, detail="peer not found")
     r = db.get(Router, peer.router_id)
     client = make_client(r) if (r and peer.ros_id) else None
-
-    # Timezone-aware window evaluation (treat stored datetime-local strings as settings.timezone)
-    try:
-        tz = ZoneInfo(getattr(settings, "timezone", "UTC") or "UTC")
-    except Exception:
-        tz = ZoneInfo("UTC")
-    now_tz = datetime.now(tz)
-
-    vf = db.get(SettingsKV, f"quota_valid_from:{peer_id}")
-    vu = db.get(SettingsKV, f"quota_valid_until:{peer_id}")
-    window_start = None
-    window_end = None
-    if vf and vf.value:
-        try:
-            dt = datetime.fromisoformat(vf.value)
-            window_start = dt if dt.tzinfo else dt.replace(tzinfo=tz)
-        except Exception:
-            window_start = None
-    if vu and vu.value:
-        try:
-            dt = datetime.fromisoformat(vu.value)
-            window_end = dt if dt.tzinfo else dt.replace(tzinfo=tz)
-        except Exception:
-            window_end = None
-
-    inside_window = True
-    if window_start and now_tz < window_start:
-        inside_window = False
-    if window_end and now_tz > window_end:
-        inside_window = False
-
-    # Quota evaluation (current month based on UTC day keys)
-    q = db.query(Quota).filter(Quota.peer_id == peer_id).first()
-    limit = int(q.monthly_limit_bytes or 0) if q else 0
     now_utc = datetime.now(timezone.utc)
-    month_key = now_utc.strftime("%Y-%m")
-    month_prefix = now_utc.strftime("%Y-%m-")
-    monthly = (
-        db.query(UsageMonthly)
-        .filter(UsageMonthly.peer_id == peer_id, UsageMonthly.month_key == month_key)
-        .first()
-    )
-    if monthly is not None:
-        used = int((monthly.rx or 0) + (monthly.tx or 0))
-    else:
-        used_rx = (
-            db.query(func.coalesce(func.sum(UsageDaily.rx), 0))
-            .filter(UsageDaily.peer_id == peer_id, UsageDaily.day.like(f"{month_prefix}%"))
-            .scalar()
-            or 0
-        )
-        used_tx = (
-            db.query(func.coalesce(func.sum(UsageDaily.tx), 0))
-            .filter(UsageDaily.peer_id == peer_id, UsageDaily.day.like(f"{month_prefix}%"))
-            .scalar()
-            or 0
-        )
-        used = int(used_rx + used_tx)
 
-    over_quota = limit > 0 and used >= limit
-    outside_window = (window_start is not None or window_end is not None) and (not inside_window)
-    desired_disabled = bool(over_quota or outside_window)
-
-    if desired_disabled != bool(peer.disabled):
-        # Apply on RouterOS first when possible.
-        if client is not None:
-            try:
-                client.set_peer_disabled(peer.interface, peer.ros_id, desired_disabled)
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"router update failed: {e}")
-        peer.disabled = desired_disabled
-
-        # Action log: treat this as policy enforcement, not manual.
-        if desired_disabled:
-            action = "quota_disable" if over_quota else "window_disable"
-            note = (
-                f"Reconciled: over quota used={used} limit={limit}"
-                if over_quota
-                else f"Reconciled: outside access window ({vf.value if vf else ''} – {vu.value if vu else ''})"
-            )
-        else:
-            action = "quota_enable" if (not over_quota and limit == 0) else "window_enable"
-            note = "Reconciled: conditions satisfied"
-        db.add(Action(peer_id=peer.id, ts=now_utc, action=action, note=note))
-
+    try:
+        apply_fair_usage_policy(db, peer, client, now_utc, strict_router_errors=True)
+    except FairUsageRouterError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     db.commit()
     db.refresh(peer)
     return peer
@@ -1742,6 +1692,7 @@ def get_peer_usage(
         )
         resolved_interval = _normalize_raw_interval(resolved_seconds, interval)
 
+        tz = app_zoneinfo()
         if _minute_coverage_covers_window_start(
             db,
             peer_id=peer_id,
@@ -1751,16 +1702,12 @@ def get_peer_usage(
         ):
             query = text(
                 """
-                SELECT
-                    CAST(strftime('%s', minute_ts) / :interval AS INT) * :interval as bucket,
-                    COALESCE(SUM(rx), 0) as d_rx,
-                    COALESCE(SUM(tx), 0) as d_tx
+                SELECT minute_ts, rx, tx
                 FROM usage_minute
                 WHERE peer_id = :peer_id
                   AND minute_ts >= :cutoff
                   AND minute_ts <= :end
-                GROUP BY bucket
-                ORDER BY bucket
+                ORDER BY minute_ts
                 """
             )
             rows = db.execute(
@@ -1769,16 +1716,17 @@ def get_peer_usage(
                     "peer_id": peer_id,
                     "cutoff": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
                     "end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                    "interval": resolved_interval,
                 },
             ).fetchall()
+            minute_rows = [(_ts_cell_to_utc_naive(r[0]), int(r[1] or 0), int(r[2] or 0)) for r in rows]
+            aggregated = aggregate_rows_to_local_buckets(minute_rows, resolved_interval, tz)
             return [
                 UsagePointDTO(
-                    day=datetime.fromtimestamp(int(r[0]), tz=timezone.utc).isoformat(),
-                    rx=int(r[1] or 0),
-                    tx=int(r[2] or 0),
+                    day=b.replace(tzinfo=timezone.utc).isoformat(),
+                    rx=rx,
+                    tx=tx,
                 )
-                for r in rows
+                for b, rx, tx in aggregated
             ]
 
         samples = (
@@ -1791,7 +1739,7 @@ def get_peer_usage(
             .order_by(UsageSample.ts.asc())
             .all()
         )
-        buckets: dict[datetime, list[int]] = {}
+        delta_rows: list[tuple[datetime, int, int]] = []
         prev: Optional[UsageSample] = None
         for s in samples:
             if prev is None:
@@ -1802,15 +1750,12 @@ def get_peer_usage(
             prev = s
             if drx <= 0 and dtx <= 0:
                 continue
-            ts = s.ts.replace(tzinfo=timezone.utc)
-            bucket_ts_val = int(ts.timestamp() // resolved_interval) * resolved_interval
-            bucket_dt = datetime.fromtimestamp(bucket_ts_val, tz=timezone.utc)
-            bucket = buckets.setdefault(bucket_dt, [0, 0])
-            bucket[0] += int(drx or 0)
-            bucket[1] += int(dtx or 0)
+            ts_naive = s.ts.replace(tzinfo=None) if s.ts.tzinfo else s.ts
+            delta_rows.append((ts_naive, int(drx or 0), int(dtx or 0)))
+        aggregated = aggregate_rows_to_local_buckets(delta_rows, resolved_interval, tz)
         return [
-            UsagePointDTO(day=ts.isoformat(), rx=vals[0], tx=vals[1])
-            for ts, vals in sorted(buckets.items(), key=lambda item: item[0])
+            UsagePointDTO(day=b.replace(tzinfo=timezone.utc).isoformat(), rx=rx, tx=tx)
+            for b, rx, tx in aggregated
         ]
 
     raise HTTPException(status_code=400, detail="window must be 'daily' or 'raw'")
@@ -2052,6 +1997,8 @@ class PeerUsageSummaryDTO(BaseModel):
     peer_id: int
     rx: int
     tx: int
+    has_fair_usage: bool = False
+    fair_usage_throttled: bool = False
 
 
 @router.get("/summary/peers", response_model=List[PeerUsageSummaryDTO])
@@ -2149,8 +2096,30 @@ def get_peers_summary(
         for r in rows:
             summary[int(r.peer_id)] = {"rx": int(r.rx or 0), "tx": int(r.tx or 0)}
 
+    # Peers with no usage in this window were omitted above; include them so clients can show
+    # fair-usage flags and "0 B" totals for never-connected / idle peers.
+    scope_peers = db.query(Peer.id).filter(Peer.selected == True)
+    scope_peers = _apply_router_filter(scope_peers, router_id, router_ids)
+    for row in scope_peers.all():
+        summary.setdefault(int(row.id), {"rx": 0, "tx": 0})
+
+    peer_ids = list(summary.keys())
+    fu_set: set[int] = set()
+    fu_throttled: dict[int, bool] = {}
+    if peer_ids:
+        peers_for_fu = db.query(Peer).filter(Peer.id.in_(peer_ids)).all()
+        fu_set = peer_ids_with_applicable_fair_usage(db, peers_for_fu)
+        for st in db.query(FairUsageState).filter(FairUsageState.peer_id.in_(peer_ids)).all():
+            fu_throttled[int(st.peer_id)] = bool(st.throttled)
+
     return [
-        PeerUsageSummaryDTO(peer_id=pid, rx=vals["rx"], tx=vals["tx"])
+        PeerUsageSummaryDTO(
+            peer_id=pid,
+            rx=vals["rx"],
+            tx=vals["tx"],
+            has_fair_usage=pid in fu_set,
+            fair_usage_throttled=fu_throttled.get(pid, False),
+        )
         for pid, vals in summary.items()
     ]
 
@@ -2180,6 +2149,7 @@ def get_summary_raw(
         end_utc=end_utc,
     )
     resolved_interval = _normalize_raw_interval(resolved_seconds, interval)
+    tz = app_zoneinfo()
     if _minute_coverage_covers_window_start(
         db,
         router_id=router_id,
@@ -2190,42 +2160,41 @@ def get_summary_raw(
         router_filter = _router_sql_filter(router_id, router_ids)
         query = text(f"""
         SELECT
-            CAST(strftime('%s', m.minute_ts) / :interval AS INT) * :interval as bucket,
-            COALESCE(SUM(m.rx), 0) as d_rx,
-            COALESCE(SUM(m.tx), 0) as d_tx
+            m.minute_ts,
+            COALESCE(SUM(m.rx), 0) as s_rx,
+            COALESCE(SUM(m.tx), 0) as s_tx
         FROM usage_minute m
         JOIN peers p ON p.id = m.peer_id
         WHERE p.selected = 1
           {router_filter}
           AND m.minute_ts >= :cutoff
           AND m.minute_ts <= :end
-        GROUP BY bucket
-        ORDER BY bucket
+        GROUP BY m.minute_ts
+        ORDER BY m.minute_ts
         """)
         rows = db.execute(
             query,
             {
                 "cutoff": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
                 "end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "interval": resolved_interval,
             },
         ).fetchall()
+        minute_rows = [(_ts_cell_to_utc_naive(r[0]), int(r[1] or 0), int(r[2] or 0)) for r in rows]
+        aggregated = aggregate_rows_to_local_buckets(minute_rows, resolved_interval, tz)
     else:
-        rows = _query_raw_aggregate_buckets(
+        delta_rows = _query_raw_sample_delta_rows(
             db,
             cutoff=cutoff,
             end_dt=end_dt,
-            interval=resolved_interval,
             router_id=router_id,
             router_ids=router_ids,
         )
+        aggregated = aggregate_rows_to_local_buckets(delta_rows, resolved_interval, tz)
 
-    out: List[SummaryRawPointDTO] = []
-    for r in rows:
-        dt = datetime.fromtimestamp(int(r[0]), tz=timezone.utc)
-        out.append(SummaryRawPointDTO(ts=dt.isoformat(), rx=int(r[1] or 0), tx=int(r[2] or 0)))
-        
-    return out
+    return [
+        SummaryRawPointDTO(ts=b.replace(tzinfo=timezone.utc).isoformat(), rx=rx, tx=tx)
+        for b, rx, tx in aggregated
+    ]
 
 
 class RouterSummaryRawPointDTO(BaseModel):
@@ -2254,6 +2223,7 @@ def get_summary_raw_by_router(
         end_utc=end_utc,
     )
     resolved_interval = _normalize_raw_interval(resolved_seconds, interval)
+    tz = app_zoneinfo()
     if _minute_coverage_covers_window_start(
         db,
         router_id=router_id,
@@ -2265,47 +2235,45 @@ def get_summary_raw_by_router(
         query = text(f"""
         SELECT
             p.router_id,
-            CAST(strftime('%s', m.minute_ts) / :interval AS INT) * :interval as bucket,
-            COALESCE(SUM(m.rx), 0) as d_rx,
-            COALESCE(SUM(m.tx), 0) as d_tx
+            m.minute_ts,
+            COALESCE(SUM(m.rx), 0) as s_rx,
+            COALESCE(SUM(m.tx), 0) as s_tx
         FROM usage_minute m
         JOIN peers p ON p.id = m.peer_id
         WHERE p.selected = 1
           {router_filter}
           AND m.minute_ts >= :cutoff
           AND m.minute_ts <= :end
-        GROUP BY p.router_id, bucket
-        ORDER BY p.router_id, bucket
+        GROUP BY p.router_id, m.minute_ts
+        ORDER BY p.router_id, m.minute_ts
         """)
         rows = db.execute(
             query,
             {
                 "cutoff": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
                 "end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "interval": resolved_interval,
             },
         ).fetchall()
+        rrows = [(int(r[0]), _ts_cell_to_utc_naive(r[1]), int(r[2] or 0), int(r[3] or 0)) for r in rows]
+        aggregated = aggregate_router_rows_to_local_buckets(rrows, resolved_interval, tz)
     else:
-        rows = _query_raw_router_buckets(
+        delta_rows = _query_raw_router_sample_delta_rows(
             db,
             cutoff=cutoff,
             end_dt=end_dt,
-            interval=resolved_interval,
             router_id=router_id,
             router_ids=router_ids,
         )
-    out: List[RouterSummaryRawPointDTO] = []
-    for r in rows:
-        dt = datetime.fromtimestamp(int(r[1]), tz=timezone.utc)
-        out.append(
-            RouterSummaryRawPointDTO(
-                router_id=int(r[0]),
-                ts=dt.isoformat(),
-                rx=int(r[2] or 0),
-                tx=int(r[3] or 0),
-            )
+        aggregated = aggregate_router_rows_to_local_buckets(delta_rows, resolved_interval, tz)
+    return [
+        RouterSummaryRawPointDTO(
+            router_id=rid,
+            ts=b.replace(tzinfo=timezone.utc).isoformat(),
+            rx=rx,
+            tx=tx,
         )
-    return out
+        for rid, b, rx, tx in aggregated
+    ]
 
 
 class UsageMaintenanceStatusDTO(BaseModel):
@@ -2402,3 +2370,702 @@ def get_dashboard_metrics(db: Session = Depends(get_db)):
         disk_percent=60.0,
         uptime_seconds=3600
     )
+
+
+# ── Fair Usage ───────────────────────────────────────────────────────────
+
+def _validate_fair_usage_scope(count: int, unit: str) -> None:
+    u = (unit or "").lower().strip()
+    if u not in ("hour", "day", "week", "month"):
+        raise HTTPException(status_code=400, detail="scope_period_unit must be hour, day, week, or month")
+    if count < 1:
+        raise HTTPException(status_code=400, detail="scope_period_count must be >= 1")
+    cap = SCOPE_UNIT_MAX.get(u, 24)
+    if count > cap:
+        raise HTTPException(status_code=400, detail=f"scope_period_count for {u} must be <= {cap}")
+
+
+def _apply_legacy_time_scope_to_scope(
+    scope_count: int,
+    scope_unit: str,
+    legacy_time_scope: Optional[str],
+) -> tuple[int, str]:
+    """If legacy time_scope is set (hourly/daily/...), map to period fields."""
+    if not legacy_time_scope:
+        return scope_count, scope_unit
+    m = {"hourly": ("hour", 1), "daily": ("day", 1), "weekly": ("week", 1), "monthly": ("month", 1)}
+    if legacy_time_scope in m:
+        u, c = m[legacy_time_scope]
+        return c, u
+    return scope_count, scope_unit
+
+
+class FairUsageRuleCreateDTO(BaseModel):
+    name: str
+    description: str = ""
+    quota_mode: str = "combined"  # combined | independent
+    download_quota_bytes: int = 0
+    upload_quota_bytes: Optional[int] = None
+    throttle_download_kbps: int = 1000
+    throttle_upload_kbps: int = 1000
+    scope_period_count: int = 1
+    scope_period_unit: str = "month"  # hour | day | week | month
+    time_scope: Optional[str] = None  # deprecated; hourly/daily/weekly/monthly maps to period=1
+    scope_type: str = "global"  # global | router | peer
+    router_id: Optional[int] = None
+    peer_ids: Optional[List[int]] = None
+    enabled: bool = True
+
+
+class FairUsageRuleUpdateDTO(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    quota_mode: Optional[str] = None
+    download_quota_bytes: Optional[int] = None
+    upload_quota_bytes: Optional[int] = None
+    throttle_download_kbps: Optional[int] = None
+    throttle_upload_kbps: Optional[int] = None
+    scope_period_count: Optional[int] = None
+    scope_period_unit: Optional[str] = None
+    time_scope: Optional[str] = None
+    scope_type: Optional[str] = None
+    router_id: Optional[int] = None
+    enabled: Optional[bool] = None
+
+
+class FairUsageAssignedPeerDTO(BaseModel):
+    peer_id: int
+    name: str
+    allowed_address: str
+    router_id: int
+    disabled: bool
+
+
+class FairUsageRuleDTO(BaseModel):
+    id: int
+    name: str
+    description: str
+    quota_mode: str
+    download_quota_bytes: int
+    upload_quota_bytes: Optional[int]
+    throttle_download_kbps: int
+    throttle_upload_kbps: int
+    time_scope: str
+    scope_period_count: int = 1
+    scope_period_unit: str = "month"
+    scope_label: str = "Monthly"
+    scope_type: str
+    router_id: Optional[int]
+    enabled: bool
+    created_at: str
+    updated_at: str
+    assigned_peer_count: int = 0
+    assigned_peers: List[FairUsageAssignedPeerDTO] = []
+
+
+class FairUsagePeerStatusDTO(BaseModel):
+    peer_id: int
+    rule_id: Optional[int] = None
+    rule_name: Optional[str] = None
+    quota_mode: Optional[str] = None
+    download_quota_bytes: int = 0
+    upload_quota_bytes: Optional[int] = None
+    throttle_download_kbps: int = 0
+    throttle_upload_kbps: int = 0
+    time_scope: Optional[str] = None
+    scope_period_count: int = 1
+    scope_period_unit: str = "month"
+    scope_label: str = "Monthly"
+    scope_type: Optional[str] = None
+    used_rx: int = 0
+    used_tx: int = 0
+    throttled: bool = False
+    throttled_at: Optional[str] = None
+    next_reset: Optional[str] = None
+
+
+def _fu_rule_to_dto(rule: FairUsageRule, db: Session, include_peers: bool = False) -> FairUsageRuleDTO:
+    assignments = db.query(FairUsageAssignment).filter(FairUsageAssignment.rule_id == rule.id).all()
+    peers_out: List[FairUsageAssignedPeerDTO] = []
+    if include_peers and assignments:
+        peer_ids = [a.peer_id for a in assignments]
+        peers = db.query(Peer).filter(Peer.id.in_(peer_ids)).all()
+        for p in peers:
+            peers_out.append(FairUsageAssignedPeerDTO(
+                peer_id=p.id, name=p.name, allowed_address=p.allowed_address,
+                router_id=p.router_id, disabled=p.disabled,
+            ))
+    cnt, unit = normalize_scope_period(rule)
+    return FairUsageRuleDTO(
+        id=rule.id,
+        name=rule.name,
+        description=rule.description or "",
+        quota_mode=rule.quota_mode,
+        download_quota_bytes=rule.download_quota_bytes,
+        upload_quota_bytes=rule.upload_quota_bytes,
+        throttle_download_kbps=rule.throttle_download_kbps,
+        throttle_upload_kbps=rule.throttle_upload_kbps,
+        time_scope=rule.time_scope,
+        scope_period_count=cnt,
+        scope_period_unit=unit,
+        scope_label=format_scope_label(cnt, unit),
+        scope_type=rule.scope_type,
+        router_id=rule.router_id,
+        enabled=rule.enabled,
+        created_at=rule.created_at.replace(tzinfo=timezone.utc).isoformat() if rule.created_at else "",
+        updated_at=rule.updated_at.replace(tzinfo=timezone.utc).isoformat() if rule.updated_at else "",
+        assigned_peer_count=len(assignments),
+        assigned_peers=peers_out,
+    )
+
+
+def _get_peer_scope_usage(peer_id: int, rule: FairUsageRule, db: Session) -> tuple[int, int]:
+    """Return (used_rx, used_tx) for the peer in the current fair-usage period."""
+    return peer_scope_usage_for_rule(peer_id, rule, db)
+
+
+@router.post("/fair-usage/rules", response_model=FairUsageRuleDTO)
+def create_fair_usage_rule(dto: FairUsageRuleCreateDTO, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if dto.quota_mode not in ("combined", "independent"):
+        raise HTTPException(status_code=400, detail="quota_mode must be 'combined' or 'independent'")
+    if dto.scope_type not in ("global", "router", "peer"):
+        raise HTTPException(status_code=400, detail="scope_type must be 'global', 'router', or 'peer'")
+    if dto.scope_type == "router" and not dto.router_id:
+        raise HTTPException(status_code=400, detail="router_id is required for router-scoped rules")
+
+    sc, su = _apply_legacy_time_scope_to_scope(dto.scope_period_count, dto.scope_period_unit, dto.time_scope)
+    _validate_fair_usage_scope(sc, su)
+
+    rule = FairUsageRule(
+        name=dto.name,
+        description=dto.description,
+        quota_mode=dto.quota_mode,
+        download_quota_bytes=dto.download_quota_bytes,
+        upload_quota_bytes=dto.upload_quota_bytes if dto.quota_mode == "independent" else None,
+        throttle_download_kbps=dto.throttle_download_kbps,
+        throttle_upload_kbps=dto.throttle_upload_kbps,
+        scope_period_count=sc,
+        scope_period_unit=su,
+        time_scope="monthly",
+        scope_type=dto.scope_type,
+        router_id=dto.router_id if dto.scope_type == "router" else None,
+        enabled=dto.enabled,
+    )
+    sync_legacy_time_scope_field(rule)
+    db.add(rule)
+    db.flush()
+
+    if dto.scope_type == "peer" and dto.peer_ids:
+        for pid in dto.peer_ids:
+            peer = db.get(Peer, pid)
+            if not peer:
+                continue
+            db.add(FairUsageAssignment(rule_id=rule.id, peer_id=pid))
+    db.commit()
+    db.refresh(rule)
+    return _fu_rule_to_dto(rule, db, include_peers=True)
+
+
+@router.get("/fair-usage/rules", response_model=List[FairUsageRuleDTO])
+def list_fair_usage_rules(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    rules = db.query(FairUsageRule).order_by(FairUsageRule.id.asc()).all()
+    return [_fu_rule_to_dto(r, db, include_peers=True) for r in rules]
+
+
+@router.get("/fair-usage/rules/{rule_id}", response_model=FairUsageRuleDTO)
+def get_fair_usage_rule(rule_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    rule = db.get(FairUsageRule, rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="rule not found")
+    return _fu_rule_to_dto(rule, db, include_peers=True)
+
+
+@router.put("/fair-usage/rules/{rule_id}", response_model=FairUsageRuleDTO)
+def update_fair_usage_rule(rule_id: int, dto: FairUsageRuleUpdateDTO, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    rule = db.get(FairUsageRule, rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="rule not found")
+
+    if dto.name is not None:
+        rule.name = dto.name
+    if dto.description is not None:
+        rule.description = dto.description
+    if dto.quota_mode is not None:
+        if dto.quota_mode not in ("combined", "independent"):
+            raise HTTPException(status_code=400, detail="quota_mode must be 'combined' or 'independent'")
+        rule.quota_mode = dto.quota_mode
+    if dto.download_quota_bytes is not None:
+        rule.download_quota_bytes = dto.download_quota_bytes
+    if dto.upload_quota_bytes is not None:
+        rule.upload_quota_bytes = dto.upload_quota_bytes
+    if dto.throttle_download_kbps is not None:
+        rule.throttle_download_kbps = dto.throttle_download_kbps
+    if dto.throttle_upload_kbps is not None:
+        rule.throttle_upload_kbps = dto.throttle_upload_kbps
+    if dto.scope_period_count is not None:
+        rule.scope_period_count = dto.scope_period_count
+    if dto.scope_period_unit is not None:
+        rule.scope_period_unit = dto.scope_period_unit
+    if dto.time_scope is not None:
+        sc, su = _apply_legacy_time_scope_to_scope(rule.scope_period_count, rule.scope_period_unit, dto.time_scope)
+        rule.scope_period_count = sc
+        rule.scope_period_unit = su
+    _validate_fair_usage_scope(rule.scope_period_count, rule.scope_period_unit)
+    sync_legacy_time_scope_field(rule)
+    if dto.scope_type is not None:
+        if dto.scope_type not in ("global", "router", "peer"):
+            raise HTTPException(status_code=400, detail="scope_type must be 'global', 'router', or 'peer'")
+        rule.scope_type = dto.scope_type
+    if dto.router_id is not None:
+        rule.router_id = dto.router_id
+    if dto.enabled is not None:
+        rule.enabled = dto.enabled
+    rule.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(rule)
+    return _fu_rule_to_dto(rule, db, include_peers=True)
+
+
+@router.delete("/fair-usage/rules/{rule_id}")
+def delete_fair_usage_rule(rule_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    rule = db.get(FairUsageRule, rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="rule not found")
+    # Clean up any active throttle queues on RouterOS
+    states = db.query(FairUsageState).filter(FairUsageState.rule_id == rule_id).all()
+    for st in states:
+        if st.throttled and st.ros_queue_id:
+            peer = db.get(Peer, st.peer_id)
+            if peer:
+                r = db.get(Router, peer.router_id)
+                if r:
+                    try:
+                        client = make_client(r)
+                        client.remove_simple_queue(st.ros_queue_id)
+                    except Exception:
+                        pass
+        db.delete(st)
+    db.delete(rule)
+    db.commit()
+    return {"ok": True}
+
+
+class FairUsageAssignDTO(BaseModel):
+    peer_ids: List[int]
+
+
+@router.post("/fair-usage/rules/{rule_id}/assign", response_model=FairUsageRuleDTO)
+def assign_peers_to_rule(rule_id: int, dto: FairUsageAssignDTO, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    rule = db.get(FairUsageRule, rule_id)
+    if not rule:
+        raise HTTPException(status_code=404, detail="rule not found")
+    for pid in dto.peer_ids:
+        peer = db.get(Peer, pid)
+        if not peer:
+            continue
+        existing = (
+            db.query(FairUsageAssignment)
+            .filter(FairUsageAssignment.rule_id == rule_id, FairUsageAssignment.peer_id == pid)
+            .first()
+        )
+        if not existing:
+            db.add(FairUsageAssignment(rule_id=rule_id, peer_id=pid))
+    db.commit()
+    db.refresh(rule)
+    return _fu_rule_to_dto(rule, db, include_peers=True)
+
+
+@router.delete("/fair-usage/rules/{rule_id}/assign/{peer_id}")
+def unassign_peer_from_rule(rule_id: int, peer_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    assignment = (
+        db.query(FairUsageAssignment)
+        .filter(FairUsageAssignment.rule_id == rule_id, FairUsageAssignment.peer_id == peer_id)
+        .first()
+    )
+    if not assignment:
+        raise HTTPException(status_code=404, detail="assignment not found")
+    # If peer is currently throttled by this rule, remove queue
+    state = db.query(FairUsageState).filter(FairUsageState.peer_id == peer_id, FairUsageState.rule_id == rule_id).first()
+    if state and state.throttled and state.ros_queue_id:
+        peer = db.get(Peer, peer_id)
+        if peer:
+            r = db.get(Router, peer.router_id)
+            if r:
+                try:
+                    client = make_client(r)
+                    client.remove_simple_queue(state.ros_queue_id)
+                except Exception:
+                    pass
+        db.delete(state)
+    db.delete(assignment)
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/fair-usage/peers/{peer_id}/status", response_model=FairUsagePeerStatusDTO)
+def get_fair_usage_peer_status(peer_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    peer = db.get(Peer, peer_id)
+    if not peer:
+        raise HTTPException(status_code=404, detail="peer not found")
+
+    rule = get_effective_fair_usage_rule(peer, db)
+    if not rule:
+        return FairUsagePeerStatusDTO(peer_id=peer_id)
+
+    used_rx, used_tx = _get_peer_scope_usage(peer_id, rule, db)
+    cnt, unit = normalize_scope_period(rule)
+    next_reset = compute_next_reset_utc_for_rule(rule, db)
+
+    state = db.query(FairUsageState).filter(FairUsageState.peer_id == peer_id).first()
+    throttled = state.throttled if state else False
+    throttled_at = None
+    if state and state.throttled_at:
+        t = state.throttled_at
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        throttled_at = t.isoformat()
+
+    return FairUsagePeerStatusDTO(
+        peer_id=peer_id,
+        rule_id=rule.id,
+        rule_name=rule.name,
+        quota_mode=rule.quota_mode,
+        download_quota_bytes=rule.download_quota_bytes,
+        upload_quota_bytes=rule.upload_quota_bytes,
+        throttle_download_kbps=rule.throttle_download_kbps,
+        throttle_upload_kbps=rule.throttle_upload_kbps,
+        time_scope=rule.time_scope,
+        scope_period_count=cnt,
+        scope_period_unit=unit,
+        scope_label=format_scope_label(cnt, unit),
+        scope_type=rule.scope_type,
+        used_rx=used_rx,
+        used_tx=used_tx,
+        throttled=throttled,
+        throttled_at=throttled_at,
+        next_reset=next_reset.isoformat(),
+    )
+
+
+@router.post("/fair-usage/peers/{peer_id}/reset")
+def reset_fair_usage_peer(peer_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Manually remove throttle for a peer."""
+    peer = db.get(Peer, peer_id)
+    if not peer:
+        raise HTTPException(status_code=404, detail="peer not found")
+    state = db.query(FairUsageState).filter(FairUsageState.peer_id == peer_id).first()
+    if not state:
+        return {"ok": True, "was_throttled": False}
+    was_throttled = state.throttled
+    if state.throttled and state.ros_queue_id:
+        r = db.get(Router, peer.router_id)
+        if r:
+            try:
+                client = make_client(r)
+                client.remove_simple_queue(state.ros_queue_id)
+            except Exception:
+                pass
+    db.delete(state)
+    now_utc = datetime.now(timezone.utc)
+    db.add(Action(peer_id=peer_id, ts=now_utc, action="fu_manual_reset", note="Manual fair-usage reset"))
+    db.commit()
+    return {"ok": True, "was_throttled": was_throttled}
+
+
+# ── Telegram bot management ─────────────────────────────────────────
+
+from ..models import TelegramUser, TelegramPeerBinding, TelegramSignupToken, TelegramNotificationConfig
+
+
+class TelegramConfigPayload(BaseModel):
+    tg_bot_token: Optional[str] = None
+    tg_bot_enabled: Optional[bool] = None
+    tg_admin_chat_id: Optional[str] = None
+    tg_bot_language: Optional[str] = None
+
+
+@router.get("/telegram/config")
+def get_telegram_config(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    keys = ("tg_bot_token", "tg_bot_enabled", "tg_admin_chat_id", "tg_bot_language")
+    result = {}
+    for k in keys:
+        kv = db.get(SettingsKV, k)
+        v = kv.value if kv else ""
+        if k == "tg_bot_token" and v:
+            v = v[:8] + "..." if len(v) > 8 else "***"
+        result[k] = v
+    return result
+
+
+@router.put("/telegram/config")
+def update_telegram_config(payload: TelegramConfigPayload, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    box = SecretBox(settings.secret_key)
+    token_changed = False
+    for field, key in [
+        ("tg_bot_token", "tg_bot_token"),
+        ("tg_bot_enabled", "tg_bot_enabled"),
+        ("tg_admin_chat_id", "tg_admin_chat_id"),
+        ("tg_bot_language", "tg_bot_language"),
+    ]:
+        val = getattr(payload, field, None)
+        if val is None:
+            continue
+        str_val = str(val)
+        if key == "tg_bot_token" and str_val:
+            str_val = box.encrypt(str_val)
+            token_changed = True
+        elif key == "tg_bot_enabled":
+            str_val = "true" if val else "false"
+        kv = db.get(SettingsKV, key)
+        if kv:
+            kv.value = str_val
+        else:
+            db.add(SettingsKV(key=key, value=str_val))
+    db.commit()
+
+    if token_changed or payload.tg_bot_enabled is not None:
+        from ..telegram.bot import restart_bot
+        restart_bot()
+
+    return {"ok": True}
+
+
+@router.get("/telegram/status")
+def get_telegram_status(current_user: User = Depends(get_current_user)):
+    from ..telegram.bot import get_bot_status
+    return get_bot_status()
+
+
+@router.post("/telegram/restart")
+def restart_telegram_bot(current_user: User = Depends(get_current_user)):
+    from ..telegram.bot import restart_bot
+    started = restart_bot()
+    return {"ok": True, "started": started}
+
+
+class TokenCreatePayload(BaseModel):
+    peer_ids: List[int]
+    expires_hours: Optional[int] = None
+    single_use: bool = True
+
+
+@router.post("/telegram/tokens")
+def create_signup_token(payload: TokenCreatePayload, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from ..telegram.tokens import generate_token
+    expires_at = None
+    if payload.expires_hours and payload.expires_hours > 0:
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=payload.expires_hours)
+    tok = generate_token(db, payload.peer_ids, current_user.id, expires_at, payload.single_use)
+    db.commit()
+
+    # Try to get bot username for deep link
+    bot_username = ""
+    try:
+        from ..telegram.bot import _get_tg_settings, _decrypt_token
+        import asyncio as _aio
+        cfg = _get_tg_settings()
+        _token = _decrypt_token(cfg.get("tg_bot_token", ""))
+        if _token and len(_token) >= 20:
+            from aiogram import Bot as _Bot
+            async def _get_username():
+                b = _Bot(token=_token)
+                try:
+                    me = await b.get_me()
+                    return me.username or ""
+                finally:
+                    await b.session.close()
+            bot_username = _aio.run(_get_username())
+    except Exception:
+        pass
+
+    deep_link = f"https://t.me/{bot_username}?start={tok.token}" if bot_username else ""
+    return {
+        "id": tok.id,
+        "token": tok.token,
+        "peer_ids": json.loads(tok.peer_ids),
+        "deep_link": deep_link,
+        "expires_at": tok.expires_at.isoformat() if tok.expires_at else None,
+        "single_use": tok.single_use,
+    }
+
+
+@router.get("/telegram/tokens")
+def list_signup_tokens(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    tokens = db.query(TelegramSignupToken).order_by(TelegramSignupToken.created_at.desc()).all()
+    result = []
+    for tok in tokens:
+        used_by_info = None
+        if tok.used_by:
+            tg_user = db.get(TelegramUser, tok.used_by)
+            if tg_user:
+                used_by_info = {
+                    "telegram_username": tg_user.telegram_username,
+                    "first_name": tg_user.first_name,
+                }
+        result.append({
+            "id": tok.id,
+            "token": tok.token,
+            "peer_ids": json.loads(tok.peer_ids or "[]"),
+            "created_at": tok.created_at.isoformat() if tok.created_at else None,
+            "used_at": tok.used_at.isoformat() if tok.used_at else None,
+            "used_by": used_by_info,
+            "expires_at": tok.expires_at.isoformat() if tok.expires_at else None,
+            "single_use": tok.single_use,
+        })
+    return result
+
+
+@router.delete("/telegram/tokens/{token_id}")
+def revoke_token(token_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    tok = db.get(TelegramSignupToken, token_id)
+    if not tok:
+        raise HTTPException(status_code=404, detail="token not found")
+    db.delete(tok)
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/telegram/users")
+def list_telegram_users(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    users = db.query(TelegramUser).order_by(TelegramUser.created_at.desc()).all()
+    result = []
+    for u in users:
+        bindings = db.query(TelegramPeerBinding).filter_by(telegram_user_id=u.id).all()
+        peer_info = []
+        for b in bindings:
+            peer = db.get(Peer, b.peer_id)
+            rtr = db.get(Router, peer.router_id) if peer else None
+            peer_info.append({
+                "binding_id": b.id,
+                "peer_id": b.peer_id,
+                "peer_name": peer.name if peer else "?",
+                "router_name": rtr.name if rtr else "?",
+                "interface": peer.interface if peer else "?",
+                "visible": b.visible,
+            })
+        result.append({
+            "id": u.id,
+            "telegram_user_id": u.telegram_user_id,
+            "telegram_username": u.telegram_username,
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+            "language": u.language,
+            "is_blocked": u.is_blocked,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+            "peers": peer_info,
+        })
+    return result
+
+
+@router.delete("/telegram/users/{tg_user_db_id}")
+def delete_telegram_user(tg_user_db_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    u = db.get(TelegramUser, tg_user_db_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+    db.delete(u)
+    db.commit()
+    return {"ok": True}
+
+
+class TelegramUserPatch(BaseModel):
+    is_blocked: Optional[bool] = None
+
+
+@router.patch("/telegram/users/{tg_user_db_id}")
+def patch_telegram_user(tg_user_db_id: int, payload: TelegramUserPatch, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    u = db.get(TelegramUser, tg_user_db_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+    if payload.is_blocked is not None:
+        u.is_blocked = payload.is_blocked
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/telegram/bindings")
+def list_bindings(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    bindings = db.query(TelegramPeerBinding).all()
+    result = []
+    for b in bindings:
+        tg_user = db.get(TelegramUser, b.telegram_user_id)
+        peer = db.get(Peer, b.peer_id)
+        result.append({
+            "id": b.id,
+            "telegram_username": tg_user.telegram_username if tg_user else "?",
+            "peer_name": peer.name if peer else "?",
+            "peer_id": b.peer_id,
+            "visible": b.visible,
+        })
+    return result
+
+
+class BindingPatch(BaseModel):
+    visible: Optional[bool] = None
+
+
+@router.patch("/telegram/bindings/{binding_id}")
+def patch_binding(binding_id: int, payload: BindingPatch, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    b = db.get(TelegramPeerBinding, binding_id)
+    if not b:
+        raise HTTPException(status_code=404, detail="binding not found")
+    if payload.visible is not None:
+        b.visible = payload.visible
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/telegram/bindings/{binding_id}")
+def delete_binding(binding_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    b = db.get(TelegramPeerBinding, binding_id)
+    if not b:
+        raise HTTPException(status_code=404, detail="binding not found")
+    db.delete(b)
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/telegram/notifications")
+def get_notification_config(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    configs = db.query(TelegramNotificationConfig).all()
+    return [
+        {
+            "id": c.id,
+            "event_type": c.event_type,
+            "notify_clients": c.notify_clients,
+            "notify_admin": c.notify_admin,
+            "enabled": c.enabled,
+        }
+        for c in configs
+    ]
+
+
+class NotifConfigUpdate(BaseModel):
+    configs: List[dict]
+
+
+@router.put("/telegram/notifications")
+def update_notification_config(payload: NotifConfigUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    for item in payload.configs:
+        cfg = db.query(TelegramNotificationConfig).filter_by(event_type=item.get("event_type")).first()
+        if not cfg:
+            continue
+        if "notify_clients" in item:
+            cfg.notify_clients = bool(item["notify_clients"])
+        if "notify_admin" in item:
+            cfg.notify_admin = bool(item["notify_admin"])
+        if "enabled" in item:
+            cfg.enabled = bool(item["enabled"])
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/telegram/test-notify")
+def test_notify(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from ..telegram.notifications import _send_message_sync, _get_admin_chat_id
+    admin_id = _get_admin_chat_id(db)
+    if not admin_id:
+        raise HTTPException(status_code=400, detail="Admin chat ID not configured")
+    ok = _send_message_sync(admin_id, "WGMik test notification - bot is working!")
+    if not ok:
+        raise HTTPException(status_code=502, detail="Failed to send message. Check bot token and chat ID.")
+    return {"ok": True}

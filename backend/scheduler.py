@@ -1,4 +1,5 @@
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -10,11 +11,17 @@ from typing import Optional, Dict, Tuple
 from .settings import settings
 from .db import SessionLocal
 from .models import Router, Peer, UsageSample, UsageMinute, UsageDaily, UsageMonthly, SettingsKV, Quota, Action
+from .fair_usage_sync import apply_fair_usage_policy, get_effective_fair_usage_rule
 from .routeros.factory import make_client
 from .usage_storage import floor_to_minute_utc, upsert_usage_minute
 
 
 _scheduler: Optional[BackgroundScheduler] = None
+
+
+def _enforce_fair_usage(db: Session, peer: Peer, client, now_utc: datetime):
+    """Fair usage: throttle/unthrottle and keep simple-queue limits synced every poll tick."""
+    apply_fair_usage_policy(db, peer, client, now_utc)
 
 
 def _poll_once():
@@ -198,125 +205,19 @@ def _poll_once():
                     )
                     return int(used_rx + used_tx)
 
-                # Quota enforcement: auto-disable peers that exceed their monthly limit
-                quota = db.query(Quota).filter(Quota.peer_id == peer.id).first()
-                over_quota = False
-                if quota and quota.monthly_limit_bytes and quota.monthly_limit_bytes > 0:
-                    total = month_total_bytes()
-                    over_quota = total >= quota.monthly_limit_bytes
-                    if over_quota and not peer.disabled:
-                        # For real RouterOS peers, only flip DB state if router call succeeds.
-                        if peer.ros_id:
-                            try:
-                                client.set_peer_disabled(peer.interface, peer.ros_id, True)
-                                peer.disabled = True
-                                db.add(
-                                    Action(
-                                        peer_id=peer.id,
-                                        ts=now_utc,
-                                        action="quota_disable",
-                                        note=f"Auto-disabled: used={total} limit={quota.monthly_limit_bytes}",
-                                    )
-                                )
-                            except Exception as e:
-                                db.add(
-                                    Action(
-                                        peer_id=peer.id,
-                                        ts=now_utc,
-                                        action="quota_disable_failed",
-                                        note=f"{e}",
-                                    )
-                                )
-                        else:
-                            # No RouterOS backing, just flip DB flag.
-                            peer.disabled = True
-                            db.add(
-                                Action(
-                                    peer_id=peer.id,
-                                    ts=now_utc,
-                                    action="quota_disable",
-                                    note=f"Auto-disabled (no ros_id): used={total} limit={quota.monthly_limit_bytes}",
-                                )
-                            )
+                # ── Fair Usage enforcement (replaces old quota hard-disable) ──
+                _enforce_fair_usage(db, peer, client, now_utc)
 
-                # Access window enforcement: optional time-based enable/disable
-                vf = db.get(SettingsKV, f"quota_valid_from:{peer.id}")
-                vu = db.get(SettingsKV, f"quota_valid_until:{peer.id}")
-                window_start = None
-                window_end = None
+                # ── Telegram notifications (best-effort, never blocks polling) ──
                 try:
-                    if vf and vf.value:
-                        dt = datetime.fromisoformat(vf.value)
-                        window_start = dt if dt.tzinfo else dt.replace(tzinfo=tz)
+                    from .telegram.notifications import check_and_send_notifications
+                    from .fair_usage_usage import peer_scope_usage_for_rule as _fu_usage
+                    fu_rule = get_effective_fair_usage_rule(peer, db)
+                    if fu_rule:
+                        _urx, _utx = _fu_usage(peer.id, fu_rule, db, now_utc)
+                        check_and_send_notifications(db, peer, fu_rule, _urx, _utx, now_utc)
                 except Exception:
-                    window_start = None
-                try:
-                    if vu and vu.value:
-                        dt = datetime.fromisoformat(vu.value)
-                        window_end = dt if dt.tzinfo else dt.replace(tzinfo=tz)
-                except Exception:
-                    window_end = None
-                inside_window = True
-                if window_start and now_local < window_start:
-                    inside_window = False
-                if window_end and now_local > window_end:
-                    inside_window = False
-
-                if (window_start or window_end) and (not inside_window) and (not peer.disabled):
-                    # Outside access window -> disable
-                    if peer.ros_id:
-                        try:
-                            client.set_peer_disabled(peer.interface, peer.ros_id, True)
-                            peer.disabled = True
-                            db.add(
-                                Action(
-                                    peer_id=peer.id,
-                                    ts=now_utc,
-                                    action="window_disable",
-                                    note=f"Auto-disabled outside access window ({vf.value if vf else ''} – {vu.value if vu else ''})",
-                                )
-                            )
-                        except Exception as e:
-                            db.add(
-                                Action(
-                                    peer_id=peer.id,
-                                    ts=now_utc,
-                                    action="window_disable_failed",
-                                    note=f"{e}",
-                                )
-                            )
-                    else:
-                        peer.disabled = True
-                        db.add(
-                            Action(
-                                peer_id=peer.id,
-                                ts=now_utc,
-                                action="window_disable",
-                                note="Auto-disabled outside access window (no ros_id)",
-                            )
-                        )
-
-                # Auto-enable when conditions are satisfied again, but only if we disabled it (quota/window).
-                if peer.disabled and (not over_quota) and inside_window:
-                    last_action = (
-                        db.query(Action)
-                        .filter(Action.peer_id == peer.id)
-                        .order_by(Action.ts.desc())
-                        .first()
-                    )
-                    if last_action and last_action.action in ("window_disable", "quota_disable"):
-                        enable_action = "window_enable" if last_action.action == "window_disable" else "quota_enable"
-                        enable_note = "Auto-enabled: inside access window" if last_action.action == "window_disable" else "Auto-enabled: not over quota"
-                        if peer.ros_id:
-                            try:
-                                client.set_peer_disabled(peer.interface, peer.ros_id, False)
-                                peer.disabled = False
-                                db.add(Action(peer_id=peer.id, ts=now_utc, action=enable_action, note=enable_note))
-                            except Exception as e:
-                                db.add(Action(peer_id=peer.id, ts=now_utc, action=f"{enable_action}_failed", note=f"{e}"))
-                        else:
-                            peer.disabled = False
-                            db.add(Action(peer_id=peer.id, ts=now_utc, action=enable_action, note=enable_note + " (no ros_id)"))
+                    pass
 
         db.commit()
     except OperationalError as exc:
@@ -350,8 +251,44 @@ def ensure_scheduler() -> BackgroundScheduler:
             id="polling-job",
             replace_existing=True,
         )
+        _scheduler.add_job(
+            _tg_daily_summary,
+            CronTrigger(hour=20, minute=0),
+            id="tg-daily-summary",
+            replace_existing=True,
+        )
+        _scheduler.add_job(
+            _tg_weekly_summary,
+            CronTrigger(day_of_week="sun", hour=20, minute=0),
+            id="tg-weekly-summary",
+            replace_existing=True,
+        )
         _scheduler.start()
     return _scheduler
+
+
+def _tg_daily_summary():
+    db: Session = SessionLocal()
+    try:
+        from .telegram.notifications import send_daily_summary
+        send_daily_summary(db)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _tg_weekly_summary():
+    db: Session = SessionLocal()
+    try:
+        from .telegram.notifications import send_weekly_summary
+        send_weekly_summary(db)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 def update_scheduler_interval(seconds: int) -> None:

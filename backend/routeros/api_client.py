@@ -196,6 +196,83 @@ class RouterOSApiClient(RouterOSClient):
             except Exception:
                 pass
 
+    # ── Simple Queue management ──────────────────────────────────────────
+
+    def add_simple_queue(self, name: str, target: str, max_limit_up: str, max_limit_down: str, comment: str = "") -> str:
+        api = self._conn()
+        try:
+            params = {
+                "name": name,
+                "target": target,
+                "max-limit": f"{max_limit_up}/{max_limit_down}",
+            }
+            if comment:
+                params["comment"] = comment
+            res = api(cmd="/queue/simple/add", **params)
+            if isinstance(res, dict):
+                rid = res.get("ret") or res.get(".id")
+                if isinstance(rid, str) and rid:
+                    return rid
+            if isinstance(res, list) and res:
+                first = res[0]
+                if isinstance(first, dict):
+                    rid = first.get("ret") or first.get(".id")
+                    if isinstance(rid, str) and rid:
+                        return rid
+            rows = api(cmd="/queue/simple/print")
+            for row in rows:
+                if row.get("name") == name:
+                    return row.get(".id", "")
+            raise RuntimeError("RouterOS did not return queue id")
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def update_simple_queue(self, ros_id: str, max_limit_up: str, max_limit_down: str) -> None:
+        api = self._conn()
+        try:
+            api(cmd="/queue/simple/set", **{".id": ros_id, "max-limit": f"{max_limit_up}/{max_limit_down}"})
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def remove_simple_queue(self, ros_id: str) -> None:
+        api = self._conn()
+        try:
+            api(cmd="/queue/simple/remove", **{".id": ros_id})
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def list_simple_queues(self, name_prefix: str = "") -> List[dict]:
+        api = self._conn()
+        try:
+            rows = api(cmd="/queue/simple/print")
+            result = []
+            for row in rows:
+                n = row.get("name", "")
+                if name_prefix and not n.startswith(name_prefix):
+                    continue
+                result.append({
+                    "ros_id": row.get(".id", ""),
+                    "name": n,
+                    "target": row.get("target", ""),
+                    "max_limit": row.get("max-limit", ""),
+                    "comment": row.get("comment", ""),
+                })
+            return result
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
     def get_wireguard_peer_private_key(self, interface: str, ros_id: str) -> Optional[str]:
         api = self._conn()
         try:

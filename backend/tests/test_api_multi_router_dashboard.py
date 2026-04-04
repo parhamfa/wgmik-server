@@ -379,7 +379,9 @@ def test_summary_endpoints_read_usage_minute(client):
 
     peers = client.get(f"/api/summary/peers?seconds=600&router_ids={seeded['router2_id']}")
     assert peers.status_code == 200, peers.text
-    assert peers.json() == [{"peer_id": seeded["peer2_id"], "rx": 720, "tx": 300}]
+    assert peers.json() == [
+        {"peer_id": seeded["peer2_id"], "rx": 720, "tx": 300, "has_fair_usage": False, "fair_usage_throttled": False}
+    ]
 
     raw = client.get(f"/api/summary/raw?seconds=600&router_ids={seeded['router2_id']}&interval=60")
     assert raw.status_code == 200, raw.text
@@ -424,7 +426,9 @@ def test_summary_endpoints_fall_back_when_minute_data_starts_after_cutoff(client
 
     peers = client.get(f"/api/summary/peers?seconds=600&router_ids={seeded['router2_id']}")
     assert peers.status_code == 200, peers.text
-    assert peers.json() == [{"peer_id": seeded["peer2_id"], "rx": 600, "tx": 400}]
+    assert peers.json() == [
+        {"peer_id": seeded["peer2_id"], "rx": 600, "tx": 400, "has_fair_usage": False, "fair_usage_throttled": False}
+    ]
 
     raw = client.get(f"/api/summary/raw?seconds=600&router_ids={seeded['router2_id']}&interval=60")
     assert raw.status_code == 200, raw.text

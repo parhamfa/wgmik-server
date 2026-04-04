@@ -57,6 +57,7 @@ export default function SettingsPage() {
     online_threshold_seconds: 15,
     monthly_reset_day: 1,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    week_start_day: 0,
     show_kind_pills: true,
     show_hw_stats: true,
     dashboard_refresh_seconds: 30,
@@ -426,6 +427,22 @@ export default function SettingsPage() {
                 onChange={(e) => setForm({ ...form, timezone: e.target.value })}
               />
             )}
+          </div>
+          <div>
+            <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Week starts on</label>
+            <select
+              className="w-full md:w-80 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
+              value={form.week_start_day}
+              onChange={(e) => setForm({ ...form, week_start_day: Number(e.target.value) })}
+            >
+              <option value={0}>Monday</option>
+              <option value={1}>Tuesday</option>
+              <option value={2}>Wednesday</option>
+              <option value={3}>Thursday</option>
+              <option value={4}>Friday</option>
+              <option value={5}>Saturday</option>
+              <option value={6}>Sunday</option>
+            </select>
           </div>
           <div className="grid gap-2 pt-2 border-t border-gray-100 dark:border-gray-800">
             <label className="inline-flex items-center gap-2 text-xs text-gray-700 dark:text-gray-200">

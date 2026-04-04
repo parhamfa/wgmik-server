@@ -28,6 +28,7 @@ export type SettingsDTO = {
   monthly_reset_day: number;
   // Previously used fields in Settings.tsx
   timezone: string;
+  week_start_day: number;
   dashboard_refresh_seconds: number;
   peer_refresh_seconds: number;
   peer_default_scope_unit: string;
@@ -243,6 +244,10 @@ export type PeerUsageSummaryDTO = {
   total_tx: number;
   rx: number; // Alias
   tx: number; // Alias
+  /** True when an enabled fair-usage rule applies (assignment, router, or global). */
+  has_fair_usage?: boolean;
+  /** True when fair usage has applied a throttle (simple queue) for this peer. */
+  fair_usage_throttled?: boolean;
 };
 export type PeerUsageSummary = PeerUsageSummaryDTO; // Alias
 
@@ -289,6 +294,8 @@ export async function getPeersSummary(opts: { seconds?: number; days?: number; r
     tx: r.tx ?? 0,
     total_rx: r.rx ?? 0,
     total_tx: r.tx ?? 0,
+    has_fair_usage: r.has_fair_usage === true,
+    fair_usage_throttled: r.fair_usage_throttled === true,
   }));
 }
 
@@ -488,6 +495,126 @@ export const putSettings = updateSettings;
 export const patchPeerQuota = updateQuota;
 
 
+// ── Fair Usage ─────────────────────────────────────────────────────────
+
+export type FairUsageAssignedPeer = {
+  peer_id: number;
+  name: string;
+  allowed_address: string;
+  router_id: number;
+  disabled: boolean;
+};
+
+export type FairUsageRuleDTO = {
+  id: number;
+  name: string;
+  description: string;
+  quota_mode: "combined" | "independent";
+  download_quota_bytes: number;
+  upload_quota_bytes: number | null;
+  throttle_download_kbps: number;
+  throttle_upload_kbps: number;
+  /** Legacy short code (e.g. monthly, 5h) */
+  time_scope: string;
+  scope_period_count: number;
+  scope_period_unit: "hour" | "day" | "week" | "month";
+  scope_label: string;
+  scope_type: "global" | "router" | "peer";
+  router_id: number | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  assigned_peer_count: number;
+  assigned_peers: FairUsageAssignedPeer[];
+};
+
+export type FairUsageRuleCreateDTO = {
+  name: string;
+  description?: string;
+  quota_mode?: "combined" | "independent";
+  download_quota_bytes: number;
+  upload_quota_bytes?: number | null;
+  throttle_download_kbps: number;
+  throttle_upload_kbps: number;
+  scope_period_count: number;
+  scope_period_unit: "hour" | "day" | "week" | "month";
+  /** @deprecated maps to scope_period_* when set to hourly/daily/weekly/monthly */
+  time_scope?: "hourly" | "daily" | "weekly" | "monthly";
+  scope_type: "global" | "router" | "peer";
+  router_id?: number | null;
+  peer_ids?: number[];
+  enabled?: boolean;
+};
+
+export type FairUsagePeerStatusDTO = {
+  peer_id: number;
+  rule_id: number | null;
+  rule_name: string | null;
+  quota_mode: string | null;
+  download_quota_bytes: number;
+  upload_quota_bytes: number | null;
+  throttle_download_kbps: number;
+  throttle_upload_kbps: number;
+  time_scope: string | null;
+  scope_period_count: number;
+  scope_period_unit: string;
+  scope_label: string;
+  scope_type: string | null;
+  used_rx: number;
+  used_tx: number;
+  throttled: boolean;
+  throttled_at: string | null;
+  next_reset: string | null;
+};
+
+export async function listFairUsageRules(): Promise<FairUsageRuleDTO[]> {
+  return fetchJson("/api/fair-usage/rules");
+}
+
+export async function getFairUsageRule(ruleId: number): Promise<FairUsageRuleDTO> {
+  return fetchJson(`/api/fair-usage/rules/${ruleId}`);
+}
+
+export async function createFairUsageRule(dto: FairUsageRuleCreateDTO): Promise<FairUsageRuleDTO> {
+  return fetchJson("/api/fair-usage/rules", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(dto),
+  });
+}
+
+export async function updateFairUsageRule(ruleId: number, dto: Partial<FairUsageRuleCreateDTO>): Promise<FairUsageRuleDTO> {
+  return fetchJson(`/api/fair-usage/rules/${ruleId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(dto),
+  });
+}
+
+export async function deleteFairUsageRule(ruleId: number): Promise<void> {
+  await fetchJson(`/api/fair-usage/rules/${ruleId}`, { method: "DELETE" });
+}
+
+export async function assignPeersToRule(ruleId: number, peerIds: number[]): Promise<FairUsageRuleDTO> {
+  return fetchJson(`/api/fair-usage/rules/${ruleId}/assign`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ peer_ids: peerIds }),
+  });
+}
+
+export async function unassignPeerFromRule(ruleId: number, peerId: number): Promise<void> {
+  await fetchJson(`/api/fair-usage/rules/${ruleId}/assign/${peerId}`, { method: "DELETE" });
+}
+
+export async function getFairUsagePeerStatus(peerId: number): Promise<FairUsagePeerStatusDTO> {
+  return fetchJson(`/api/fair-usage/peers/${peerId}/status`);
+}
+
+export async function resetFairUsagePeer(peerId: number): Promise<void> {
+  await fetchJson(`/api/fair-usage/peers/${peerId}/reset`, { method: "POST" });
+}
+
 // RESTORED: Admin Actions
 export async function purgeUsage() {
   return fetchJson("/api/admin/purge_usage", { method: "POST" });
@@ -500,4 +627,154 @@ export async function getUsageMaintenanceStatus(): Promise<UsageMaintenanceStatu
 }
 export async function runUsageMaintenance(): Promise<UsageMaintenanceStatusDTO> {
   return fetchJson("/api/admin/usage_maintenance/run", { method: "POST" });
+}
+
+// ── Telegram Bot ────────────────────────────────────────────────────
+
+export type TelegramConfigDTO = {
+  tg_bot_token: string;
+  tg_bot_enabled: string;
+  tg_admin_chat_id: string;
+  tg_bot_language: string;
+};
+
+export type TelegramStatusDTO = {
+  running: boolean;
+  started_at: string | null;
+  uptime_seconds: number;
+};
+
+export type TelegramTokenDTO = {
+  id: number;
+  token: string;
+  peer_ids: number[];
+  deep_link?: string;
+  created_at: string | null;
+  used_at: string | null;
+  used_by: { telegram_username: string; first_name: string } | null;
+  expires_at: string | null;
+  single_use: boolean;
+};
+
+export type TelegramPeerInfo = {
+  binding_id: number;
+  peer_id: number;
+  peer_name: string;
+  router_name: string;
+  interface: string;
+  visible: boolean;
+};
+
+export type TelegramUserDTO = {
+  id: number;
+  telegram_user_id: number;
+  telegram_username: string;
+  first_name: string;
+  last_name: string;
+  language: string;
+  is_blocked: boolean;
+  created_at: string | null;
+  peers: TelegramPeerInfo[];
+};
+
+export type TelegramNotifConfigDTO = {
+  id: number;
+  event_type: string;
+  notify_clients: boolean;
+  notify_admin: boolean;
+  enabled: boolean;
+};
+
+export async function getTelegramConfig(): Promise<TelegramConfigDTO> {
+  return fetchJson("/api/telegram/config");
+}
+
+export async function updateTelegramConfig(cfg: Partial<{
+  tg_bot_token: string;
+  tg_bot_enabled: boolean;
+  tg_admin_chat_id: string;
+  tg_bot_language: string;
+}>): Promise<{ ok: boolean }> {
+  return fetchJson("/api/telegram/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(cfg),
+  });
+}
+
+export async function getTelegramStatus(): Promise<TelegramStatusDTO> {
+  return fetchJson("/api/telegram/status");
+}
+
+export async function restartTelegramBot(): Promise<{ ok: boolean; started: boolean }> {
+  return fetchJson("/api/telegram/restart", { method: "POST" });
+}
+
+export async function createTelegramToken(data: {
+  peer_ids: number[];
+  expires_hours?: number;
+  single_use?: boolean;
+}): Promise<TelegramTokenDTO> {
+  return fetchJson("/api/telegram/tokens", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function listTelegramTokens(): Promise<TelegramTokenDTO[]> {
+  return fetchJson("/api/telegram/tokens");
+}
+
+export async function revokeTelegramToken(id: number): Promise<void> {
+  await fetchJson(`/api/telegram/tokens/${id}`, { method: "DELETE" });
+}
+
+export async function listTelegramUsers(): Promise<TelegramUserDTO[]> {
+  return fetchJson("/api/telegram/users");
+}
+
+export async function deleteTelegramUser(id: number): Promise<void> {
+  await fetchJson(`/api/telegram/users/${id}`, { method: "DELETE" });
+}
+
+export async function patchTelegramUser(id: number, data: { is_blocked?: boolean }): Promise<void> {
+  await fetchJson(`/api/telegram/users/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function patchTelegramBinding(id: number, data: { visible?: boolean }): Promise<void> {
+  await fetchJson(`/api/telegram/bindings/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteTelegramBinding(id: number): Promise<void> {
+  await fetchJson(`/api/telegram/bindings/${id}`, { method: "DELETE" });
+}
+
+export async function getTelegramNotifConfig(): Promise<TelegramNotifConfigDTO[]> {
+  return fetchJson("/api/telegram/notifications");
+}
+
+export async function updateTelegramNotifConfig(configs: Array<{
+  event_type: string;
+  notify_clients?: boolean;
+  notify_admin?: boolean;
+  enabled?: boolean;
+}>): Promise<void> {
+  await fetchJson("/api/telegram/notifications", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ configs }),
+  });
+}
+
+export async function testTelegramNotify(): Promise<{ ok: boolean }> {
+  return fetchJson("/api/telegram/test-notify", { method: "POST" });
 }

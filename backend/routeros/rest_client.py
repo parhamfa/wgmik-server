@@ -214,6 +214,52 @@ class RouterOSRestClient(RouterOSClient):
         #   POST /rest/interface/wireguard/peers/remove  {"numbers":"*53"}
         self._request("POST", "/interface/wireguard/peers/remove", json={"numbers": ros_id})
 
+    # ── Simple Queue management ──────────────────────────────────────────
+
+    def add_simple_queue(self, name: str, target: str, max_limit_up: str, max_limit_down: str, comment: str = "") -> str:
+        payload = {
+            "name": name,
+            "target": target,
+            "max-limit": f"{max_limit_up}/{max_limit_down}",
+        }
+        if comment:
+            payload["comment"] = comment
+        res = self._request("POST", "/queue/simple/add", json=payload)
+        if isinstance(res, dict):
+            rid = res.get("ret") or res.get(".id")
+            if isinstance(rid, str) and rid:
+                return rid
+        for q in self.list_simple_queues():
+            if q["name"] == name:
+                return q["ros_id"]
+        raise RuntimeError("RouterOS did not return queue id")
+
+    def update_simple_queue(self, ros_id: str, max_limit_up: str, max_limit_down: str) -> None:
+        self._request(
+            "POST",
+            "/queue/simple/set",
+            json={"numbers": ros_id, "max-limit": f"{max_limit_up}/{max_limit_down}"},
+        )
+
+    def remove_simple_queue(self, ros_id: str) -> None:
+        self._request("POST", "/queue/simple/remove", json={"numbers": ros_id})
+
+    def list_simple_queues(self, name_prefix: str = "") -> List[dict]:
+        data = self._get("/queue/simple")
+        result = []
+        for row in (data if isinstance(data, list) else []):
+            n = row.get("name", "")
+            if name_prefix and not n.startswith(name_prefix):
+                continue
+            result.append({
+                "ros_id": row.get(".id", ""),
+                "name": n,
+                "target": row.get("target", ""),
+                "max_limit": row.get("max-limit", ""),
+                "comment": row.get("comment", ""),
+            })
+        return result
+
     def get_wireguard_peer_private_key(self, interface: str, ros_id: str) -> Optional[str]:
         # Try item endpoint first (fast path). RouterOS uses ids like "*3".
         try:

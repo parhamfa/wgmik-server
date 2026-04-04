@@ -64,3 +64,25 @@ class RouterOSClient:
     def get_primary_ipv4(self) -> str:
         """Return primary IPv4 address of the router (public if available, otherwise first private)."""
         raise NotImplementedError
+
+    # ── Simple Queue management ──────────────────────────────────────────
+
+    def add_simple_queue(self, name: str, target: str, max_limit_up: str, max_limit_down: str, comment: str = "") -> str:
+        """Create a simple queue and return its RouterOS .id.
+        max_limit_up / max_limit_down are in MikroTik notation, e.g. '1000k'.
+        """
+        raise NotImplementedError
+
+    def update_simple_queue(self, ros_id: str, max_limit_up: str, max_limit_down: str) -> None:
+        """Update the speed limits of an existing simple queue."""
+        raise NotImplementedError
+
+    def remove_simple_queue(self, ros_id: str) -> None:
+        """Remove a simple queue by RouterOS .id."""
+        raise NotImplementedError
+
+    def list_simple_queues(self, name_prefix: str = "") -> List[dict]:
+        """List simple queues, optionally filtered by name prefix.
+        Returns list of dicts with keys: ros_id, name, target, max_limit, comment.
+        """
+        raise NotImplementedError

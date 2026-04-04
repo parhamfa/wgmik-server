@@ -101,6 +101,54 @@ class Quota(Base):
     reset_day: Mapped[int] = mapped_column(Integer, default=1)
 
 
+class FairUsageRule(Base):
+    __tablename__ = "fair_usage_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(String(512), default="")
+    quota_mode: Mapped[str] = mapped_column(String(16), default="combined")  # combined | independent
+    download_quota_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    upload_quota_bytes: Mapped[int] = mapped_column(BigInteger, nullable=True)
+    throttle_download_kbps: Mapped[int] = mapped_column(Integer, default=1000)
+    throttle_upload_kbps: Mapped[int] = mapped_column(Integer, default=1000)
+    time_scope: Mapped[str] = mapped_column(String(16), default="monthly")  # legacy; sync from scope_period_*
+    scope_period_count: Mapped[int] = mapped_column(Integer, default=1)
+    scope_period_unit: Mapped[str] = mapped_column(String(8), default="month")  # hour | day | week | month
+    scope_type: Mapped[str] = mapped_column(String(16), default="global")  # global | router | peer
+    router_id: Mapped[int] = mapped_column(ForeignKey("routers.id", ondelete="CASCADE"), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    assignments: Mapped[list["FairUsageAssignment"]] = relationship("FairUsageAssignment", back_populates="rule", cascade="all, delete-orphan")
+
+
+class FairUsageAssignment(Base):
+    __tablename__ = "fair_usage_assignments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("fair_usage_rules.id", ondelete="CASCADE"))
+    peer_id: Mapped[int] = mapped_column(ForeignKey("peers.id", ondelete="CASCADE"))
+
+    rule: Mapped["FairUsageRule"] = relationship("FairUsageRule", back_populates="assignments")
+
+    __table_args__ = (
+        UniqueConstraint("rule_id", "peer_id", name="uq_fu_rule_peer"),
+    )
+
+
+class FairUsageState(Base):
+    __tablename__ = "fair_usage_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    peer_id: Mapped[int] = mapped_column(ForeignKey("peers.id", ondelete="CASCADE"), unique=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("fair_usage_rules.id", ondelete="CASCADE"))
+    throttled: Mapped[bool] = mapped_column(Boolean, default=False)
+    ros_queue_id: Mapped[str] = mapped_column(String(64), nullable=True, default="")
+    throttled_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+
+
 class Action(Base):
     __tablename__ = "actions"
 
@@ -125,3 +173,73 @@ class User(Base):
     hashed_password: Mapped[str] = mapped_column(String)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ── Telegram bot tables ──────────────────────────────────────────────
+
+class TelegramUser(Base):
+    __tablename__ = "telegram_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    telegram_username: Mapped[str] = mapped_column(String(255), default="")
+    first_name: Mapped[str] = mapped_column(String(255), default="")
+    last_name: Mapped[str] = mapped_column(String(255), default="")
+    language: Mapped[str] = mapped_column(String(4), default="en")
+    is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    bindings: Mapped[list["TelegramPeerBinding"]] = relationship(
+        "TelegramPeerBinding", back_populates="tg_user", cascade="all, delete-orphan"
+    )
+
+
+class TelegramPeerBinding(Base):
+    __tablename__ = "telegram_peer_bindings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.id", ondelete="CASCADE"))
+    peer_id: Mapped[int] = mapped_column(ForeignKey("peers.id", ondelete="CASCADE"))
+    visible: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    tg_user: Mapped["TelegramUser"] = relationship("TelegramUser", back_populates="bindings")
+
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", "peer_id", name="uq_tg_user_peer"),
+    )
+
+
+class TelegramSignupToken(Base):
+    __tablename__ = "telegram_signup_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    peer_ids: Mapped[str] = mapped_column(String, default="[]")  # JSON array
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    used_by: Mapped[int] = mapped_column(ForeignKey("telegram_users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    used_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    single_use: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class TelegramNotificationConfig(Base):
+    __tablename__ = "telegram_notification_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(32), unique=True)
+    notify_clients: Mapped[bool] = mapped_column(Boolean, default=True)
+    notify_admin: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class TelegramNotificationLog(Base):
+    __tablename__ = "telegram_notification_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.id", ondelete="CASCADE"))
+    peer_id: Mapped[int] = mapped_column(ForeignKey("peers.id", ondelete="SET NULL"), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(32))
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    message_hash: Mapped[str] = mapped_column(String(64), default="")

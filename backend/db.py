@@ -49,6 +49,48 @@ if db_url.startswith("sqlite:"):
             cursor.close()
 
 
+def ensure_fair_usage_scope_columns() -> None:
+    """Add scope_period_* columns and backfill from legacy time_scope (SQLite)."""
+    if not db_url.startswith("sqlite:"):
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(fair_usage_rules)")).fetchall()
+        col_names = {r[1] for r in rows}
+        if "scope_period_count" not in col_names:
+            conn.execute(
+                text("ALTER TABLE fair_usage_rules ADD COLUMN scope_period_count INTEGER DEFAULT 1")
+            )
+        if "scope_period_unit" not in col_names:
+            conn.execute(
+                text("ALTER TABLE fair_usage_rules ADD COLUMN scope_period_unit VARCHAR(8) DEFAULT 'month'")
+            )
+    db = SessionLocal()
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE fair_usage_rules
+                SET
+                    scope_period_count = COALESCE(NULLIF(scope_period_count, 0), 1),
+                    scope_period_unit = CASE
+                        WHEN scope_period_unit IS NOT NULL AND LENGTH(TRIM(scope_period_unit)) > 0
+                            THEN scope_period_unit
+                        ELSE CASE time_scope
+                            WHEN 'hourly' THEN 'hour'
+                            WHEN 'daily' THEN 'day'
+                            WHEN 'weekly' THEN 'week'
+                            WHEN 'monthly' THEN 'month'
+                            ELSE 'month'
+                        END
+                    END
+                """
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def prepare_sqlite_database():
     if not db_url.startswith("sqlite:") or ":memory:" in db_url:
         return
