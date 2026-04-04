@@ -18,6 +18,12 @@ __pycache__/
 *.db
 wgmik.db
 
+# Local runtime data (mounted DB, backups, recovery); never commit
+/data/
+
+# Local Claude/agent worktrees
+.claude/
+
 # IDE/Editor
 .cursor/
 .idea/
