@@ -7,6 +7,7 @@ from .db import (
     Base,
     engine,
     ensure_fair_usage_scope_columns,
+    ensure_fair_usage_tier_schema,
     ensure_runtime_indexes,
     prepare_sqlite_database,
     should_auto_bootstrap_runtime_indexes,
@@ -33,6 +34,7 @@ def _start():
     # Ensure tables exist
     Base.metadata.create_all(bind=engine)
     ensure_fair_usage_scope_columns()
+    ensure_fair_usage_tier_schema()
     prepare_sqlite_database()
     if settings.database_url.startswith("sqlite:") and ":memory:" not in settings.database_url:
         if should_auto_bootstrap_runtime_indexes():

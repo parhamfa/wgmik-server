@@ -11,11 +11,11 @@ import {
   listTelegramUsers,
   deleteTelegramUser,
   patchTelegramUser,
-  patchTelegramBinding,
-  deleteTelegramBinding,
+  setTelegramUserPeers,
   getTelegramNotifConfig,
   updateTelegramNotifConfig,
   testTelegramNotify,
+  testTelegramNotifyEvent,
   listRouters,
   listSavedPeers,
   type TelegramConfigDTO,
@@ -58,6 +58,7 @@ export default function TelegramPage() {
 
   // Notifications
   const [notifConfigs, setNotifConfigs] = React.useState<TelegramNotifConfigDTO[]>([]);
+  const [testingNotifEvent, setTestingNotifEvent] = React.useState<string | null>(null);
 
   // Tokens
   const [tokens, setTokens] = React.useState<TelegramTokenDTO[]>([]);
@@ -72,6 +73,8 @@ export default function TelegramPage() {
   const [users, setUsers] = React.useState<TelegramUserDTO[]>([]);
   const [expandedUser, setExpandedUser] = React.useState<number | null>(null);
   const [userSearch, setUserSearch] = React.useState("");
+  const [userPeerDraft, setUserPeerDraft] = React.useState<Record<number, number[]>>({});
+  const [savingUserPeers, setSavingUserPeers] = React.useState<number | null>(null);
 
   // Peers + Routers for token creation
   const [peers, setPeers] = React.useState<PeerListDTO[]>([]);
@@ -154,6 +157,19 @@ export default function TelegramPage() {
     }
   };
 
+  const handleTestEventNotify = async (eventType: string) => {
+    setErr("");
+    setTestingNotifEvent(eventType);
+    try {
+      await testTelegramNotifyEvent(eventType);
+      flash(`Test sent for ${EVENT_LABELS[eventType] || eventType}`);
+    } catch (e: any) {
+      setErr(e?.message || "Test failed");
+    } finally {
+      setTestingNotifEvent(null);
+    }
+  };
+
   const handleCreateToken = async () => {
     if (tokenPeerIds.length === 0) { setErr("Select at least one peer"); return; }
     setErr("");
@@ -202,6 +218,42 @@ export default function TelegramPage() {
       u.peers.some(p => p.peer_name.toLowerCase().includes(q))
     );
   }, [users, userSearch]);
+
+  const toggleUserPeerDraft = (userId: number, peerId: number, checked: boolean) => {
+    setUserPeerDraft(prev => {
+      const current = prev[userId] || [];
+      if (checked) {
+        if (current.includes(peerId)) return prev;
+        return { ...prev, [userId]: [...current, peerId] };
+      }
+      return { ...prev, [userId]: current.filter(id => id !== peerId) };
+    });
+  };
+
+  const openUserPeers = (u: TelegramUserDTO) => {
+    const willExpand = expandedUser !== u.id;
+    setExpandedUser(willExpand ? u.id : null);
+    if (!willExpand) return;
+    setUserPeerDraft(prev => {
+      if (prev[u.id]) return prev;
+      return { ...prev, [u.id]: u.peers.map(p => p.peer_id) };
+    });
+  };
+
+  const applyUserPeers = async (u: TelegramUserDTO) => {
+    setErr("");
+    setSavingUserPeers(u.id);
+    try {
+      const peer_ids = userPeerDraft[u.id] || [];
+      await setTelegramUserPeers(u.id, peer_ids);
+      await load();
+      flash("Peer bindings updated");
+    } catch (e: any) {
+      setErr(e?.message || "Failed to update peer bindings");
+    } finally {
+      setSavingUserPeers(null);
+    }
+  };
 
   if (loading) {
     return (
@@ -339,6 +391,7 @@ export default function TelegramPage() {
                   <th className="py-2 px-4 text-center">Clients</th>
                   <th className="py-2 px-4 text-center">Admin</th>
                   <th className="py-2 px-4 text-center">Active</th>
+                  <th className="py-2 px-4 text-center">Test</th>
                 </tr>
               </thead>
               <tbody>
@@ -353,6 +406,16 @@ export default function TelegramPage() {
                     </td>
                     <td className="py-2.5 px-4 text-center">
                       <input type="checkbox" checked={c.enabled} onChange={e => handleNotifToggle(c.event_type, "enabled", e.target.checked)} className="rounded" />
+                    </td>
+                    <td className="py-2.5 px-4 text-center">
+                      <button
+                        type="button"
+                        disabled={testingNotifEvent === c.event_type}
+                        onClick={() => handleTestEventNotify(c.event_type)}
+                        className="rounded-full bg-white text-gray-700 px-3 py-1 text-xs ring-1 ring-gray-200 shadow-sm hover:ring-gray-300 disabled:opacity-60 dark:bg-gray-800 dark:text-gray-200 dark:ring-gray-700"
+                      >
+                        {testingNotifEvent === c.event_type ? "Sending..." : "Test"}
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -440,76 +503,125 @@ export default function TelegramPage() {
           )}
 
           <div className="space-y-2">
-            {filteredUsers.map(u => (
-              <div key={u.id} className="rounded-xl bg-gray-50 dark:bg-gray-800/50 px-3 py-2">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className="h-8 w-8 rounded-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-xs font-medium text-gray-600 dark:text-gray-300 shrink-0">
-                      {(u.first_name?.[0] || u.telegram_username?.[0] || "?").toUpperCase()}
+            {filteredUsers.map(u => {
+              const subscribedNotifications = u.subscribed_notifications.map(eventType => EVENT_LABELS[eventType] || eventType);
+              return (
+                <div key={u.id} className="rounded-xl bg-gray-50 dark:bg-gray-800/50 px-3 py-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="h-8 w-8 rounded-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-xs font-medium text-gray-600 dark:text-gray-300 shrink-0">
+                        {(u.first_name?.[0] || u.telegram_username?.[0] || "?").toUpperCase()}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">
+                          {u.first_name} {u.last_name}
+                          {u.telegram_username && <span className="text-gray-400 dark:text-gray-500 ml-1">@{u.telegram_username}</span>}
+                        </div>
+                        <div className="text-xs text-gray-400 dark:text-gray-500">
+                          {u.peers.length} peer(s) · {u.language.toUpperCase()}
+                          {u.is_blocked && <span className="text-red-500 ml-1">[Blocked]</span>}
+                        </div>
+                        <div className="mt-1 flex flex-wrap items-center gap-1">
+                          <span className="text-[11px] text-gray-400 dark:text-gray-500 mr-1">Subscribed:</span>
+                          {subscribedNotifications.length > 0 ? (
+                            subscribedNotifications.map(label => (
+                              <span
+                                key={label}
+                                className="rounded-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 px-2 py-0.5 text-[11px] text-gray-600 dark:text-gray-300"
+                              >
+                                {label}
+                              </span>
+                            ))
+                          ) : (
+                            <span className="text-[11px] text-gray-400 dark:text-gray-500">None</span>
+                          )}
+                        </div>
+                      </div>
                     </div>
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">
-                        {u.first_name} {u.last_name}
-                        {u.telegram_username && <span className="text-gray-400 dark:text-gray-500 ml-1">@{u.telegram_username}</span>}
-                      </div>
-                      <div className="text-xs text-gray-400 dark:text-gray-500">
-                        {u.peers.length} peer(s) · {u.language.toUpperCase()}
-                        {u.is_blocked && <span className="text-red-500 ml-1">[Blocked]</span>}
-                      </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => openUserPeers(u)}
+                        className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+                      >
+                        {expandedUser === u.id ? "Collapse" : "Peers"}
+                      </button>
+                      <button
+                        onClick={async () => { await patchTelegramUser(u.id, { is_blocked: !u.is_blocked }); await load(); }}
+                        className={`text-xs ${u.is_blocked ? "text-green-600 hover:text-green-700" : "text-orange-500 hover:text-orange-700"}`}
+                      >
+                        {u.is_blocked ? "Unblock" : "Block"}
+                      </button>
+                      <button
+                        onClick={async () => { if (confirm("Delete this user and all bindings?")) { await deleteTelegramUser(u.id); await load(); } }}
+                        className="text-xs text-red-500 hover:text-red-700"
+                      >
+                        Delete
+                      </button>
                     </div>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      onClick={() => setExpandedUser(expandedUser === u.id ? null : u.id)}
-                      className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
-                    >
-                      {expandedUser === u.id ? "Collapse" : "Peers"}
-                    </button>
-                    <button
-                      onClick={async () => { await patchTelegramUser(u.id, { is_blocked: !u.is_blocked }); await load(); }}
-                      className={`text-xs ${u.is_blocked ? "text-green-600 hover:text-green-700" : "text-orange-500 hover:text-orange-700"}`}
-                    >
-                      {u.is_blocked ? "Unblock" : "Block"}
-                    </button>
-                    <button
-                      onClick={async () => { if (confirm("Delete this user and all bindings?")) { await deleteTelegramUser(u.id); await load(); } }}
-                      className="text-xs text-red-500 hover:text-red-700"
-                    >
-                      Delete
-                    </button>
-                  </div>
-                </div>
 
-                {expandedUser === u.id && u.peers.length > 0 && (
-                  <div className="mt-2 ml-11 space-y-1">
-                    {u.peers.map(p => (
-                      <div key={p.binding_id} className="flex items-center justify-between text-xs py-1 border-t border-gray-100 dark:border-gray-700/50">
-                        <span className="text-gray-700 dark:text-gray-300">
-                          {p.peer_name} <span className="text-gray-400">@ {p.router_name}/{p.interface}</span>
-                        </span>
+                  {expandedUser === u.id && (
+                    <div className="mt-3 ml-11 rounded-xl border border-gray-200 dark:border-gray-700/60 bg-white dark:bg-gray-900/40 p-3">
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <div className="text-xs text-gray-500 dark:text-gray-400">
+                          Select peers to assign to this user ({(userPeerDraft[u.id] || []).length} selected)
+                        </div>
                         <div className="flex items-center gap-2">
-                          <label className="flex items-center gap-1 cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={p.visible}
-                              onChange={async e => { await patchTelegramBinding(p.binding_id, { visible: e.target.checked }); await load(); }}
-                              className="rounded"
-                            />
-                            <span className="text-gray-400">Visible</span>
-                          </label>
                           <button
-                            onClick={async () => { await deleteTelegramBinding(p.binding_id); await load(); }}
-                            className="text-red-400 hover:text-red-600"
+                            type="button"
+                            onClick={() => setUserPeerDraft(prev => ({ ...prev, [u.id]: peers.map(p => p.id) }))}
+                            className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
                           >
-                            Unbind
+                            All
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setUserPeerDraft(prev => ({ ...prev, [u.id]: [] }))}
+                            className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+                          >
+                            None
                           </button>
                         </div>
                       </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
+                      <div className="max-h-56 overflow-y-auto rounded-lg border border-gray-100 dark:border-gray-800">
+                        {peers.map(p => {
+                          const selected = (userPeerDraft[u.id] || []).includes(p.id);
+                          return (
+                            <label
+                              key={p.id}
+                              className="flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={selected}
+                                onChange={e => toggleUserPeerDraft(u.id, p.id, e.target.checked)}
+                                className="rounded"
+                              />
+                              <span className="text-gray-700 dark:text-gray-300">
+                                {p.name || p.public_key.slice(0, 16)}
+                              </span>
+                              <span className="text-gray-400 ml-auto">
+                                {routerById[p.router_id]?.name || `R#${p.router_id}`} / {p.interface}
+                              </span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                      <div className="mt-2 flex justify-end">
+                        <button
+                          type="button"
+                          disabled={savingUserPeers === u.id}
+                          onClick={() => applyUserPeers(u)}
+                          className="rounded-full bg-gray-900 text-white px-4 py-1.5 text-xs shadow hover:bg-gray-800 disabled:opacity-60 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200"
+                        >
+                          {savingUserPeers === u.id ? "Saving..." : "Apply changes"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </Card>
       </div>

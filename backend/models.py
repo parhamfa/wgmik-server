@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Optional
 from sqlalchemy import Column, Integer, String, Boolean, BigInteger, ForeignKey, UniqueConstraint, DateTime, Index
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from datetime import datetime
@@ -118,10 +119,31 @@ class FairUsageRule(Base):
     scope_type: Mapped[str] = mapped_column(String(16), default="global")  # global | router | peer
     router_id: Mapped[int] = mapped_column(ForeignKey("routers.id", ondelete="CASCADE"), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: When True, enforcement uses :class:`FairUsageTier` rows (combined usage only); thresholds are a ladder.
+    tiered: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     assignments: Mapped[list["FairUsageAssignment"]] = relationship("FairUsageAssignment", back_populates="rule", cascade="all, delete-orphan")
+    tiers: Mapped[list["FairUsageTier"]] = relationship(
+        "FairUsageTier", back_populates="rule", cascade="all, delete-orphan", order_by="FairUsageTier.sort_order"
+    )
+
+
+class FairUsageTier(Base):
+    """Step within a tiered fair-usage rule: at/above ``threshold_bytes`` combined usage, apply this tier's throttle."""
+
+    __tablename__ = "fair_usage_tiers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("fair_usage_rules.id", ondelete="CASCADE"), index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    threshold_bytes: Mapped[int] = mapped_column(BigInteger)
+    name: Mapped[str] = mapped_column(String(128), default="")
+    throttle_download_kbps: Mapped[int] = mapped_column(Integer)
+    throttle_upload_kbps: Mapped[int] = mapped_column(Integer)
+
+    rule: Mapped["FairUsageRule"] = relationship("FairUsageRule", back_populates="tiers")
 
 
 class FairUsageAssignment(Base):
@@ -144,6 +166,7 @@ class FairUsageState(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     peer_id: Mapped[int] = mapped_column(ForeignKey("peers.id", ondelete="CASCADE"), unique=True)
     rule_id: Mapped[int] = mapped_column(ForeignKey("fair_usage_rules.id", ondelete="CASCADE"))
+    tier_id: Mapped[Optional[int]] = mapped_column(ForeignKey("fair_usage_tiers.id", ondelete="SET NULL"), nullable=True)
     throttled: Mapped[bool] = mapped_column(Boolean, default=False)
     ros_queue_id: Mapped[str] = mapped_column(String(64), nullable=True, default="")
     throttled_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
@@ -232,6 +255,19 @@ class TelegramNotificationConfig(Base):
     notify_clients: Mapped[bool] = mapped_column(Boolean, default=True)
     notify_admin: Mapped[bool] = mapped_column(Boolean, default=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class TelegramUserNotificationPreference(Base):
+    __tablename__ = "telegram_user_notification_preferences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(ForeignKey("telegram_users.id", ondelete="CASCADE"))
+    event_type: Mapped[str] = mapped_column(String(32))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", "event_type", name="uq_tg_user_notification_pref"),
+    )
 
 
 class TelegramNotificationLog(Base):

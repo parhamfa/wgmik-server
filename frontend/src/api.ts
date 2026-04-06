@@ -39,6 +39,10 @@ export type SettingsDTO = {
   dashboard_selected_router_ids: number[];
   dashboard_filter_status: string;
   dashboard_sort_by: string;
+  /** Dashboard usage chart: fixed start at local midnight, end tracks "now" */
+  dashboard_time_frame_today: boolean;
+  /** Peer detail usage chart: same semantics as dashboard_time_frame_today */
+  peer_time_frame_today: boolean;
   show_hw_stats: boolean; // Alias field often used
   raw_sample_retention_hours: number;
   minute_rollup_retention_days: number;
@@ -418,6 +422,36 @@ export async function getPeerClientPrivateKey(peerId: number): Promise<{ private
   return fetchJson(`/api/peers/${peerId}/client_private_key`);
 }
 
+export type PeerClientExportPrefsDTO = {
+  config_name: string;
+  custom_endpoint: string;
+  preshared_key: string | null;
+};
+
+export async function getPeerClientExportPrefs(peerId: number): Promise<PeerClientExportPrefsDTO> {
+  return fetchJson(`/api/peers/${peerId}/client_export_prefs`);
+}
+
+export async function patchPeerClientExportPrefs(
+  peerId: number,
+  body: Partial<{ config_name: string; custom_endpoint: string; preshared_key: string }>
+): Promise<PeerClientExportPrefsDTO> {
+  return fetchJson(`/api/peers/${peerId}/client_export_prefs`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export type PeerRenewKeysDTO = {
+  peer: PeerListDTO;
+  private_key: string;
+};
+
+export async function renewPeerKeys(peerId: number): Promise<PeerRenewKeysDTO> {
+  return fetchJson(`/api/peers/${peerId}/renew_keys`, { method: "POST" });
+}
+
 export type PeerImportItem = { interface: string; public_key: string; selected: boolean };
 export async function importPeers(routerId: number, items: PeerImportItem[]) {
   return fetchJson(`/api/routers/${routerId}/peers/import`, {
@@ -505,6 +539,15 @@ export type FairUsageAssignedPeer = {
   disabled: boolean;
 };
 
+export type FairUsageTierDTO = {
+  id: number;
+  sort_order: number;
+  threshold_bytes: number;
+  name: string;
+  throttle_download_kbps: number;
+  throttle_upload_kbps: number;
+};
+
 export type FairUsageRuleDTO = {
   id: number;
   name: string;
@@ -522,10 +565,20 @@ export type FairUsageRuleDTO = {
   scope_type: "global" | "router" | "peer";
   router_id: number | null;
   enabled: boolean;
+  tiered: boolean;
+  tiers: FairUsageTierDTO[];
   created_at: string;
   updated_at: string;
   assigned_peer_count: number;
   assigned_peers: FairUsageAssignedPeer[];
+};
+
+export type FairUsageTierInputDTO = {
+  threshold_bytes: number;
+  name?: string;
+  throttle_download_kbps: number;
+  throttle_upload_kbps: number;
+  sort_order?: number;
 };
 
 export type FairUsageRuleCreateDTO = {
@@ -544,10 +597,45 @@ export type FairUsageRuleCreateDTO = {
   router_id?: number | null;
   peer_ids?: number[];
   enabled?: boolean;
+  tiered?: boolean;
+  tiers?: FairUsageTierInputDTO[];
+};
+
+export type FairUsageTierStatusDTO = {
+  tier_id: number;
+  sort_order: number;
+  threshold_bytes: number;
+  name: string;
+  throttle_download_kbps: number;
+  throttle_upload_kbps: number;
+  is_active: boolean;
+};
+
+export type FairUsageRuleStatusItemDTO = {
+  rule_id: number;
+  rule_name: string;
+  quota_mode: string;
+  download_quota_bytes: number;
+  upload_quota_bytes: number | null;
+  throttle_download_kbps: number;
+  throttle_upload_kbps: number;
+  time_scope: string | null;
+  scope_period_count: number;
+  scope_period_unit: string;
+  scope_label: string;
+  scope_type: string | null;
+  used_rx: number;
+  used_tx: number;
+  over_quota: boolean;
+  next_reset: string | null;
+  tiered?: boolean;
+  tiers?: FairUsageTierStatusDTO[];
 };
 
 export type FairUsagePeerStatusDTO = {
   peer_id: number;
+  /** Each applicable fair-usage rule with its own period usage and reset time. */
+  rules: FairUsageRuleStatusItemDTO[];
   rule_id: number | null;
   rule_name: string | null;
   quota_mode: string | null;
@@ -675,6 +763,7 @@ export type TelegramUserDTO = {
   is_blocked: boolean;
   created_at: string | null;
   peers: TelegramPeerInfo[];
+  subscribed_notifications: string[];
 };
 
 export type TelegramNotifConfigDTO = {
@@ -746,6 +835,14 @@ export async function patchTelegramUser(id: number, data: { is_blocked?: boolean
   });
 }
 
+export async function setTelegramUserPeers(id: number, peer_ids: number[]): Promise<void> {
+  await fetchJson(`/api/telegram/users/${id}/peers`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ peer_ids }),
+  });
+}
+
 export async function patchTelegramBinding(id: number, data: { visible?: boolean }): Promise<void> {
   await fetchJson(`/api/telegram/bindings/${id}`, {
     method: "PATCH",
@@ -777,4 +874,8 @@ export async function updateTelegramNotifConfig(configs: Array<{
 
 export async function testTelegramNotify(): Promise<{ ok: boolean }> {
   return fetchJson("/api/telegram/test-notify", { method: "POST" });
+}
+
+export async function testTelegramNotifyEvent(eventType: string): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/telegram/test-notify/${encodeURIComponent(eventType)}`, { method: "POST" });
 }

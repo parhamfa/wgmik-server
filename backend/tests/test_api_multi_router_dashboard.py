@@ -1,9 +1,13 @@
+import base64
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import backend.api.routes as routes_module
 import backend.scheduler as scheduler_module
 from backend.db import SessionLocal
-from backend.models import Peer, Router, SettingsKV, UsageDaily, UsageMinute, UsageSample
+from backend.models import Action, Peer, Router, SettingsKV, UsageDaily, UsageMinute, UsageSample
+from backend.security import SecretBox
+from backend.settings import settings
 
 
 def seed_router_data():
@@ -144,6 +148,56 @@ def seed_minute_data():
             "peer1_id": peer1.id,
             "peer2_id": peer2.id,
         }
+    finally:
+        db.close()
+
+
+def seed_peer_for_key_renewal(old_private_key=None):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Router Renew",
+            host="10.0.0.9",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret-renew",
+            tls_verify=True,
+        )
+        db.add(router)
+        db.flush()
+
+        peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*9",
+            name="peer-renew",
+            public_key="pub-old",
+            allowed_address="10.0.0.99/32",
+            disabled=False,
+            selected=True,
+        )
+        db.add(peer)
+        db.flush()
+
+        db.add(
+            UsageSample(
+                peer_id=peer.id,
+                ts=datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None) - timedelta(minutes=1),
+                rx=100,
+                tx=50,
+                endpoint="",
+            )
+        )
+        if old_private_key:
+            db.add(
+                SettingsKV(
+                    key=f"peer_private_key:{peer.id}",
+                    value=SecretBox(settings.secret_key).encrypt(old_private_key),
+                )
+            )
+        db.commit()
+        return {"router_id": router.id, "peer_id": peer.id}
     finally:
         db.close()
 
@@ -489,3 +543,104 @@ def test_usage_maintenance_endpoints(client, monkeypatch):
     assert started.status_code == 202, started.text
     assert started.json()["running"] is True
     assert started.json()["phase"] == "queued"
+
+
+def test_renew_peer_keys_updates_router_db_and_scheduler_match(client, monkeypatch):
+    old_private = base64.b64encode(b"o" * 32).decode("utf-8")
+    new_private = base64.b64encode(b"n" * 32).decode("utf-8")
+    new_public = "pub-renewed"
+    seeded = seed_peer_for_key_renewal(old_private)
+    calls: dict[str, tuple[str, str, str, str]] = {}
+
+    class StubClient:
+        def set_peer_keys(self, iface, ros_id, public_key, private_key):
+            calls["set_peer_keys"] = (iface, ros_id, public_key, private_key)
+
+        def list_wireguard_peers(self, iface):
+            return [
+                SimpleNamespace(
+                    public_key=new_public,
+                    ros_id="*9",
+                    name="peer-renew",
+                    allowed_address="10.0.0.99/32",
+                    disabled=False,
+                    rx_bytes=150,
+                    tx_bytes=90,
+                    endpoint="198.51.100.10:51820",
+                )
+            ]
+
+    stub_client = StubClient()
+    monkeypatch.setattr(routes_module, "_generate_wg_keypair_b64", lambda: (new_private, new_public))
+    monkeypatch.setattr(routes_module, "make_client", lambda router: stub_client)
+
+    response = client.post(f"/api/peers/{seeded['peer_id']}/renew_keys")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["private_key"] == new_private
+    assert body["peer"]["id"] == seeded["peer_id"]
+    assert body["peer"]["public_key"] == new_public
+    assert calls["set_peer_keys"] == ("wg0", "*9", new_public, new_private)
+
+    private_response = client.get(f"/api/peers/{seeded['peer_id']}/client_private_key")
+    assert private_response.status_code == 200, private_response.text
+    assert private_response.json() == {"private_key": new_private}
+
+    db = SessionLocal()
+    try:
+        peer = db.get(Peer, seeded["peer_id"])
+        assert peer is not None
+        assert peer.id == seeded["peer_id"]
+        assert peer.public_key == new_public
+        assert peer.selected is True
+        renew_actions = db.query(Action).filter(Action.peer_id == peer.id, Action.action == "renew_keys").all()
+        assert len(renew_actions) == 1
+    finally:
+        db.close()
+
+    monkeypatch.setattr(scheduler_module, "make_client", lambda router: stub_client)
+    monkeypatch.setattr(scheduler_module, "_enforce_fair_usage", lambda db, peer, client, now_utc: None)
+    scheduler_module._poll_once()
+
+    db = SessionLocal()
+    try:
+        peer = db.get(Peer, seeded["peer_id"])
+        assert peer is not None
+        assert peer.selected is True
+        assert db.query(Action).filter(Action.peer_id == peer.id, Action.action == "router_missing").count() == 0
+        assert db.query(UsageSample).filter(UsageSample.peer_id == peer.id).count() == 2
+    finally:
+        db.close()
+
+
+def test_renew_peer_keys_failure_keeps_existing_public_and_private_key(client, monkeypatch):
+    old_private = base64.b64encode(b"p" * 32).decode("utf-8")
+    new_private = base64.b64encode(b"q" * 32).decode("utf-8")
+    seeded = seed_peer_for_key_renewal(old_private)
+
+    class FailingClient:
+        def set_peer_keys(self, iface, ros_id, public_key, private_key):
+            raise RuntimeError("router rejected key update")
+
+    monkeypatch.setattr(routes_module, "_generate_wg_keypair_b64", lambda: (new_private, "pub-should-not-stick"))
+    monkeypatch.setattr(routes_module, "make_client", lambda router: FailingClient())
+
+    response = client.post(f"/api/peers/{seeded['peer_id']}/renew_keys")
+    assert response.status_code == 502, response.text
+    assert "router key renewal failed" in response.json()["detail"]
+
+    private_response = client.get(f"/api/peers/{seeded['peer_id']}/client_private_key")
+    assert private_response.status_code == 200, private_response.text
+    assert private_response.json() == {"private_key": old_private}
+
+    db = SessionLocal()
+    try:
+        peer = db.get(Peer, seeded["peer_id"])
+        assert peer is not None
+        assert peer.public_key == "pub-old"
+        assert db.query(Action).filter(Action.peer_id == peer.id, Action.action == "renew_keys").count() == 0
+        kv = db.get(SettingsKV, f"peer_private_key:{peer.id}")
+        assert kv is not None
+        assert SecretBox(settings.secret_key).decrypt(kv.value) == old_private
+    finally:
+        db.close()

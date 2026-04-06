@@ -91,6 +91,38 @@ def ensure_fair_usage_scope_columns() -> None:
         db.close()
 
 
+def ensure_fair_usage_tier_schema() -> None:
+    """Add tiered column, fair_usage_tiers table, fair_usage_state.tier_id (SQLite migrations)."""
+    if not db_url.startswith("sqlite:"):
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS fair_usage_tiers (
+                    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                    rule_id INTEGER NOT NULL,
+                    sort_order INTEGER DEFAULT 0 NOT NULL,
+                    threshold_bytes BIGINT NOT NULL,
+                    name VARCHAR(128) DEFAULT '' NOT NULL,
+                    throttle_download_kbps INTEGER NOT NULL,
+                    throttle_upload_kbps INTEGER NOT NULL,
+                    FOREIGN KEY(rule_id) REFERENCES fair_usage_rules (id) ON DELETE CASCADE
+                )
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_fair_usage_tiers_rule_id ON fair_usage_tiers (rule_id)"))
+        rows = conn.execute(text("PRAGMA table_info(fair_usage_rules)")).fetchall()
+        col_names = {r[1] for r in rows}
+        if "tiered" not in col_names:
+            conn.execute(text("ALTER TABLE fair_usage_rules ADD COLUMN tiered BOOLEAN DEFAULT 0"))
+        rows_s = conn.execute(text("PRAGMA table_info(fair_usage_state)")).fetchall()
+        col_names_s = {r[1] for r in rows_s}
+        if "tier_id" not in col_names_s:
+            conn.execute(text("ALTER TABLE fair_usage_state ADD COLUMN tier_id INTEGER REFERENCES fair_usage_tiers (id)"))
+
+
 def prepare_sqlite_database():
     if not db_url.startswith("sqlite:") or ":memory:" in db_url:
         return

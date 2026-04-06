@@ -2,29 +2,34 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 
-from aiogram import Dispatcher, Router, types
+from aiogram import Dispatcher, F, Router, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from ..db import SessionLocal
-from ..models import (
-    Peer,
-    Router as RouterModel,
-    TelegramPeerBinding,
-    TelegramUser,
-)
-from .formatters import format_fair_usage_status, format_peer_line, format_usage_scope
+from ..fair_usage_peer_status_dto import build_fair_usage_peer_status_dto
+from ..models import Peer, Router as RouterModel, TelegramPeerBinding, TelegramUser
+from ..settings import settings
+from .fair_usage_image import render_fair_usage_peer_card_png
+from .formatters import format_next_reset_from_iso
+from .usage_chart_image import render_usage_chart_png, usage_points_for_tg_menu
 from .i18n import t
 from .keyboards import (
-    back_button,
+    home_button,
+    language_menu,
     main_menu,
-    peer_list_keyboard,
+    notifications_menu,
     settings_menu,
-    usage_scope_selector,
+    usage_history_menu,
+)
+from .notifications import (
+    USER_NOTIFICATION_EVENT_TYPES,
+    get_user_notification_preferences,
+    set_user_notification_preference,
 )
 from .tokens import redeem_token
 
@@ -65,6 +70,193 @@ def _get_visible_peers(tg_user_id: int) -> list[tuple[Peer, RouterModel | None]]
         return result
     finally:
         db.close()
+
+
+async def _abort_if_not_registered_or_blocked(msg: Message) -> bool:
+    """Return True if the handler should stop (user missing or blocked)."""
+    tg_id = msg.from_user.id
+    user = _get_tg_user(tg_id)
+    lang = user.language if user else "en"
+    if not user:
+        await msg.answer(t("not_registered", lang))
+        return True
+    if user.is_blocked:
+        await msg.answer(t("blocked", user.language or "en"))
+        return True
+    return False
+
+def _notification_label(lang: str, event_type: str, enabled: bool) -> str:
+    marker = "✅" if enabled else "☑️"
+    return f"{marker} {t(f'notif_label_{event_type}', lang)}"
+
+
+async def _safe_edit_text(message: Message, text: str, **kwargs) -> None:
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc):
+            raise
+
+
+def _status_caption_text(dto, peer_label: str, lang: str) -> str:
+    status_label = t("fu_throttled", lang) if dto.throttled else t("fu_ok", lang)
+    lines = [
+        t("status_card_caption", lang, name=peer_label),
+        f"{t('btn_status', lang)}: {status_label}",
+    ]
+    if dto.throttled:
+        effective_rule = next((rule for rule in dto.rules if rule.over_quota), None) or (dto.rules[0] if dto.rules else None)
+        rule_label = effective_rule.rule_name if effective_rule else t("status_no_active_rule", lang)
+        reset_line = (
+            format_next_reset_from_iso(effective_rule.next_reset, lang)
+            if effective_rule and effective_rule.next_reset
+            else t("status_next_reset", lang) + ": " + t("status_none", lang)
+        )
+        lines.extend([
+            f"{t('status_effective_rule', lang)}: {rule_label}",
+            reset_line,
+        ])
+    return "\n".join(lines)
+
+
+async def deliver_usage_scope_charts(
+    message: Message,
+    scope: str,
+    *,
+    use_edit: bool,
+    requester_id: int,
+) -> None:
+    """Send usage charts for all visible peers."""
+    lang = _get_lang(requester_id)
+    peers = _get_visible_peers(requester_id)
+    if not peers:
+        if use_edit:
+            await _safe_edit_text(message, t("no_peers", lang), reply_markup=home_button(lang))
+        else:
+            await message.answer(t("no_peers", lang))
+        return
+
+    scope_label = {
+        "today": t("btn_today", lang),
+        "week": t("btn_this_week", lang),
+        "month": t("btn_this_month", lang),
+    }.get(scope, scope)
+
+    status_text = t("usage_sending", lang, scope=scope_label)
+    if use_edit:
+        await _safe_edit_text(message, status_text, reply_markup=usage_history_menu(lang))
+    else:
+        await message.answer(status_text)
+
+    now = datetime.now(timezone.utc)
+    db = SessionLocal()
+    try:
+        for peer, _ in peers:
+            db_peer = db.get(Peer, peer.id)
+            if not db_peer:
+                continue
+            points, mode = usage_points_for_tg_menu(db, db_peer.id, scope, now)
+            label = db_peer.name or db_peer.public_key[:12]
+            payload = {
+                "peerName": label,
+                "scopeLabel": scope_label,
+                "mode": mode,
+                "timezone": settings.timezone,
+                "points": points,
+            }
+            try:
+                png = await render_usage_chart_png(payload)
+            except Exception:
+                logger.exception("Usage chart screenshot failed for peer %s", db_peer.id)
+                continue
+            await message.answer_photo(
+                BufferedInputFile(png, filename="usage.png"),
+                caption=t("usage_chart_caption", lang, name=label, scope=scope_label),
+            )
+    finally:
+        db.close()
+
+
+async def deliver_status_cards(message: Message, *, use_edit: bool, requester_id: int) -> None:
+    """Send one status card per visible peer, then explain tiers/limits."""
+    lang = _get_lang(requester_id)
+    peers = _get_visible_peers(requester_id)
+    if not peers:
+        if use_edit:
+            await _safe_edit_text(message, t("no_peers", lang), reply_markup=home_button(lang))
+        else:
+            await message.answer(t("no_peers", lang))
+        return
+
+    status_text = t("status_sending", lang)
+    if use_edit:
+        await _safe_edit_text(message, status_text, reply_markup=home_button(lang))
+    else:
+        await message.answer(status_text)
+
+    sent = 0
+    db = SessionLocal()
+    try:
+        for peer, _ in peers:
+            db_peer = db.get(Peer, peer.id)
+            if not db_peer:
+                continue
+            dto = build_fair_usage_peer_status_dto(db, db_peer)
+            label = db_peer.name or db_peer.public_key[:12]
+            try:
+                png = await render_fair_usage_peer_card_png(dto, label, lang)
+            except Exception:
+                logger.exception("Fair usage screenshot failed for peer %s", db_peer.id)
+                continue
+            await message.answer_photo(
+                BufferedInputFile(png, filename="fair-usage.png"),
+                caption=_status_caption_text(dto, label, lang),
+            )
+            sent += 1
+    finally:
+        db.close()
+
+    if sent == 0:
+        await message.answer(t("status_failed", lang))
+
+
+async def deliver_settings_screen(message: Message, *, use_edit: bool, requester_id: int) -> None:
+    lang = _get_lang(requester_id)
+    text = t("settings_intro", lang)
+    if use_edit:
+        await _safe_edit_text(message, text, reply_markup=settings_menu(lang))
+    else:
+        await message.answer(text, reply_markup=settings_menu(lang))
+
+
+async def deliver_language_screen(message: Message, *, use_edit: bool, requester_id: int) -> None:
+    lang = _get_lang(requester_id)
+    text = t("language_title", lang)
+    if use_edit:
+        await _safe_edit_text(message, text, reply_markup=language_menu(lang))
+    else:
+        await message.answer(t("settings_command_hint", lang))
+
+
+async def deliver_notifications_screen(message: Message, *, use_edit: bool, requester_id: int) -> None:
+    lang = _get_lang(requester_id)
+    user = _get_tg_user(requester_id)
+    prefs: dict[str, bool] = {}
+    if user:
+        db = SessionLocal()
+        try:
+            prefs = get_user_notification_preferences(db, user.id)
+        finally:
+            db.close()
+    items = [
+        (event_type, _notification_label(lang, event_type, prefs.get(event_type, True)))
+        for event_type in USER_NOTIFICATION_EVENT_TYPES
+    ]
+    text = t("notifications_intro", lang)
+    if use_edit:
+        await _safe_edit_text(message, text, reply_markup=notifications_menu(items, lang))
+    else:
+        await message.answer(t("settings_command_hint", lang))
 
 
 @router.message(CommandStart(deep_link=True))
@@ -108,7 +300,7 @@ async def cmd_start_deeplink(msg: types.Message):
     except Exception:
         db.rollback()
         logger.exception("Token redemption failed")
-        await msg.answer(t("token_invalid", "en"))
+        await msg.answer(t("token_invalid", _get_lang(tg_id)))
     finally:
         db.close()
 
@@ -129,97 +321,98 @@ async def cmd_start(msg: types.Message):
     await msg.answer(t("welcome", lang), reply_markup=main_menu(lang))
 
 
+@router.message(Command("home"))
+async def cmd_home(msg: types.Message):
+    """Same as /start: show welcome and main menu."""
+    await cmd_start(msg)
+
+
 @router.callback_query(lambda c: c.data == "menu:main")
 async def cb_main_menu(cb: CallbackQuery):
     lang = _get_lang(cb.from_user.id)
-    await cb.message.edit_text(t("welcome", lang), reply_markup=main_menu(lang))
+    await _safe_edit_text(cb.message, t("welcome", lang), reply_markup=main_menu(lang))
     await cb.answer()
 
-
-@router.callback_query(lambda c: c.data == "menu:peers")
-async def cb_peers(cb: CallbackQuery):
+@router.callback_query(lambda c: c.data == "menu:usage_history" or c.data == "menu:usage")
+async def cb_usage_menu(cb: CallbackQuery):
     lang = _get_lang(cb.from_user.id)
     peers = _get_visible_peers(cb.from_user.id)
     if not peers:
-        await cb.message.edit_text(t("no_peers", lang), reply_markup=back_button(lang))
+        await _safe_edit_text(cb.message, t("no_peers", lang), reply_markup=home_button(lang))
         await cb.answer()
         return
-
-    lines = []
-    peer_buttons = []
-    for peer, rtr in peers:
-        lines.append(format_peer_line(peer, rtr, lang))
-        peer_buttons.append((peer.id, peer.name or peer.public_key[:12]))
-
-    text = "\n".join(lines)
-    await cb.message.edit_text(text, reply_markup=peer_list_keyboard(peer_buttons, lang), parse_mode="Markdown")
-    await cb.answer()
-
-
-@router.callback_query(lambda c: c.data == "menu:usage")
-async def cb_usage_menu(cb: CallbackQuery):
-    lang = _get_lang(cb.from_user.id)
-    await cb.message.edit_text(
-        t("usage_header", lang, scope="..."),
-        reply_markup=usage_scope_selector(lang),
+    await _safe_edit_text(
+        cb.message,
+        t("usage_history_intro", lang),
+        reply_markup=usage_history_menu(lang),
     )
     await cb.answer()
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("usage:"))
-async def cb_usage_scope(cb: CallbackQuery):
+async def cb_usage_scope_legacy(cb: CallbackQuery):
     scope = cb.data.split(":")[1]
-    lang = _get_lang(cb.from_user.id)
-    peers = _get_visible_peers(cb.from_user.id)
-    if not peers:
-        await cb.message.edit_text(t("no_peers", lang), reply_markup=back_button(lang))
-        await cb.answer()
-        return
-
-    db = SessionLocal()
-    try:
-        now = datetime.now(timezone.utc)
-        lines = []
-        for peer, _ in peers:
-            db_peer = db.get(Peer, peer.id)
-            if db_peer:
-                lines.append(format_usage_scope(db_peer, scope, db, lang, now))
-        text = "\n\n".join(lines) if lines else t("no_peers", lang)
-        await cb.message.edit_text(text, reply_markup=usage_scope_selector(lang), parse_mode="Markdown")
-    finally:
-        db.close()
+    await deliver_usage_scope_charts(cb.message, scope, use_edit=True, requester_id=cb.from_user.id)
     await cb.answer()
 
 
-@router.callback_query(lambda c: c.data == "menu:fair_usage")
-async def cb_fair_usage(cb: CallbackQuery):
-    lang = _get_lang(cb.from_user.id)
-    peers = _get_visible_peers(cb.from_user.id)
-    if not peers:
-        await cb.message.edit_text(t("no_peers", lang), reply_markup=back_button(lang))
-        await cb.answer()
-        return
-
-    db = SessionLocal()
-    try:
-        now = datetime.now(timezone.utc)
-        lines = []
-        for peer, _ in peers:
-            db_peer = db.get(Peer, peer.id)
-            if db_peer:
-                lines.append(format_fair_usage_status(db_peer, db, lang, now))
-        text = "\n\n".join(lines) if lines else t("no_peers", lang)
-        await cb.message.edit_text(text, reply_markup=back_button(lang), parse_mode="Markdown")
-    finally:
-        db.close()
+@router.callback_query(lambda c: c.data == "menu:status" or c.data == "menu:fair_usage")
+async def cb_status(cb: CallbackQuery):
+    await deliver_status_cards(cb.message, use_edit=True, requester_id=cb.from_user.id)
     await cb.answer()
 
 
 @router.callback_query(lambda c: c.data == "menu:settings")
 async def cb_settings(cb: CallbackQuery):
-    lang = _get_lang(cb.from_user.id)
-    await cb.message.edit_text(t("btn_settings", lang), reply_markup=settings_menu(lang))
+    await deliver_settings_screen(cb.message, use_edit=True, requester_id=cb.from_user.id)
     await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "settings:language" or c.data == "menu:language")
+async def cb_language(cb: CallbackQuery):
+    await deliver_language_screen(cb.message, use_edit=True, requester_id=cb.from_user.id)
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data == "settings:notifications")
+async def cb_notifications(cb: CallbackQuery):
+    await deliver_notifications_screen(cb.message, use_edit=True, requester_id=cb.from_user.id)
+    await cb.answer()
+
+
+@router.message(Command("fair"))
+async def cmd_fair(msg: types.Message):
+    if await _abort_if_not_registered_or_blocked(msg):
+        return
+    await deliver_status_cards(msg, use_edit=False, requester_id=msg.from_user.id)
+
+
+@router.message(Command("today"))
+async def cmd_today(msg: types.Message):
+    if await _abort_if_not_registered_or_blocked(msg):
+        return
+    await deliver_usage_scope_charts(msg, "today", use_edit=False, requester_id=msg.from_user.id)
+
+
+@router.message(Command("weekly"))
+async def cmd_weekly(msg: types.Message):
+    if await _abort_if_not_registered_or_blocked(msg):
+        return
+    await deliver_usage_scope_charts(msg, "week", use_edit=False, requester_id=msg.from_user.id)
+
+
+@router.message(Command("monthly"))
+async def cmd_monthly(msg: types.Message):
+    if await _abort_if_not_registered_or_blocked(msg):
+        return
+    await deliver_usage_scope_charts(msg, "month", use_edit=False, requester_id=msg.from_user.id)
+
+
+@router.message(Command("settings"))
+async def cmd_settings(msg: types.Message):
+    if await _abort_if_not_registered_or_blocked(msg):
+        return
+    await deliver_settings_screen(msg, use_edit=False, requester_id=msg.from_user.id)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("settings:lang:"))
@@ -237,38 +430,42 @@ async def cb_switch_lang(cb: CallbackQuery):
     finally:
         db.close()
 
-    await cb.message.edit_text(
-        t("lang_switched", new_lang),
-        reply_markup=main_menu(new_lang),
-    )
+    await cb.message.edit_text(t("lang_switched", new_lang), reply_markup=settings_menu(new_lang))
     await cb.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("settings:notif:"))
+async def cb_toggle_notification(cb: CallbackQuery):
+    lang = _get_lang(cb.from_user.id)
+    event_type = cb.data.split(":", 2)[-1]
+    tg_user = _get_tg_user(cb.from_user.id)
+    if not tg_user:
+        await cb.answer(t("not_registered", lang), show_alert=True)
+        return
+    db = SessionLocal()
+    try:
+        prefs = get_user_notification_preferences(db, tg_user.id)
+        current = prefs.get(event_type, True)
+        if not set_user_notification_preference(db, tg_user.id, event_type, not current):
+            await cb.answer()
+            return
+    finally:
+        db.close()
+    await deliver_notifications_screen(cb.message, use_edit=True, requester_id=cb.from_user.id)
+    await cb.answer(t("settings_saved", lang))
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("peer:"))
 async def cb_peer_detail(cb: CallbackQuery):
-    peer_id = int(cb.data.split(":")[1])
     lang = _get_lang(cb.from_user.id)
-
-    db = SessionLocal()
-    try:
-        peer = db.get(Peer, peer_id)
-        if not peer:
-            await cb.message.edit_text(t("no_peers", lang), reply_markup=back_button(lang))
-            await cb.answer()
-            return
-
-        rtr = db.get(RouterModel, peer.router_id)
-        now = datetime.now(timezone.utc)
-
-        peer_info = format_peer_line(peer, rtr, lang)
-        usage_text = format_usage_scope(peer, "month", db, lang, now)
-        fu_text = format_fair_usage_status(peer, db, lang, now)
-
-        text = f"{peer_info}\n\n{usage_text}\n\n{fu_text}"
-        await cb.message.edit_text(text, reply_markup=back_button(lang), parse_mode="Markdown")
-    finally:
-        db.close()
+    await _safe_edit_text(cb.message, t("welcome", lang), reply_markup=main_menu(lang))
     await cb.answer()
+
+
+@router.message(F.text)
+async def any_text_to_home(msg: types.Message):
+    """Any text not handled above (plain text, unknown /commands): same as /start / /home."""
+    await cmd_start(msg)
 
 
 def register_handlers(dp: Dispatcher) -> None:

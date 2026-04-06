@@ -14,20 +14,69 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from ..fair_usage_sync import is_rule_over_quota
+from ..fair_usage_tiers import active_tier_for_combined_usage, ordered_tiers_for_rule
 from ..models import (
     FairUsageRule,
     FairUsageState,
+    FairUsageTier,
     Peer,
     SettingsKV,
     TelegramNotificationConfig,
     TelegramNotificationLog,
     TelegramPeerBinding,
     TelegramUser,
+    TelegramUserNotificationPreference,
 )
 from .formatters import _fmt_bytes
 from .i18n import t
 
 logger = logging.getLogger("wgmik.telegram.notifications")
+
+
+def _fmt_speed_pair(dl_kbps: int, ul_kbps: int) -> str:
+    def one(k: int) -> str:
+        if k >= 1000:
+            v = k / 1000.0
+            s = f"{v:.1f}".rstrip("0").rstrip(".")
+            return f"{s} Mbps"
+        return f"{k} kbps"
+
+    return f"⬇️ {one(dl_kbps)} · ⬆️ {one(ul_kbps)}"
+
+
+def _throttle_detail_for_notification(
+    db: Session,
+    rule: FairUsageRule,
+    used_rx: int,
+    used_tx: int,
+    state: Optional[FairUsageState],
+) -> tuple[Optional[str], int, int]:
+    """Human tier label (tiered rules only) and effective throttle speeds for this rule."""
+    if rule.tiered:
+        tiers = ordered_tiers_for_rule(db, rule.id)
+        combined = used_rx + used_tx
+        tier: Optional[FairUsageTier] = None
+        if state and state.tier_id:
+            tier = db.get(FairUsageTier, state.tier_id)
+        if tier is None:
+            tier = active_tier_for_combined_usage(tiers, combined)
+        if tier:
+            idx = next((i for i, x in enumerate(tiers) if x.id == tier.id), 0)
+            label = (tier.name or "").strip() or f"Tier {idx + 1}"
+            return label, tier.throttle_download_kbps, tier.throttle_upload_kbps
+        return None, rule.throttle_download_kbps, rule.throttle_upload_kbps
+    return None, rule.throttle_download_kbps, rule.throttle_upload_kbps
+
+
+USER_NOTIFICATION_EVENT_TYPES: tuple[str, ...] = (
+    "quota_warning_80",
+    "quota_warning_90",
+    "quota_hit",
+    "quota_lifted",
+    "daily_summary",
+    "weekly_summary",
+)
 
 # Warnings: at most once per peer/user per window while usage stays in a band.
 _DEDUP_WARNING_HOURS = 24
@@ -43,12 +92,65 @@ def _dedup_hours(event_type: str) -> int:
     return _DEDUP_WARNING_HOURS
 
 
-def _is_event_enabled(db: Session, event_type: str) -> tuple[bool, bool]:
-    """Return (notify_clients, notify_admin) for event_type."""
-    cfg = db.query(TelegramNotificationConfig).filter_by(event_type=event_type).first()
+def _get_event_config(db: Session, event_type: str) -> TelegramNotificationConfig | None:
+    return db.query(TelegramNotificationConfig).filter_by(event_type=event_type).first()
+
+
+def _default_client_notification_enabled(db: Session, event_type: str) -> bool:
+    cfg = _get_event_config(db, event_type)
+    return bool(cfg.notify_clients) if cfg else True
+
+
+def user_notification_enabled(db: Session, tg_user_pk: int, event_type: str) -> bool:
+    pref = (
+        db.query(TelegramUserNotificationPreference)
+        .filter_by(telegram_user_id=tg_user_pk, event_type=event_type)
+        .first()
+    )
+    return _default_client_notification_enabled(db, event_type) if pref is None else bool(pref.enabled)
+
+
+def effective_user_notification_enabled(db: Session, tg_user_pk: int, event_type: str) -> bool:
+    cfg = _get_event_config(db, event_type)
     if not cfg or not cfg.enabled:
-        return False, False
-    return cfg.notify_clients, cfg.notify_admin
+        return False
+    return user_notification_enabled(db, tg_user_pk, event_type)
+
+
+def get_user_notification_preferences(db: Session, tg_user_pk: int) -> dict[str, bool]:
+    prefs = (
+        db.query(TelegramUserNotificationPreference)
+        .filter_by(telegram_user_id=tg_user_pk)
+        .all()
+    )
+    out = {
+        event_type: _default_client_notification_enabled(db, event_type)
+        for event_type in USER_NOTIFICATION_EVENT_TYPES
+    }
+    for pref in prefs:
+        out[pref.event_type] = bool(pref.enabled)
+    return out
+
+
+def set_user_notification_preference(db: Session, tg_user_pk: int, event_type: str, enabled: bool) -> bool:
+    if event_type not in USER_NOTIFICATION_EVENT_TYPES:
+        return False
+    pref = (
+        db.query(TelegramUserNotificationPreference)
+        .filter_by(telegram_user_id=tg_user_pk, event_type=event_type)
+        .first()
+    )
+    if pref is None:
+        pref = TelegramUserNotificationPreference(
+            telegram_user_id=tg_user_pk,
+            event_type=event_type,
+            enabled=enabled,
+        )
+        db.add(pref)
+    else:
+        pref.enabled = enabled
+    db.commit()
+    return True
 
 
 def _already_sent(
@@ -182,34 +284,45 @@ def check_and_send_notifications(
     if not bindings and not admin_chat_id:
         return
 
+    rule_key = str(rule.id)
+    rule_label = rule.name or f"#{rule.id}"
     # Quota warning 80%
     if 80 <= pct < 90:
         _notify_event(
             db, bindings, admin_chat_id, peer, "quota_warning_80",
             peer_name=peer_name, pct=pct, used=used, total=total,
-            dedup_extra="",
+            rule_name=rule_label,
+            dedup_extra=rule_key,
         )
     # Quota warning 90%
     elif 90 <= pct < 100 and not is_throttled:
         _notify_event(
             db, bindings, admin_chat_id, peer, "quota_warning_90",
             peer_name=peer_name, pct=pct, used=used, total=total,
-            dedup_extra="",
+            rule_name=rule_label,
+            dedup_extra=rule_key,
         )
-    # Quota reached / throttled — once per throttle episode (hash includes throttled_at)
-    if is_throttled:
+    # Quota reached / throttled — only for *this* rule if it is actually over quota.
+    # (Peer may be throttled because another applicable rule fired; do not blame every rule.)
+    if is_throttled and is_rule_over_quota(used_rx, used_tx, rule, db):
+        tier_label, tdl, tul = _throttle_detail_for_notification(db, rule, used_rx, used_tx, state)
         _notify_event(
             db, bindings, admin_chat_id, peer, "quota_hit",
             peer_name=peer_name, pct=pct, used=used, total=total,
-            dedup_extra=_throttle_episode_key(state),
+            rule_name=rule_label,
+            dedup_extra=f"{rule_key}:{_throttle_episode_key(state)}",
+            tier_label=tier_label,
+            throttle_dl_kbps=tdl,
+            throttle_ul_kbps=tul,
         )
 
 
 def notify_quota_lifted(db: Session, peer: Peer) -> None:
     """Called when a peer's throttle is removed."""
-    notify_clients, notify_admin = _is_event_enabled(db, "quota_lifted")
-    if not notify_clients and not notify_admin:
+    cfg = _get_event_config(db, "quota_lifted")
+    if not cfg or not cfg.enabled:
         return
+    notify_admin = bool(cfg.notify_admin)
 
     peer_name = peer.name or peer.public_key[:12]
     bindings = _get_bindings_for_peer(db, peer.id)
@@ -218,10 +331,10 @@ def notify_quota_lifted(db: Session, peer: Peer) -> None:
     from .placeholder import get_internal_admin_log_user_id
 
     for b in bindings:
-        if not notify_clients:
-            break
         tg_user = db.get(TelegramUser, b.telegram_user_id)
         if not tg_user:
+            continue
+        if not effective_user_notification_enabled(db, tg_user.id, "quota_lifted"):
             continue
         msg_hash = _make_hash("quota_lifted", str(peer.id), str(tg_user.id), "lift")
         if _already_sent(db, tg_user.id, peer.id, "quota_lifted", msg_hash, within_hours=hours):
@@ -251,33 +364,57 @@ def _notify_event(
     pct: int,
     used: int,
     total: int,
+    rule_name: str = "",
     dedup_extra: str,
+    tier_label: Optional[str] = None,
+    throttle_dl_kbps: Optional[int] = None,
+    throttle_ul_kbps: Optional[int] = None,
 ) -> None:
-    notify_clients, notify_admin = _is_event_enabled(db, event_type)
-    if not notify_clients and not notify_admin:
+    cfg = _get_event_config(db, event_type)
+    if not cfg or not cfg.enabled:
         return
+    notify_admin = bool(cfg.notify_admin)
 
     hours = _dedup_hours(event_type)
     from .placeholder import get_internal_admin_log_user_id
 
-    i18n_key = {
-        "quota_warning_80": "notif_quota_warning",
-        "quota_warning_90": "notif_quota_warning",
-        "quota_hit": "notif_quota_hit",
-    }.get(event_type, "notif_quota_warning")
+    def _message_for_user(lang: str) -> str:
+        if event_type == "quota_hit":
+            if throttle_dl_kbps is not None and throttle_ul_kbps is not None:
+                speed = _fmt_speed_pair(throttle_dl_kbps, throttle_ul_kbps)
+                common = dict(
+                    name=peer_name,
+                    rule=rule_name or "—",
+                    speed=speed,
+                    pct=str(pct),
+                    used=_fmt_bytes(used),
+                    total=_fmt_bytes(total),
+                )
+                if tier_label:
+                    return t("notif_quota_hit_tiered", lang, tier=tier_label, **common)
+                return t("notif_quota_hit_flat", lang, **common)
+            return t("notif_quota_hit", lang, name=peer_name)
+        return t(
+            "notif_quota_warning",
+            lang,
+            name=peer_name,
+            pct=str(pct),
+            used=_fmt_bytes(used),
+            total=_fmt_bytes(total),
+            rule=rule_name or "—",
+        )
 
     for b in bindings:
-        if not notify_clients:
-            break
         tg_user = db.get(TelegramUser, b.telegram_user_id)
         if not tg_user:
+            continue
+        if not effective_user_notification_enabled(db, tg_user.id, event_type):
             continue
         msg_hash = _make_hash(event_type, str(peer.id), str(tg_user.id), dedup_extra)
         if _already_sent(db, tg_user.id, peer.id, event_type, msg_hash, within_hours=hours):
             continue
         lang = tg_user.language or "en"
-        text = t(i18n_key, lang, name=peer_name, pct=str(pct),
-                 used=_fmt_bytes(used), total=_fmt_bytes(total))
+        text = _message_for_user(lang)
         if _send_message_sync(tg_user.telegram_user_id, text):
             _record_sent(db, tg_user.id, peer.id, event_type, msg_hash)
 
@@ -286,19 +423,21 @@ def _notify_event(
         msg_hash = _make_hash(event_type, str(peer.id), "admin", dedup_extra)
         if _already_sent(db, aid, peer.id, event_type, msg_hash, within_hours=hours):
             return
-        text = t(i18n_key, "en", name=peer_name, pct=str(pct),
-                 used=_fmt_bytes(used), total=_fmt_bytes(total))
+        text = _message_for_user("en")
         if _send_message_sync(admin_chat_id, f"[Admin] {text}"):
             _record_sent(db, aid, peer.id, event_type, msg_hash)
 
 
 def send_daily_summary(db: Session) -> None:
     """Send daily usage summary to all clients with bindings."""
-    notify_clients, notify_admin = _is_event_enabled(db, "daily_summary")
-    if not notify_clients and not notify_admin:
+    cfg = _get_event_config(db, "daily_summary")
+    if not cfg or not cfg.enabled:
         return
+    notify_admin = bool(cfg.notify_admin)
 
     from ..fair_usage_usage import peer_scope_usage_bytes
+    from .formatters import format_fair_usage_condensed
+
     now = datetime.now(timezone.utc)
 
     tg_users = db.query(TelegramUser).filter_by(is_blocked=False).all()
@@ -306,6 +445,8 @@ def send_daily_summary(db: Session) -> None:
     admin_lines = []
 
     for tg_user in tg_users:
+        if not effective_user_notification_enabled(db, tg_user.id, "daily_summary"):
+            continue
         bindings = (
             db.query(TelegramPeerBinding)
             .filter_by(telegram_user_id=tg_user.id, visible=True)
@@ -323,23 +464,29 @@ def send_daily_summary(db: Session) -> None:
             rx, tx = peer_scope_usage_bytes(peer.id, "daily", db, now)
             name = peer.name or peer.public_key[:12]
             lines.append(f"  {name}: \u2b07{_fmt_bytes(rx)} \u2b06{_fmt_bytes(tx)}")
+            fu_line = format_fair_usage_condensed(peer, db, lang, now)
+            if fu_line:
+                lines.append(f"    {t('btn_limits', lang)}: {fu_line}")
             admin_lines.append(f"  {name} (@{tg_user.telegram_username}): \u2b07{_fmt_bytes(rx)} \u2b06{_fmt_bytes(tx)}")
 
-        if notify_clients and len(lines) > 1:
+        if len(lines) > 1:
             _send_message_sync(tg_user.telegram_user_id, "\n".join(lines))
 
     if notify_admin and admin_chat_id and admin_lines:
-        header = "[Admin] Daily Summary"
+        header = "[Admin] Daily usage summary"
         _send_message_sync(admin_chat_id, f"{header}\n" + "\n".join(admin_lines))
 
 
 def send_weekly_summary(db: Session) -> None:
     """Send weekly usage summary to all clients with bindings."""
-    notify_clients, notify_admin = _is_event_enabled(db, "weekly_summary")
-    if not notify_clients and not notify_admin:
+    cfg = _get_event_config(db, "weekly_summary")
+    if not cfg or not cfg.enabled:
         return
+    notify_admin = bool(cfg.notify_admin)
 
     from ..fair_usage_usage import peer_scope_usage_bytes
+    from .formatters import format_fair_usage_condensed
+
     now = datetime.now(timezone.utc)
 
     tg_users = db.query(TelegramUser).filter_by(is_blocked=False).all()
@@ -347,6 +494,8 @@ def send_weekly_summary(db: Session) -> None:
     admin_lines = []
 
     for tg_user in tg_users:
+        if not effective_user_notification_enabled(db, tg_user.id, "weekly_summary"):
+            continue
         bindings = (
             db.query(TelegramPeerBinding)
             .filter_by(telegram_user_id=tg_user.id, visible=True)
@@ -364,11 +513,14 @@ def send_weekly_summary(db: Session) -> None:
             rx, tx = peer_scope_usage_bytes(peer.id, "weekly", db, now)
             name = peer.name or peer.public_key[:12]
             lines.append(f"  {name}: \u2b07{_fmt_bytes(rx)} \u2b06{_fmt_bytes(tx)}")
+            fu_line = format_fair_usage_condensed(peer, db, lang, now)
+            if fu_line:
+                lines.append(f"    {t('btn_limits', lang)}: {fu_line}")
             admin_lines.append(f"  {name} (@{tg_user.telegram_username}): \u2b07{_fmt_bytes(rx)} \u2b06{_fmt_bytes(tx)}")
 
-        if notify_clients and len(lines) > 1:
+        if len(lines) > 1:
             _send_message_sync(tg_user.telegram_user_id, "\n".join(lines))
 
     if notify_admin and admin_chat_id and admin_lines:
-        header = "[Admin] Weekly Summary"
+        header = "[Admin] Weekly usage summary"
         _send_message_sync(admin_chat_id, f"{header}\n" + "\n".join(admin_lines))

@@ -2,8 +2,24 @@ import React from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import QRCode from "react-qr-code";
-import { listSavedPeers, getPeerUsage, listRouters, routerPeers, routerInterfaceDetail, getPeerClientPrivateKey, patchPeer, getPeerQuota, patchPeerQuota, resetPeerMetrics, deletePeer, reconcilePeer, getPeerActions, type PeerAction, getSettings, type SavedPeer, type UsagePoint, type Router, type PeerView, type Quota, type WGInterfaceConfig, getFairUsagePeerStatus, resetFairUsagePeer, type FairUsagePeerStatusDTO } from "../api";
+import { listSavedPeers, getPeerUsage, listRouters, routerPeers, routerInterfaceDetail, getPeerClientPrivateKey, getPeerClientExportPrefs, patchPeerClientExportPrefs, renewPeerKeys, patchPeer, getPeerQuota, patchPeerQuota, resetPeerMetrics, deletePeer, reconcilePeer, getPeerActions, type PeerAction, getSettings, type SavedPeer, type UsagePoint, type Router, type PeerView, type Quota, type WGInterfaceConfig, getFairUsagePeerStatus, resetFairUsagePeer, type FairUsagePeerStatusDTO, type FairUsageRuleStatusItemDTO } from "../api";
+
+function effectiveThrottleForRule(fr: FairUsageRuleStatusItemDTO): { dl: number; ul: number; label: string } {
+  if (fr.tiered && fr.tiers?.length) {
+    const a = fr.tiers.find((t) => t.is_active);
+    if (a) {
+      return {
+        dl: a.throttle_download_kbps,
+        ul: a.throttle_upload_kbps,
+        label: (a.name || "").trim() || fr.rule_name,
+      };
+    }
+  }
+  return { dl: fr.throttle_download_kbps, ul: fr.throttle_upload_kbps, label: fr.rule_name };
+}
 import { useAutoSaveSettings, type ScopeUnit } from "../useAutoSaveSettings";
+import { useLooseNumberInput } from "../hooks/useLooseNumberInput";
+import { formatDatetimeLocalValue } from "../datetimeLocal";
 
 function Card({ className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) {
   const base = "rounded-3xl overflow-hidden ring-1 ring-gray-200 ring-offset-2 ring-offset-gray-50 bg-white shadow-md hover:shadow-lg transition transform hover:-translate-y-0.5 dark:ring-gray-800 dark:ring-offset-gray-950 dark:bg-gray-900";
@@ -60,9 +76,38 @@ export default function PeerDetail() {
   const [fuStatus, setFuStatus] = React.useState<FairUsagePeerStatusDTO | null>(null);
   const [fuResetBusy, setFuResetBusy] = React.useState(false);
 
+  const fuRules = React.useMemo((): FairUsageRuleStatusItemDTO[] => {
+    if (!fuStatus) return [];
+    if (fuStatus.rules && fuStatus.rules.length > 0) return fuStatus.rules;
+    if (fuStatus.rule_id) {
+      return [
+        {
+          rule_id: fuStatus.rule_id,
+          rule_name: fuStatus.rule_name ?? "",
+          quota_mode: fuStatus.quota_mode ?? "combined",
+          download_quota_bytes: fuStatus.download_quota_bytes,
+          upload_quota_bytes: fuStatus.upload_quota_bytes,
+          throttle_download_kbps: fuStatus.throttle_download_kbps,
+          throttle_upload_kbps: fuStatus.throttle_upload_kbps,
+          time_scope: fuStatus.time_scope,
+          scope_period_count: fuStatus.scope_period_count,
+          scope_period_unit: fuStatus.scope_period_unit,
+          scope_label: fuStatus.scope_label,
+          scope_type: fuStatus.scope_type,
+          used_rx: fuStatus.used_rx,
+          used_tx: fuStatus.used_tx,
+          over_quota: fuStatus.throttled,
+          next_reset: fuStatus.next_reset,
+        },
+      ];
+    }
+    return [];
+  }, [fuStatus]);
+
   const [timeFrom, setTimeFrom] = React.useState<string>("");
   const [timeTo, setTimeTo] = React.useState<string>("");
   const [allTime, setAllTime] = React.useState<boolean>(false);
+  const [todayTick, setTodayTick] = React.useState(0);
 
   const [clientCfg, setClientCfg] = React.useState(() => ({
     privateKey: "",
@@ -70,14 +115,33 @@ export default function PeerDetail() {
     mtu: "1280",
     persistentKeepalive: "25",
     allowedIps: "0.0.0.0/0, ::/0",
+    /** Display / download filename only; not part of WireGuard config body */
+    configName: "",
+    /** Overrides Endpoint= line when set (hostname, IP, or host:port) */
+    customEndpoint: "",
+    presharedKey: "",
   }));
   const [showPrivateKey, setShowPrivateKey] = React.useState(false);
+  const [showPresharedKey, setShowPresharedKey] = React.useState(false);
+  const [exportPrefsServer, setExportPrefsServer] = React.useState<{
+    config_name: string;
+    custom_endpoint: string;
+    preshared_key: string;
+  } | null>(null);
+  const [exportPrefsSaveState, setExportPrefsSaveState] = React.useState<
+    "idle" | "dirty" | "saving" | "saved" | "error"
+  >("idle");
+  const [exportPrefsErr, setExportPrefsErr] = React.useState("");
+  const exportPrefsSaveTimerRef = React.useRef<number | null>(null);
+  const exportPrefsSavingRef = React.useRef(false);
+  const exportPrefsPendingRef = React.useRef(false);
 
   const [quotaDraft, setQuotaDraft] = React.useState<{ limitGb: number; valid_from: string; valid_until: string }>({
     limitGb: 0,
     valid_from: "",
     valid_until: "",
   });
+  const [confirmRenewKeys, setConfirmRenewKeys] = React.useState(false);
   const [confirmDelete, setConfirmDelete] = React.useState(false);
   const windowProgress = React.useMemo(() => {
     if (!quotaDraft.valid_from && !quotaDraft.valid_until) return null;
@@ -141,6 +205,42 @@ export default function PeerDetail() {
 	    // eslint-disable-next-line react-hooks/exhaustive-deps
 	  }, [peerId]);
 
+	  React.useEffect(() => {
+	    if (!peerId) return;
+	    setExportPrefsServer(null);
+	    setClientCfg((c) => ({
+	      ...c,
+	      configName: "",
+	      customEndpoint: "",
+	      presharedKey: "",
+	    }));
+	    let cancelled = false;
+	    (async () => {
+	      try {
+	        const p = await getPeerClientExportPrefs(peerId);
+	        if (cancelled) return;
+	        const server = {
+	          config_name: p.config_name ?? "",
+	          custom_endpoint: p.custom_endpoint ?? "",
+	          preshared_key: p.preshared_key ?? "",
+	        };
+	        setClientCfg((c) => ({
+	          ...c,
+	          configName: server.config_name,
+	          customEndpoint: server.custom_endpoint,
+	          presharedKey: server.preshared_key,
+	        }));
+	        setExportPrefsServer(server);
+	      } catch {
+	        if (cancelled) return;
+	        setExportPrefsServer({ config_name: "", custom_endpoint: "", preshared_key: "" });
+	      }
+	    })();
+	    return () => {
+	      cancelled = true;
+	    };
+	  }, [peerId]);
+
   const refreshPeer = React.useCallback(async () => {
     const peers = await listSavedPeers();
     const p = peers.find(x => x.id === peerId) || null;
@@ -154,6 +254,18 @@ export default function PeerDetail() {
   const scopeValue = settings?.peer_default_scope_value ?? 14;
   const scopeUnit = (settings?.peer_default_scope_unit as ScopeUnit) ?? "days";
   const timezone = settings?.timezone ?? "UTC";
+  const todayFrame = Boolean(settings?.peer_time_frame_today);
+
+  const peerRefreshInput = useLooseNumberInput(
+    refreshSec,
+    (n) => update({ peer_refresh_seconds: n }),
+    { min: 5, emptyFallback: 5 },
+  );
+  const peerScopeInput = useLooseNumberInput(
+    scopeValue,
+    (n) => update({ peer_default_scope_value: n }),
+    { min: 1, emptyFallback: 1 },
+  );
   const showKindPills = settings?.show_kind_pills ?? true;
 
   const clientConfig = React.useMemo(() => {
@@ -168,7 +280,30 @@ export default function PeerDetail() {
     const serverPublicKey = (ifaceCfg?.public_key || "").trim() || "SERVER_PUBLIC_KEY";
     const endpointHost = (ifaceCfg?.public_host || "").trim() || (router?.host || "").trim();
     const endpointPort = ifaceCfg?.listen_port || 51820;
-    const endpoint = endpointHost ? `${endpointHost}:${endpointPort}` : "HOST:PORT";
+    const customEp = (clientCfg.customEndpoint || "").trim();
+    const defaultEndpoint = endpointHost ? `${endpointHost}:${endpointPort}` : "HOST:PORT";
+    let endpoint = defaultEndpoint;
+    if (customEp) {
+      if (customEp.startsWith("[") && customEp.includes("]")) {
+        endpoint = customEp.includes("]:") ? customEp : `${customEp}:${endpointPort}`;
+      } else if (/:[0-9]{1,5}$/.test(customEp)) {
+        endpoint = customEp;
+      } else if (customEp.includes(":")) {
+        endpoint = `[${customEp}]:${endpointPort}`;
+      } else {
+        endpoint = `${customEp}:${endpointPort}`;
+      }
+    }
+
+    const psk = (clientCfg.presharedKey || "").trim();
+    const pskLineOk = (() => {
+      if (!psk) return false;
+      try {
+        return atob(psk).length === 32;
+      } catch {
+        return false;
+      }
+    })();
 
     const lines = [
       "[Interface]",
@@ -184,6 +319,7 @@ export default function PeerDetail() {
       "",
       "[Peer]",
       `PublicKey = ${serverPublicKey}`,
+      ...(pskLineOk ? [`PresharedKey = ${psk}`] : []),
       `Endpoint = ${endpoint}`,
       ...(allowedIps ? [`AllowedIPs = ${allowedIps}`] : []),
       ...(() => {
@@ -194,7 +330,28 @@ export default function PeerDetail() {
       })(),
     ];
     return lines.join("\n");
-  }, [peer?.id, peer?.allowed_address, clientCfg.privateKey, clientCfg.dns, clientCfg.mtu, clientCfg.persistentKeepalive, clientCfg.allowedIps, ifaceCfg?.public_key, ifaceCfg?.public_host, ifaceCfg?.listen_port, router?.host]);
+  }, [peer?.id, peer?.allowed_address, clientCfg.privateKey, clientCfg.dns, clientCfg.mtu, clientCfg.persistentKeepalive, clientCfg.allowedIps, clientCfg.presharedKey, clientCfg.customEndpoint, ifaceCfg?.public_key, ifaceCfg?.public_host, ifaceCfg?.listen_port, router?.host]);
+
+  const sanitizeConfigFileBase = React.useCallback((name: string, fallback: string) => {
+    const raw = (name || "").trim() || (fallback || "").trim() || "wg-peer";
+    const safe = raw.replace(/[/\\?%*:|"<>]/g, "_").replace(/\s+/g, "_").slice(0, 120);
+    return safe || "wg-peer";
+  }, []);
+
+  const downloadClientConfigFile = React.useCallback(() => {
+    if (!peer || !clientConfig) return;
+    const base = sanitizeConfigFileBase(clientCfg.configName, peer.name || "");
+    const blob = new Blob([clientConfig], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${base}.conf`;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, [peer, clientConfig, clientCfg.configName, sanitizeConfigFileBase]);
 
   const isValidWgPrivateKey = React.useMemo(() => {
     const pk = (clientCfg.privateKey || "").trim();
@@ -207,19 +364,195 @@ export default function PeerDetail() {
     }
   }, [clientCfg.privateKey]);
 
+  const isValidWgPresharedKey = React.useMemo(() => {
+    const pk = (clientCfg.presharedKey || "").trim();
+    if (!pk) return true;
+    try {
+      return atob(pk).length === 32;
+    } catch {
+      return false;
+    }
+  }, [clientCfg.presharedKey]);
+
+  const isExportPrefsDirty = React.useMemo(() => {
+    if (!exportPrefsServer || !peer) return false;
+    return (
+      clientCfg.configName !== exportPrefsServer.config_name ||
+      clientCfg.customEndpoint !== exportPrefsServer.custom_endpoint ||
+      (clientCfg.presharedKey || "") !== (exportPrefsServer.preshared_key || "")
+    );
+  }, [exportPrefsServer, peer, clientCfg.configName, clientCfg.customEndpoint, clientCfg.presharedKey]);
+
+  const validateExportPrefsDraft = React.useCallback((): string | null => {
+    const pk = (clientCfg.presharedKey || "").trim();
+    if (!pk) return null;
+    try {
+      if (atob(pk).length !== 32) return "Preshared key must be base64 (32 bytes), or leave empty.";
+    } catch {
+      return "Preshared key must be base64 (32 bytes), or leave empty.";
+    }
+    return null;
+  }, [clientCfg.presharedKey]);
+
+  const doAutoSaveExportPrefs = React.useCallback(async () => {
+    if (!peer || !exportPrefsServer) return;
+    const validationErr = validateExportPrefsDraft();
+    if (validationErr) {
+      setExportPrefsErr(validationErr);
+      setExportPrefsSaveState("error");
+      return;
+    }
+    if (!isExportPrefsDirty) {
+      setExportPrefsSaveState((s) => (s === "dirty" ? "idle" : s));
+      return;
+    }
+
+    if (exportPrefsSavingRef.current) {
+      exportPrefsPendingRef.current = true;
+      return;
+    }
+
+    const snapshot = {
+      config_name: clientCfg.configName,
+      custom_endpoint: clientCfg.customEndpoint,
+      preshared_key: clientCfg.presharedKey,
+    };
+    exportPrefsSavingRef.current = true;
+    setExportPrefsErr("");
+    setExportPrefsSaveState("saving");
+    try {
+      const saved = await patchPeerClientExportPrefs(peer.id, {
+        config_name: snapshot.config_name,
+        custom_endpoint: snapshot.custom_endpoint,
+        preshared_key: snapshot.preshared_key,
+      });
+      const next = {
+        config_name: saved.config_name ?? "",
+        custom_endpoint: saved.custom_endpoint ?? "",
+        preshared_key: saved.preshared_key ?? "",
+      };
+      setExportPrefsServer(next);
+      const stillSame =
+        clientCfg.configName === snapshot.config_name &&
+        clientCfg.customEndpoint === snapshot.custom_endpoint &&
+        (clientCfg.presharedKey || "") === (snapshot.preshared_key || "");
+      if (stillSame) {
+        setClientCfg((c) => ({
+          ...c,
+          configName: next.config_name,
+          customEndpoint: next.custom_endpoint,
+          presharedKey: next.preshared_key,
+        }));
+      }
+      await refreshPeer();
+      setExportPrefsSaveState("saved");
+      window.setTimeout(() => {
+        setExportPrefsSaveState((s) => (s === "saved" ? "idle" : s));
+      }, 1200);
+    } catch (e: any) {
+      setExportPrefsErr(e?.message || "Failed to save export preferences");
+      setExportPrefsSaveState("error");
+    } finally {
+      exportPrefsSavingRef.current = false;
+      if (exportPrefsPendingRef.current) {
+        exportPrefsPendingRef.current = false;
+        doAutoSaveExportPrefs();
+      }
+    }
+  }, [
+    peer,
+    exportPrefsServer,
+    isExportPrefsDirty,
+    validateExportPrefsDraft,
+    clientCfg.configName,
+    clientCfg.customEndpoint,
+    clientCfg.presharedKey,
+    refreshPeer,
+  ]);
+
+  // Debounced auto-save for config name, custom endpoint, preshared key (server + RouterOS).
+  React.useEffect(() => {
+    if (!exportPrefsServer || !peer) return;
+    const validationErr = validateExportPrefsDraft();
+    if (validationErr) {
+      setExportPrefsErr(validationErr);
+      setExportPrefsSaveState("error");
+      if (exportPrefsSaveTimerRef.current) window.clearTimeout(exportPrefsSaveTimerRef.current);
+      exportPrefsSaveTimerRef.current = null;
+      return;
+    }
+    setExportPrefsErr("");
+    if (isExportPrefsDirty) {
+      setExportPrefsSaveState((s) => (s === "saving" ? s : "dirty"));
+      if (exportPrefsSaveTimerRef.current) window.clearTimeout(exportPrefsSaveTimerRef.current);
+      exportPrefsSaveTimerRef.current = window.setTimeout(() => {
+        doAutoSaveExportPrefs();
+      }, 800);
+      return () => {
+        if (exportPrefsSaveTimerRef.current) window.clearTimeout(exportPrefsSaveTimerRef.current);
+      };
+    }
+    if (exportPrefsSaveTimerRef.current) window.clearTimeout(exportPrefsSaveTimerRef.current);
+    exportPrefsSaveTimerRef.current = null;
+    setExportPrefsSaveState((s) => (s === "dirty" ? "idle" : s));
+  }, [
+    clientCfg.configName,
+    clientCfg.customEndpoint,
+    clientCfg.presharedKey,
+    isExportPrefsDirty,
+    validateExportPrefsDraft,
+    doAutoSaveExportPrefs,
+    exportPrefsServer,
+    peer,
+  ]);
+
   const toIso = React.useCallback((v: string) => {
     if (!v) return undefined;
     const d = new Date(v);
     if (!Number.isFinite(d.getTime())) return undefined;
     return d.toISOString();
   }, []);
-  const startIso = toIso(timeFrom);
-  const endIso = toIso(timeTo);
-  const timeFrameActive = allTime || !!startIso || !!endIso;
+  const rawStartIso = toIso(timeFrom);
+  const rawEndIso = toIso(timeTo);
+
+  const effectiveStartIso = React.useMemo(() => {
+    if (allTime) return undefined;
+    if (todayFrame) {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      return d.toISOString();
+    }
+    return rawStartIso;
+  }, [allTime, todayFrame, rawStartIso, todayTick]);
+
+  const effectiveEndIso = React.useMemo(() => {
+    if (allTime) return undefined;
+    if (todayFrame) return new Date().toISOString();
+    return rawEndIso;
+  }, [allTime, todayFrame, rawEndIso, todayTick]);
+
+  const timeFrameActive = allTime || !!rawStartIso || !!rawEndIso || todayFrame;
+
+  const displayTimeFrom = React.useMemo(() => {
+    if (todayFrame) {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      return formatDatetimeLocalValue(d);
+    }
+    return timeFrom;
+  }, [todayFrame, timeFrom, todayTick]);
 
   React.useEffect(() => {
     if (scopeUnit !== "days" && allTime) setAllTime(false);
   }, [scopeUnit, allTime]);
+
+  React.useEffect(() => {
+    if (!todayFrame) return;
+    setTodayTick((t) => t + 1);
+    const ms = Math.max(5000, refreshSec * 1000);
+    const id = window.setInterval(() => setTodayTick((t) => t + 1), ms);
+    return () => window.clearInterval(id);
+  }, [todayFrame, refreshSec]);
 
   const fetchActions = React.useCallback(async (limit: number) => {
     const lim = Math.max(1, Math.min(200, limit || 25));
@@ -267,8 +600,8 @@ export default function PeerDetail() {
           setUsage(points);
           return;
         }
-        if (startIso || endIso) {
-          const points = await getPeerUsage(peerId, { window: "daily", start: startIso, end: endIso });
+        if (effectiveStartIso || effectiveEndIso) {
+          const points = await getPeerUsage(peerId, { window: "daily", start: effectiveStartIso, end: effectiveEndIso });
           setUsage(points);
           return;
         }
@@ -281,8 +614,8 @@ export default function PeerDetail() {
             ? Math.max(1, scopeValue) * 60
             : Math.max(1, scopeValue) * 3600;
         const interval = scopeUnit === "minutes" ? 60 : 3600;
-        if (startIso || endIso) {
-          const points = await getPeerUsage(peerId, { window: "raw", seconds: startIso ? undefined : seconds, interval, start: startIso, end: endIso });
+        if (effectiveStartIso || effectiveEndIso) {
+          const points = await getPeerUsage(peerId, { window: "raw", seconds: effectiveStartIso ? undefined : seconds, interval, start: effectiveStartIso, end: effectiveEndIso });
           setUsage(points);
           return;
         }
@@ -292,7 +625,7 @@ export default function PeerDetail() {
     } catch {
       setUsage([]);
     }
-  }, [peerId, scopeUnit, scopeValue, allTime, startIso, endIso]);
+  }, [peerId, scopeUnit, scopeValue, allTime, effectiveStartIso, effectiveEndIso]);
 
 
 
@@ -640,9 +973,8 @@ export default function PeerDetail() {
                     <input
                       type="number"
                       min={5}
-                      value={refreshSec}
-                      onChange={(e) => update({ peer_refresh_seconds: Math.max(5, Number(e.target.value) || 5) })}
                       className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                      {...peerRefreshInput}
                     />
                     <span>s</span>
                   </div>
@@ -651,9 +983,8 @@ export default function PeerDetail() {
 	                    <input
 	                      type="number"
 	                      min={1}
-	                      value={scopeValue}
-	                      onChange={(e) => update({ peer_default_scope_value: Math.max(1, Number(e.target.value) || 1) })}
 	                      className="w-14 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+	                      {...peerScopeInput}
 	                    />
 	                    <select
 	                      value={scopeUnit}
@@ -667,21 +998,58 @@ export default function PeerDetail() {
 	                  </div>
 	                  <div className="basis-full flex flex-wrap items-center gap-2 justify-end">
 	                    <span>Time frame</span>
+	                    <button
+	                      type="button"
+	                      onClick={() => {
+	                        if (todayFrame) {
+	                          const d = new Date();
+	                          d.setHours(0, 0, 0, 0);
+	                          setTimeFrom(formatDatetimeLocalValue(d));
+	                          setTimeTo(formatDatetimeLocalValue(new Date()));
+	                          update({ peer_time_frame_today: false });
+	                        } else {
+	                          setAllTime(false);
+	                          update({ peer_time_frame_today: true });
+	                        }
+	                      }}
+	                      className={`rounded-full px-3 py-1 text-xs border shadow ${
+	                        todayFrame
+	                          ? "border-gray-900 bg-gray-900 text-white dark:border-gray-100 dark:bg-gray-100 dark:text-gray-900"
+	                          : "border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 hover:bg-gray-50 dark:hover:bg-gray-900"
+	                      }`}
+	                    >
+	                      Today
+	                    </button>
 	                    <input
 	                      type="datetime-local"
-	                      value={timeFrom}
-	                      onChange={(e) => setTimeFrom(e.target.value)}
-	                      disabled={allTime}
+	                      value={displayTimeFrom}
+	                      onChange={(e) => {
+	                        update({ peer_time_frame_today: false });
+	                        setTimeFrom(e.target.value);
+	                      }}
+	                      disabled={allTime || todayFrame}
 	                      className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
 	                    />
 	                    <span>to</span>
-	                    <input
-	                      type="datetime-local"
-	                      value={timeTo}
-	                      onChange={(e) => setTimeTo(e.target.value)}
-	                      disabled={allTime}
-	                      className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
-	                    />
+	                    {todayFrame ? (
+	                      <span
+	                        className="inline-flex items-center rounded-full border border-dashed border-gray-300 bg-gray-50 px-2.5 py-1 text-xs text-gray-600 dark:border-gray-600 dark:bg-gray-900/50 dark:text-gray-300"
+	                        title="End of range always matches the current time while Today is on"
+	                      >
+	                        Now
+	                      </span>
+	                    ) : (
+	                      <input
+	                        type="datetime-local"
+	                        value={timeTo}
+	                        onChange={(e) => {
+	                          update({ peer_time_frame_today: false });
+	                          setTimeTo(e.target.value);
+	                        }}
+	                        disabled={allTime}
+	                        className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
+	                      />
+	                    )}
 	                    {scopeUnit === "days" ? (
 	                      <label className="inline-flex items-center gap-2">
 	                        <input
@@ -690,6 +1058,7 @@ export default function PeerDetail() {
 	                          onChange={(e) => {
 	                            const next = e.target.checked;
 	                            setAllTime(next);
+	                            update({ peer_time_frame_today: false });
 	                            if (next) { setTimeFrom(""); setTimeTo(""); }
 	                          }}
 	                        />
@@ -698,7 +1067,12 @@ export default function PeerDetail() {
 	                    ) : null}
 	                    <button
 	                      type="button"
-	                      onClick={() => { setAllTime(false); setTimeFrom(""); setTimeTo(""); }}
+	                      onClick={() => {
+	                        setAllTime(false);
+	                        update({ peer_time_frame_today: false });
+	                        setTimeFrom("");
+	                        setTimeTo("");
+	                      }}
 	                      disabled={!timeFrameActive}
 	                      className="rounded-full border border-gray-200 dark:border-gray-800 px-3 py-1 text-xs bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
 	                    >
@@ -820,114 +1194,179 @@ export default function PeerDetail() {
                 })()}
               </div>
             </div>
-            {/* Fair Usage Status */}
-            {fuStatus && fuStatus.rule_id ? (
+            {/* Fair Usage Status — each applicable rule has its own period, usage, and reset */}
+            {fuStatus && fuRules.length > 0 ? (
               <div className="grid gap-4 mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
                   <div className="flex items-center gap-2">
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-gray-500 dark:text-gray-400">
                       <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
                     </svg>
                     <span className="text-sm text-gray-700 dark:text-gray-200">Fair Usage</span>
+                    {fuRules.length > 1 ? (
+                      <span className="text-[11px] text-gray-500 dark:text-gray-400">({fuRules.length} rules)</span>
+                    ) : null}
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <span className={`rounded-full px-2.5 py-0.5 text-[11px] ${fuStatus.throttled ? "bg-amber-100 text-amber-800 dark:bg-amber-500/10 dark:text-amber-300" : "bg-green-100 text-green-800 dark:bg-green-500/10 dark:text-green-300"}`}>
                       {fuStatus.throttled ? "Throttled" : "Normal"}
                     </span>
-                    <span className="rounded-full bg-gray-100 text-gray-700 px-2 py-0.5 text-[11px] dark:bg-gray-800 dark:text-gray-300">
-                      {fuStatus.scope_label}
-                    </span>
-                    <span className="rounded-full bg-indigo-50 text-indigo-700 px-2 py-0.5 text-[11px] dark:bg-indigo-500/10 dark:text-indigo-300 capitalize">
-                      {fuStatus.scope_type}
-                    </span>
-                  </div>
-                </div>
-                <div className="text-xs text-gray-600 dark:text-gray-300">
-                  Rule: <span className="font-medium text-gray-900 dark:text-gray-100">{fuStatus.rule_name}</span>
-                  {fuStatus.throttled && (
-                    <span className="ml-2 text-amber-700 dark:text-amber-300">
-                      Limited to {(fuStatus.throttle_download_kbps / 1000).toFixed(1)}/{(fuStatus.throttle_upload_kbps / 1000).toFixed(1)} Mbps
-                    </span>
-                  )}
-                </div>
-                <div className="grid gap-3 md:grid-cols-2">
-                  <div>
-                    <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
-                      <span>{fuStatus.quota_mode === "combined" ? "Total usage" : "Download"}</span>
-                      <span>
-                        {(() => {
-                          const used = fuStatus.quota_mode === "combined" ? fuStatus.used_rx + fuStatus.used_tx : fuStatus.used_rx;
-                          const limit = fuStatus.download_quota_bytes;
-                          const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
-                          return `${fmtBytes(used)} / ${fmtBytes(limit)} (${pct}%)`;
-                        })()}
-                      </span>
-                    </div>
-                    <div className="h-2 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full ${fuStatus.throttled ? "bg-amber-500" : "bg-gray-900 dark:bg-gray-100"}`}
-                        style={{
-                          width: `${(() => {
-                            const used = fuStatus.quota_mode === "combined" ? fuStatus.used_rx + fuStatus.used_tx : fuStatus.used_rx;
-                            return Math.min(100, Math.round((used / Math.max(1, fuStatus.download_quota_bytes)) * 100));
-                          })()}%`,
-                        }}
-                      />
-                    </div>
-                  </div>
-                  {fuStatus.quota_mode === "independent" && fuStatus.upload_quota_bytes ? (
-                    <div>
-                      <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
-                        <span>Upload</span>
-                        <span>
-                          {fmtBytes(fuStatus.used_tx)} / {fmtBytes(fuStatus.upload_quota_bytes)} ({Math.min(100, Math.round((fuStatus.used_tx / Math.max(1, fuStatus.upload_quota_bytes)) * 100))}%)
+                    {fuStatus.throttled && (() => {
+                      const v = fuRules.filter((r) => r.over_quota);
+                      const eff = (r: FairUsageRuleStatusItemDTO) => effectiveThrottleForRule(r);
+                      const d = v.length ? Math.min(...v.map((r) => eff(r).dl)) : fuStatus.throttle_download_kbps;
+                      const u = v.length ? Math.min(...v.map((r) => eff(r).ul)) : fuStatus.throttle_upload_kbps;
+                      const dlNames = v.filter((r) => eff(r).dl === d).map((r) => eff(r).label);
+                      const ulNames = v.filter((r) => eff(r).ul === u).map((r) => eff(r).label);
+                      const names = [...new Set([...dlNames, ...ulNames])];
+                      const label = names.length > 0 ? names.join(" · ") : fuStatus.rule_name ?? "Rule";
+                      return (
+                        <span className="text-[11px] text-amber-700 dark:text-amber-300">
+                          {label}: {(d / 1000).toFixed(1)}/{(u / 1000).toFixed(1)} Mbps
                         </span>
-                      </div>
-                      <div className="h-2 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
-                        <div
-                          className={`h-full ${fuStatus.throttled ? "bg-amber-500" : "bg-gray-900 dark:bg-gray-100"}`}
-                          style={{ width: `${Math.min(100, Math.round((fuStatus.used_tx / Math.max(1, fuStatus.upload_quota_bytes)) * 100))}%` }}
-                        />
-                      </div>
-                    </div>
-                  ) : null}
+                      );
+                    })()}
+                    {fuStatus.throttled && (
+                      <button
+                        type="button"
+                        disabled={fuResetBusy}
+                        onClick={async () => {
+                          setFuResetBusy(true);
+                          try {
+                            await resetFairUsagePeer(peerId);
+                            await loadFuStatus();
+                          } catch { }
+                          setFuResetBusy(false);
+                        }}
+                        className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                      >
+                        {fuResetBusy ? "Resetting..." : "Reset throttle"}
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
-                  {fuStatus.next_reset && (
-                    <span>
-                      Resets:{" "}
-                      {fuStatus.scope_period_unit === "hour"
-                        ? new Date(fuStatus.next_reset).toLocaleString(undefined, {
-                            month: "short",
-                            day: "numeric",
-                            year: "numeric",
-                            hour: "numeric",
-                            minute: "2-digit",
-                          })
-                        : new Date(fuStatus.next_reset).toLocaleDateString(undefined, {
-                            month: "short",
-                            day: "numeric",
-                            year: "numeric",
-                          })}
-                    </span>
-                  )}
-                  {fuStatus.throttled && (
-                    <button
-                      type="button"
-                      disabled={fuResetBusy}
-                      onClick={async () => {
-                        setFuResetBusy(true);
-                        try {
-                          await resetFairUsagePeer(peerId);
-                          await loadFuStatus();
-                        } catch { }
-                        setFuResetBusy(false);
-                      }}
-                      className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                <div className="grid gap-4">
+                  {fuRules.map((fr) => (
+                    <div
+                      key={fr.rule_id}
+                      className={`rounded-xl ring-1 p-3 grid gap-2 ${
+                        fr.over_quota ? "ring-amber-300/60 bg-amber-500/5 dark:ring-amber-500/30" : "ring-gray-200 dark:ring-gray-700 bg-gray-50/50 dark:bg-gray-950/40"
+                      }`}
                     >
-                      {fuResetBusy ? "Resetting..." : "Reset throttle"}
-                    </button>
-                  )}
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <div className="text-xs text-gray-600 dark:text-gray-300">
+                          Rule: <span className="font-medium text-gray-900 dark:text-gray-100">{fr.rule_name}</span>
+                          {fr.over_quota ? <span className="ml-2 text-amber-700 dark:text-amber-300">Over quota</span> : null}
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="rounded-full bg-gray-100 text-gray-700 px-2 py-0.5 text-[11px] dark:bg-gray-800 dark:text-gray-300">{fr.scope_label}</span>
+                          <span className="rounded-full bg-indigo-50 text-indigo-700 px-2 py-0.5 text-[11px] dark:bg-indigo-500/10 dark:text-indigo-300 capitalize">{fr.scope_type}</span>
+                        </div>
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        {fr.tiered && fr.tiers && fr.tiers.length > 0 ? (
+                          <div className="md:col-span-2 grid gap-2">
+                            <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+                              <span>Combined usage (tiered)</span>
+                              <span>
+                                {fmtBytes(fr.used_rx + fr.used_tx)} / max {fmtBytes(Math.max(...fr.tiers.map((t) => t.threshold_bytes)))}
+                              </span>
+                            </div>
+                            <div className="h-2 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
+                              <div
+                                className={`h-full ${fr.over_quota ? "bg-amber-500" : "bg-gray-900 dark:bg-gray-100"}`}
+                                style={{
+                                  width: `${(() => {
+                                    const used = fr.used_rx + fr.used_tx;
+                                    const cap = Math.max(...fr.tiers.map((t) => t.threshold_bytes), 1);
+                                    return Math.min(100, Math.round((used / cap) * 100));
+                                  })()}%`,
+                                }}
+                              />
+                            </div>
+                            <div className="grid gap-1.5 mt-1">
+                              {fr.tiers.map((t) => (
+                                <div
+                                  key={t.tier_id}
+                                  className={`flex flex-wrap items-center justify-between gap-2 text-[11px] rounded-lg px-2 py-1.5 ${
+                                    t.is_active ? "bg-amber-100/80 dark:bg-amber-500/15 text-amber-900 dark:text-amber-200" : "bg-gray-100/80 dark:bg-gray-800/80 text-gray-600 dark:text-gray-400"
+                                  }`}
+                                >
+                                  <span>
+                                    ≥ {fmtBytes(t.threshold_bytes)}
+                                    {(t.name || "").trim() ? ` · ${t.name.trim()}` : ""}
+                                    {t.is_active ? " · active" : ""}
+                                  </span>
+                                  <span className="font-mono">
+                                    {(t.throttle_download_kbps / 1000).toFixed(1)}/{(t.throttle_upload_kbps / 1000).toFixed(1)} Mbps
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : (
+                        <div>
+                          <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
+                            <span>{fr.quota_mode === "combined" ? "Total usage" : "Download"}</span>
+                            <span>
+                              {(() => {
+                                const used = fr.quota_mode === "combined" ? fr.used_rx + fr.used_tx : fr.used_rx;
+                                const limit = fr.download_quota_bytes;
+                                const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+                                return `${fmtBytes(used)} / ${fmtBytes(limit)} (${pct}%)`;
+                              })()}
+                            </span>
+                          </div>
+                          <div className="h-2 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
+                            <div
+                              className={`h-full ${fr.over_quota ? "bg-amber-500" : "bg-gray-900 dark:bg-gray-100"}`}
+                              style={{
+                                width: `${(() => {
+                                  const used = fr.quota_mode === "combined" ? fr.used_rx + fr.used_tx : fr.used_rx;
+                                  return Math.min(100, Math.round((used / Math.max(1, fr.download_quota_bytes)) * 100));
+                                })()}%`,
+                              }}
+                            />
+                          </div>
+                        </div>
+                        )}
+                        {fr.quota_mode === "independent" && fr.upload_quota_bytes ? (
+                          <div>
+                            <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
+                              <span>Upload</span>
+                              <span>
+                                {fmtBytes(fr.used_tx)} / {fmtBytes(fr.upload_quota_bytes)} ({Math.min(100, Math.round((fr.used_tx / Math.max(1, fr.upload_quota_bytes)) * 100))}%)
+                              </span>
+                            </div>
+                            <div className="h-2 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
+                              <div
+                                className={`h-full ${fr.over_quota ? "bg-amber-500" : "bg-gray-900 dark:bg-gray-100"}`}
+                                style={{ width: `${Math.min(100, Math.round((fr.used_tx / Math.max(1, fr.upload_quota_bytes)) * 100))}%` }}
+                              />
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                      {fr.next_reset && (
+                        <div className="text-xs text-gray-500 dark:text-gray-400">
+                          Resets:{" "}
+                          {fr.scope_period_unit === "hour"
+                            ? new Date(fr.next_reset).toLocaleString(undefined, {
+                                month: "short",
+                                day: "numeric",
+                                year: "numeric",
+                                hour: "numeric",
+                                minute: "2-digit",
+                              })
+                            : new Date(fr.next_reset).toLocaleDateString(undefined, {
+                                month: "short",
+                                day: "numeric",
+                                year: "numeric",
+                              })}
+                        </div>
+                      )}
+                    </div>
+                  ))}
                 </div>
               </div>
             ) : (
@@ -984,9 +1423,6 @@ export default function PeerDetail() {
 	                >
 	                  Copy
 	                </button>
-	              </div>
-	              <div className="text-xs text-gray-500 dark:text-gray-400">
-	                If this peer was created via the panel, the client private key may be stored encrypted and auto-filled here.
 	              </div>
 	              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
 	                <div className="grid gap-3">
@@ -1049,6 +1485,57 @@ export default function PeerDetail() {
 	                        className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
 	                      />
 	                    </div>
+	                    <div className="grid gap-1 md:col-span-2">
+	                      <div className="text-gray-500 dark:text-gray-400">Preshared key (optional)</div>
+	                      <div className="flex items-center gap-2">
+	                        <input
+	                          type={showPresharedKey ? "text" : "password"}
+	                          value={clientCfg.presharedKey}
+	                          onChange={(e) => setClientCfg((c) => ({ ...c, presharedKey: e.target.value }))}
+	                          placeholder="base64 32-byte key"
+	                          className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 font-mono"
+	                        />
+	                        <button
+	                          type="button"
+	                          onClick={() => setShowPresharedKey((s) => !s)}
+	                          className="rounded-full border border-gray-200 dark:border-gray-800 px-3 py-2 text-xs bg-white dark:bg-gray-950 shrink-0"
+	                        >
+	                          {showPresharedKey ? "Hide" : "Show"}
+	                        </button>
+	                      </div>
+	                      {(clientCfg.presharedKey || "").trim() && !isValidWgPresharedKey && (
+	                        <div className="text-xs text-rose-600">Preshared key must be base64 (32 bytes), or leave empty.</div>
+	                      )}
+	                    </div>
+	                    <div className="grid gap-1">
+	                      <div className="text-gray-500 dark:text-gray-400">Config name (optional)</div>
+	                      <input
+	                        type="text"
+	                        value={clientCfg.configName}
+	                        onChange={(e) => setClientCfg((c) => ({ ...c, configName: e.target.value }))}
+	                        placeholder="Used as download filename"
+	                        className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+	                      />
+	                    </div>
+	                    <div className="grid gap-1">
+	                      <div className="text-gray-500 dark:text-gray-400">Custom endpoint (optional)</div>
+	                      <input
+	                        type="text"
+	                        value={clientCfg.customEndpoint}
+	                        onChange={(e) => setClientCfg((c) => ({ ...c, customEndpoint: e.target.value }))}
+	                        placeholder="e.g. vpn.example.com or 1.2.3.4:8080"
+	                        className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+	                      />
+	                    </div>
+	                    <div className="md:col-span-2 flex flex-wrap items-center gap-x-3 gap-y-1 min-h-[1.25rem]">
+	                      {exportPrefsSaveState === "saving" ? (
+	                        <span className="text-xs text-gray-500 dark:text-gray-400">Saving…</span>
+	                      ) : null}
+	                      {exportPrefsSaveState === "saved" ? (
+	                        <span className="text-xs text-emerald-600 dark:text-emerald-400">Saved</span>
+	                      ) : null}
+	                      {exportPrefsErr ? <span className="text-xs text-rose-600">{exportPrefsErr}</span> : null}
+	                    </div>
 	                  </div>
 	                  <div className="grid gap-1">
 	                    <div className="text-gray-500 dark:text-gray-400 text-sm">Config</div>
@@ -1058,6 +1545,14 @@ export default function PeerDetail() {
 	                      rows={12}
 	                      className="w-full rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 px-3 py-2 text-xs font-mono text-gray-900 dark:text-gray-100 focus:outline-none"
 	                    />
+	                    <button
+	                      type="button"
+	                      onClick={downloadClientConfigFile}
+	                      disabled={!clientConfig}
+	                      className="justify-self-start rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+	                    >
+	                      Save config file
+	                    </button>
 	                  </div>
 	                </div>
 	                <div className="rounded-3xl ring-1 ring-gray-200 dark:ring-gray-800 bg-white dark:bg-gray-950 p-4 flex items-center justify-center min-h-[240px]">
@@ -1203,6 +1698,13 @@ export default function PeerDetail() {
                 </button>
                 <button
                   disabled={actionBusy || !peer}
+                  onClick={() => setConfirmRenewKeys(true)}
+                  className="inline-flex items-center gap-2 rounded-full bg-amber-500 text-white px-4 py-2 text-sm shadow hover:bg-amber-600 disabled:opacity-50"
+                >
+                  Renew private keys
+                </button>
+                <button
+                  disabled={actionBusy || !peer}
                   onClick={() => setConfirmDelete(true)}
                   className="inline-flex items-center gap-2 rounded-full bg-rose-600 text-white px-4 py-2 text-sm shadow hover:bg-rose-700 disabled:opacity-50"
                 >
@@ -1213,6 +1715,47 @@ export default function PeerDetail() {
             {actionErr && <div className="text-sm text-red-600">{actionErr}</div>}
             <div className="flex justify-end">
               <Link to="/" className="inline-flex items-center gap-2 rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black">Back to dashboard</Link>
+            </div>
+          </div>
+        )}
+        {confirmRenewKeys && peer && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
+            <div className="w-full max-w-sm rounded-2xl bg-white ring-1 ring-gray-200 shadow-lg p-6 grid gap-4">
+              <div className="text-lg font-semibold text-gray-900">Renew private keys</div>
+              <div className="text-sm text-gray-600">
+                This generates a new WireGuard keypair for <span className="font-medium text-gray-900">{peer.name}</span>, updates the router, and replaces the current client config. Existing clients using the old keypair will stop working until they import the new config.
+              </div>
+              <div className="flex items-center justify-end gap-3">
+                <button
+                  onClick={() => setConfirmRenewKeys(false)}
+                  className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={actionBusy}
+                  onClick={async () => {
+                    if (!peer) return;
+                    setActionErr("");
+                    try {
+                      setActionBusy(true);
+                      const res = await renewPeerKeys(peer.id);
+                      setPeer((current) => (current ? { ...current, ...res.peer } : current));
+                      setClientCfg((c) => ({ ...c, privateKey: res.private_key || "" }));
+                      await fetchActions(actionsLimit);
+                      setConfirmRenewKeys(false);
+                    } catch (e: any) {
+                      setActionErr(e?.message || "Failed to renew private keys");
+                      setConfirmRenewKeys(false);
+                    } finally {
+                      setActionBusy(false);
+                    }
+                  }}
+                  className="rounded-full bg-amber-500 text-white px-4 py-2 text-sm shadow hover:bg-amber-600 disabled:opacity-50"
+                >
+                  Renew keys
+                </button>
+              </div>
             </div>
           </div>
         )}

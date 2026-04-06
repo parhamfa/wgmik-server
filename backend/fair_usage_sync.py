@@ -11,8 +11,9 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from .models import Action, FairUsageAssignment, FairUsageRule, FairUsageState, Peer
+from .models import Action, FairUsageAssignment, FairUsageRule, FairUsageState, FairUsageTier, Peer
 from .fair_usage_usage import peer_scope_usage_for_rule
+from .fair_usage_tiers import active_tier_for_combined_usage, ordered_tiers_for_rule
 
 FU_QUEUE_PREFIX = "wgmik-fu-"
 
@@ -21,8 +22,12 @@ class FairUsageRouterError(Exception):
     """Router queue operation failed (used when strict_router_errors=True, e.g. reconcile)."""
 
 
-def get_effective_fair_usage_rule(peer: Peer, db: Session) -> Optional[FairUsageRule]:
-    """Highest-priority enabled rule: peer assignment > router scope > global. Strictest quota wins per tier."""
+def get_applicable_fair_usage_rules(peer: Peer, db: Session) -> list[FairUsageRule]:
+    """All enabled rules that apply to this peer, evaluated independently (AND across rules).
+
+    - If the peer has peer-level assignments, **only** those rules apply (no router/global pool).
+    - Otherwise **all** enabled router rules for this router **plus** all enabled global rules apply.
+    """
     assignments = (
         db.query(FairUsageAssignment)
         .join(FairUsageRule, FairUsageAssignment.rule_id == FairUsageRule.id)
@@ -32,29 +37,34 @@ def get_effective_fair_usage_rule(peer: Peer, db: Session) -> Optional[FairUsage
     if assignments:
         rules = [db.get(FairUsageRule, a.rule_id) for a in assignments]
         rules = [r for r in rules if r and r.enabled]
-        if rules:
-            return min(rules, key=lambda r: r.download_quota_bytes)
+        return sorted(rules, key=lambda r: r.id)
 
-    router_rules = (
+    by_id: dict[int, FairUsageRule] = {}
+    for r in (
         db.query(FairUsageRule)
-        .filter(FairUsageRule.scope_type == "router", FairUsageRule.router_id == peer.router_id, FairUsageRule.enabled == True)
+        .filter(
+            FairUsageRule.scope_type == "router",
+            FairUsageRule.router_id == peer.router_id,
+            FairUsageRule.enabled == True,
+        )
         .all()
-    )
-    if router_rules:
-        return min(router_rules, key=lambda r: r.download_quota_bytes)
+    ):
+        by_id[r.id] = r
+    for r in db.query(FairUsageRule).filter(FairUsageRule.scope_type == "global", FairUsageRule.enabled == True).all():
+        by_id[r.id] = r
+    return sorted(by_id.values(), key=lambda r: r.id)
 
-    global_rules = (
-        db.query(FairUsageRule)
-        .filter(FairUsageRule.scope_type == "global", FairUsageRule.enabled == True)
-        .all()
-    )
-    if global_rules:
-        return min(global_rules, key=lambda r: r.download_quota_bytes)
-    return None
+
+def get_effective_fair_usage_rule(peer: Peer, db: Session) -> Optional[FairUsageRule]:
+    """Backward-compatible single rule: strictest quota among applicable rules."""
+    rules = get_applicable_fair_usage_rules(peer, db)
+    if not rules:
+        return None
+    return min(rules, key=lambda r: r.download_quota_bytes)
 
 
 def peer_ids_with_applicable_fair_usage(db: Session, peers: list[Peer]) -> set[int]:
-    """Peer IDs with an enabled fair-usage rule (assignment > router > global), matching get_effective_fair_usage_rule."""
+    """Peer IDs where `get_applicable_fair_usage_rules` is non-empty (assignment tier, else router+global)."""
     if not peers:
         return set()
     ids = [p.id for p in peers]
@@ -98,21 +108,39 @@ def _over_quota(used_rx: int, used_tx: int, rule: FairUsageRule) -> bool:
     return over_dl or over_ul
 
 
+def is_rule_over_quota(used_rx: int, used_tx: int, rule: FairUsageRule, db: Session) -> bool:
+    """True when this rule demands throttling for the given usage (flat quota or tiered ladder)."""
+    if rule.tiered:
+        tiers = ordered_tiers_for_rule(db, rule.id)
+        if not tiers:
+            return False
+        combined = used_rx + used_tx
+        return active_tier_for_combined_usage(tiers, combined) is not None
+    return _over_quota(used_rx, used_tx, rule)
+
+
+def _throttle_for_violation(rule: FairUsageRule, tier: Optional[FairUsageTier]) -> tuple[int, int]:
+    if tier:
+        return tier.throttle_download_kbps, tier.throttle_upload_kbps
+    return rule.throttle_download_kbps, rule.throttle_upload_kbps
+
+
 def _sync_fu_queue_on_router(
     db: Session,
     peer: Peer,
     client,
-    rule: FairUsageRule,
     state: FairUsageState,
     now_utc: datetime,
     *,
+    state_rule_id: int,
+    up_limit: str,
+    down_limit: str,
+    log_label: str,
     entered_unthrottled: bool,
     strict_router_errors: bool,
 ) -> None:
     queue_name = f"{FU_QUEUE_PREFIX}{peer.name or peer.id}"
     target = peer.allowed_address or ""
-    up_limit = f"{rule.throttle_upload_kbps}k"
-    down_limit = f"{rule.throttle_download_kbps}k"
 
     if not client or not peer.ros_id:
         # Scheduler often has no peer on router yet; reconcile without client skips quietly (same as legacy).
@@ -140,7 +168,7 @@ def _sync_fu_queue_on_router(
     if ros_id:
         try:
             client.update_simple_queue(ros_id, up_limit, down_limit)
-            state.rule_id = rule.id
+            state.rule_id = state_rule_id
             state.throttled = True
             state.throttled_at = state.throttled_at or now_utc
             state.ros_queue_id = ros_id
@@ -150,7 +178,7 @@ def _sync_fu_queue_on_router(
                         peer_id=peer.id,
                         ts=now_utc,
                         action="fu_throttle",
-                        note=f"Throttled: {rule.name} ({rule.throttle_upload_kbps}k/{rule.throttle_download_kbps}k)",
+                        note=f"Throttled: {log_label} ({up_limit}/{down_limit})",
                     )
                 )
             return
@@ -167,7 +195,7 @@ def _sync_fu_queue_on_router(
             try:
                 client.update_simple_queue(rid, up_limit, down_limit)
                 state.ros_queue_id = rid
-                state.rule_id = rule.id
+                state.rule_id = state_rule_id
                 state.throttled = True
                 state.throttled_at = state.throttled_at or now_utc
                 if entered_unthrottled:
@@ -176,7 +204,7 @@ def _sync_fu_queue_on_router(
                             peer_id=peer.id,
                             ts=now_utc,
                             action="fu_throttle",
-                            note=f"Throttled: {rule.name} ({rule.throttle_upload_kbps}k/{rule.throttle_download_kbps}k)",
+                            note=f"Throttled: {log_label} ({up_limit}/{down_limit})",
                         )
                     )
                 else:
@@ -185,7 +213,7 @@ def _sync_fu_queue_on_router(
                             peer_id=peer.id,
                             ts=now_utc,
                             action="fu_queue_repaired",
-                            note=f"Fair-usage queue reattached on router ({rule.name})",
+                            note=f"Fair-usage queue reattached on router ({log_label})",
                         )
                     )
                 return
@@ -195,7 +223,7 @@ def _sync_fu_queue_on_router(
     try:
         new_id = add_queue()
         state.ros_queue_id = new_id
-        state.rule_id = rule.id
+        state.rule_id = state_rule_id
         state.throttled = True
         state.throttled_at = state.throttled_at or now_utc
         if entered_unthrottled:
@@ -204,7 +232,7 @@ def _sync_fu_queue_on_router(
                     peer_id=peer.id,
                     ts=now_utc,
                     action="fu_throttle",
-                    note=f"Throttled: {rule.name} ({rule.throttle_upload_kbps}k/{rule.throttle_download_kbps}k)",
+                    note=f"Throttled: {log_label} ({up_limit}/{down_limit})",
                 )
             )
         else:
@@ -213,7 +241,7 @@ def _sync_fu_queue_on_router(
                     peer_id=peer.id,
                     ts=now_utc,
                     action="fu_queue_recreated",
-                    note=f"Fair-usage queue recreated on router ({rule.name})",
+                    note=f"Fair-usage queue recreated on router ({log_label})",
                 )
             )
     except Exception as e:
@@ -238,13 +266,14 @@ def apply_fair_usage_policy(
     strict_router_errors: bool = False,
 ) -> None:
     """
-    Enforce fair usage for one peer: throttle/unthrottle and keep simple-queue limits aligned with the DB rule.
-    Intended to run every scheduler tick for selected peers.
+    Enforce fair usage for one peer: all applicable rules are evaluated; throttle applies if **any**
+    rule is over quota. Router queue limits use the **strictest** throttle among violated rules
+    (minimum kbps per direction).
     """
-    rule = get_effective_fair_usage_rule(peer, db)
+    rules = get_applicable_fair_usage_rules(peer, db)
     state = db.query(FairUsageState).filter(FairUsageState.peer_id == peer.id).first()
 
-    if not rule:
+    if not rules:
         if state and state.throttled:
             if state.ros_queue_id and peer.ros_id and client:
                 try:
@@ -269,10 +298,22 @@ def apply_fair_usage_policy(
             db.delete(state)
         return
 
-    used_rx, used_tx = peer_scope_usage_for_rule(peer.id, rule, db, now_utc)
-    over_quota = _over_quota(used_rx, used_tx, rule)
+    violating: list[tuple[FairUsageRule, Optional[FairUsageTier]]] = []
+    for rule in rules:
+        urx, utx = peer_scope_usage_for_rule(peer.id, rule, db, now_utc)
+        if rule.tiered:
+            tiers = ordered_tiers_for_rule(db, rule.id)
+            if not tiers:
+                continue
+            combined = urx + utx
+            t = active_tier_for_combined_usage(tiers, combined)
+            if t:
+                violating.append((rule, t))
+        else:
+            if _over_quota(urx, utx, rule):
+                violating.append((rule, None))
 
-    if not over_quota:
+    if not violating:
         if state and state.throttled:
             if state.ros_queue_id and peer.ros_id and client:
                 try:
@@ -285,7 +326,7 @@ def apply_fair_usage_policy(
                     peer_id=peer.id,
                     ts=now_utc,
                     action="fu_reset",
-                    note=f"Auto-reset: usage below quota for {rule.name}",
+                    note="Auto-reset: usage below quota for all applicable fair-usage rules",
                 )
             )
             try:
@@ -295,19 +336,37 @@ def apply_fair_usage_policy(
                 pass
         return
 
+    min_up = min(_throttle_for_violation(r, t)[1] for r, t in violating)
+    min_down = min(_throttle_for_violation(r, t)[0] for r, t in violating)
+    up_limit = f"{min_up}k"
+    down_limit = f"{min_down}k"
+    primary_r, primary_t = min(violating, key=lambda x: x[0].id)
+
+    def _tier_label(r: FairUsageRule, t: Optional[FairUsageTier]) -> str:
+        if t and (t.name or "").strip():
+            return f"{r.name} ({t.name.strip()})"
+        return r.name
+
+    log_label = ", ".join(_tier_label(r, t) for r, t in sorted(violating, key=lambda x: x[0].id))
+
     if not state:
-        state = FairUsageState(peer_id=peer.id, rule_id=rule.id, throttled=False, ros_queue_id="")
+        state = FairUsageState(peer_id=peer.id, rule_id=primary_r.id, throttled=False, ros_queue_id="")
         db.add(state)
         db.flush()
 
+    state.rule_id = primary_r.id
+    state.tier_id = primary_t.id if primary_t else None
     entered_unthrottled = not state.throttled
     _sync_fu_queue_on_router(
         db,
         peer,
         client,
-        rule,
         state,
         now_utc,
+        state_rule_id=primary_r.id,
+        up_limit=up_limit,
+        down_limit=down_limit,
+        log_label=log_label,
         entered_unthrottled=entered_unthrottled,
         strict_router_errors=strict_router_errors,
     )

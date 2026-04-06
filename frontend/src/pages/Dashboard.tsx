@@ -4,6 +4,8 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import QRCode from "react-qr-code";
 import nacl from "tweetnacl";
 import { useAutoSaveSettings } from "../useAutoSaveSettings";
+import { useLooseNumberInput } from "../hooks/useLooseNumberInput";
+import { formatDatetimeLocalValue } from "../datetimeLocal";
 import {
   createRouterPeer,
   getDashboardLiveStatus,
@@ -325,6 +327,7 @@ export default function Dashboard() {
   const [timeFrom, setTimeFrom] = React.useState("");
   const [timeTo, setTimeTo] = React.useState("");
   const [allTime, setAllTime] = React.useState(false);
+  const [todayTick, setTodayTick] = React.useState(0);
   const [localFilterText, setLocalFilterText] = React.useState("");
   const [expandedRouters, setExpandedRouters] = React.useState<Record<number, boolean>>({});
 
@@ -354,6 +357,17 @@ export default function Dashboard() {
   const refreshSec = settings?.dashboard_refresh_seconds ?? 30;
   const scopeValue = settings?.dashboard_scope_value ?? 14;
   const scopeUnit = (settings?.dashboard_scope_unit as ScopeUnit) ?? "days";
+
+  const dashRefreshInput = useLooseNumberInput(
+    refreshSec,
+    (n) => update({ dashboard_refresh_seconds: n }),
+    { min: 5, emptyFallback: 5 },
+  );
+  const dashScopeInput = useLooseNumberInput(
+    scopeValue,
+    (n) => update({ dashboard_scope_value: n }),
+    { min: 1, emptyFallback: 1 },
+  );
   const timezone = settings?.timezone ?? "UTC";
   const showKindPills = settings?.show_kind_pills ?? true;
   const showHwStats = settings?.show_hw_stats ?? true;
@@ -363,6 +377,7 @@ export default function Dashboard() {
   const sortBy = (settings?.dashboard_sort_by as "name" | "last_seen" | "created" | "usage") ?? "created";
   const rawScope = ((settings?.dashboard_router_scope as RouterScope | undefined) ?? "all");
   const rawSelectedRouterIds = normalizeRouterIds(settings?.dashboard_selected_router_ids);
+  const todayFrame = Boolean(settings?.dashboard_time_frame_today);
 
   const toIso = React.useCallback((value: string) => {
     if (!value) return undefined;
@@ -370,13 +385,47 @@ export default function Dashboard() {
     if (!Number.isFinite(date.getTime())) return undefined;
     return date.toISOString();
   }, []);
-  const startIso = toIso(timeFrom);
-  const endIso = toIso(timeTo);
-  const timeFrameActive = allTime || !!startIso || !!endIso;
+  const rawStartIso = toIso(timeFrom);
+  const rawEndIso = toIso(timeTo);
+
+  const effectiveStartIso = React.useMemo(() => {
+    if (allTime) return undefined;
+    if (todayFrame) {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      return d.toISOString();
+    }
+    return rawStartIso;
+  }, [allTime, todayFrame, rawStartIso, todayTick]);
+
+  const effectiveEndIso = React.useMemo(() => {
+    if (allTime) return undefined;
+    if (todayFrame) return new Date().toISOString();
+    return rawEndIso;
+  }, [allTime, todayFrame, rawEndIso, todayTick]);
+
+  const timeFrameActive = allTime || !!rawStartIso || !!rawEndIso || todayFrame;
+
+  const displayTimeFrom = React.useMemo(() => {
+    if (todayFrame) {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      return formatDatetimeLocalValue(d);
+    }
+    return timeFrom;
+  }, [todayFrame, timeFrom, todayTick]);
 
   React.useEffect(() => {
     if (scopeUnit !== "days" && allTime) setAllTime(false);
   }, [scopeUnit, allTime]);
+
+  React.useEffect(() => {
+    if (!todayFrame) return;
+    setTodayTick((t) => t + 1);
+    const ms = Math.max(5000, refreshSec * 1000);
+    const id = window.setInterval(() => setTodayTick((t) => t + 1), ms);
+    return () => window.clearInterval(id);
+  }, [todayFrame, refreshSec]);
 
   React.useEffect(() => {
     (async () => {
@@ -450,22 +499,24 @@ export default function Dashboard() {
       scopeUnit,
       scopeValue,
       allTime,
-      startIso: startIso || "",
-      endIso: endIso || "",
+      todayFrame,
+      todayTick,
+      startIso: todayFrame ? "" : (rawStartIso || ""),
+      endIso: todayFrame ? "" : (rawEndIso || ""),
     }),
-    [inScopeRouterIds, scopeUnit, scopeValue, allTime, startIso, endIso],
+    [inScopeRouterIds, scopeUnit, scopeValue, allTime, todayFrame, todayTick, rawStartIso, rawEndIso],
   );
   const scopeSignatureRef = React.useRef(scopeSignature);
   const statusRequestRef = React.useRef(0);
   const rangeSeconds = React.useMemo(() => {
     if (scopeUnit === "days") return null;
     const baseSeconds = scopeUnit === "minutes" ? Math.max(1, scopeValue) * 60 : Math.max(1, scopeValue) * 3600;
-    if (!startIso) return baseSeconds;
-    const startMs = new Date(startIso).getTime();
-    const endMs = new Date(endIso || new Date().toISOString()).getTime();
+    if (!effectiveStartIso) return baseSeconds;
+    const startMs = new Date(effectiveStartIso).getTime();
+    const endMs = new Date(effectiveEndIso || new Date().toISOString()).getTime();
     if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return baseSeconds;
     return Math.max(60, Math.floor((endMs - startMs) / 1000));
-  }, [scopeUnit, scopeValue, startIso, endIso]);
+  }, [scopeUnit, scopeValue, effectiveStartIso, effectiveEndIso]);
 
   React.useEffect(() => {
     scopeSignatureRef.current = scopeSignature;
@@ -563,8 +614,8 @@ export default function Dashboard() {
           let aggregateRows: MonthlySummaryPoint[] = [];
           if (allTime) {
             aggregateRows = await getMonthlySummary(undefined, undefined, { allTime: true, routerIds: inScopeRouterIds });
-          } else if (startIso || endIso) {
-            aggregateRows = await getMonthlySummary(undefined, undefined, { start: startIso, end: endIso, routerIds: inScopeRouterIds });
+          } else if (effectiveStartIso || effectiveEndIso) {
+            aggregateRows = await getMonthlySummary(undefined, undefined, { start: effectiveStartIso, end: effectiveEndIso, routerIds: inScopeRouterIds });
           } else {
             aggregateRows = await getMonthlySummary(scopeValue, undefined, { routerIds: inScopeRouterIds });
           }
@@ -580,8 +631,8 @@ export default function Dashboard() {
           let routerRows: RouterMonthlySummaryPoint[] = [];
           if (allTime) {
             routerRows = await getMonthlySummaryByRouter(undefined, undefined, { allTime: true, routerIds: inScopeRouterIds });
-          } else if (startIso || endIso) {
-            routerRows = await getMonthlySummaryByRouter(undefined, undefined, { start: startIso, end: endIso, routerIds: inScopeRouterIds });
+          } else if (effectiveStartIso || effectiveEndIso) {
+            routerRows = await getMonthlySummaryByRouter(undefined, undefined, { start: effectiveStartIso, end: effectiveEndIso, routerIds: inScopeRouterIds });
           } else {
             routerRows = await getMonthlySummaryByRouter(scopeValue, undefined, { routerIds: inScopeRouterIds });
           }
@@ -597,7 +648,7 @@ export default function Dashboard() {
       const seconds = rangeSeconds ?? 3600;
       const interval = scopeUnit === "minutes" ? 60 : 3600;
       if (singleInScopeRouterId) {
-        const aggregateRows = await getSummaryRaw(seconds, undefined, interval, startIso, endIso, inScopeRouterIds);
+        const aggregateRows = await getSummaryRaw(seconds, undefined, interval, effectiveStartIso, effectiveEndIso, inScopeRouterIds);
         if (signature !== scopeSignatureRef.current) return;
         setRaw(aggregateRows);
         setRawByRouter(aggregateRows.map((point) => ({
@@ -607,7 +658,7 @@ export default function Dashboard() {
           tx: point.tx,
         })));
       } else {
-        const routerRows = await getSummaryRawByRouter(seconds, undefined, interval, startIso, endIso, inScopeRouterIds);
+        const routerRows = await getSummaryRawByRouter(seconds, undefined, interval, effectiveStartIso, effectiveEndIso, inScopeRouterIds);
         if (signature !== scopeSignatureRef.current) return;
         setRawByRouter(routerRows);
         setRaw(aggregateRawRows(routerRows));
@@ -628,7 +679,7 @@ export default function Dashboard() {
         setMonthlyByRouter([]);
       }
     }
-  }, [scopeUnit, singleInScopeRouterId, allTime, startIso, endIso, scopeValue, inScopeRouterIds, rangeSeconds]);
+  }, [scopeUnit, singleInScopeRouterId, allTime, effectiveStartIso, effectiveEndIso, scopeValue, inScopeRouterIds, rangeSeconds]);
 
   const loadUsageMap = React.useCallback(async (signature: string) => {
     try {
@@ -643,16 +694,16 @@ export default function Dashboard() {
       if (scopeUnit === "days") {
         if (allTime) {
           opts.allTime = true;
-        } else if (startIso || endIso) {
-          opts.start = startIso;
-          opts.end = endIso;
+        } else if (effectiveStartIso || effectiveEndIso) {
+          opts.start = effectiveStartIso;
+          opts.end = effectiveEndIso;
         } else {
           opts.days = scopeValue;
         }
       } else {
         opts.seconds = rangeSeconds ?? 3600;
-        opts.start = startIso;
-        opts.end = endIso;
+        opts.start = effectiveStartIso;
+        opts.end = effectiveEndIso;
       }
       const sums = await getPeersSummary(opts);
       if (signature !== scopeSignatureRef.current) return;
@@ -673,7 +724,7 @@ export default function Dashboard() {
       setFairUsageByPeer({});
       setFairUsageThrottledByPeer({});
     }
-  }, [scopeUnit, scopeValue, allTime, startIso, endIso, inScopeRouterIds, rangeSeconds]);
+  }, [scopeUnit, scopeValue, allTime, effectiveStartIso, effectiveEndIso, inScopeRouterIds, rangeSeconds]);
 
   const loadMetrics = React.useCallback(async () => {
     try {
@@ -728,8 +779,10 @@ export default function Dashboard() {
     scopeUnit,
     scopeValue,
     allTime,
-    startIso,
-    endIso,
+    todayFrame,
+    todayTick,
+    rawStartIso,
+    rawEndIso,
     refreshDashboardData,
   ]);
 
@@ -992,9 +1045,8 @@ export default function Dashboard() {
                 <input
                   type="number"
                   min={5}
-                  value={refreshSec}
-                  onChange={(e) => update({ dashboard_refresh_seconds: Math.max(5, Number(e.target.value) || 5) })}
                   className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                  {...dashRefreshInput}
                 />
                 <span>s</span>
               </div>
@@ -1003,9 +1055,8 @@ export default function Dashboard() {
                 <input
                   type="number"
                   min={1}
-                  value={scopeValue}
-                  onChange={(e) => update({ dashboard_scope_value: Math.max(1, Number(e.target.value) || 1) })}
                   className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                  {...dashScopeInput}
                 />
                 <select
                   value={scopeUnit}
@@ -1020,21 +1071,58 @@ export default function Dashboard() {
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <span>Time frame</span>
+              <button
+                type="button"
+                onClick={() => {
+                  if (todayFrame) {
+                    const d = new Date();
+                    d.setHours(0, 0, 0, 0);
+                    setTimeFrom(formatDatetimeLocalValue(d));
+                    setTimeTo(formatDatetimeLocalValue(new Date()));
+                    update({ dashboard_time_frame_today: false });
+                  } else {
+                    setAllTime(false);
+                    update({ dashboard_time_frame_today: true });
+                  }
+                }}
+                className={`rounded-full px-3 py-1 text-xs border shadow ${
+                  todayFrame
+                    ? "border-gray-900 bg-gray-900 text-white dark:border-gray-100 dark:bg-gray-100 dark:text-gray-900"
+                    : "border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 hover:bg-gray-50 dark:hover:bg-gray-900"
+                }`}
+              >
+                Today
+              </button>
               <input
                 type="datetime-local"
-                value={timeFrom}
-                onChange={(e) => setTimeFrom(e.target.value)}
-                disabled={allTime}
+                value={displayTimeFrom}
+                onChange={(e) => {
+                  update({ dashboard_time_frame_today: false });
+                  setTimeFrom(e.target.value);
+                }}
+                disabled={allTime || todayFrame}
                 className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60"
               />
               <span>to</span>
-              <input
-                type="datetime-local"
-                value={timeTo}
-                onChange={(e) => setTimeTo(e.target.value)}
-                disabled={allTime}
-                className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60"
-              />
+              {todayFrame ? (
+                <span
+                  className="inline-flex items-center rounded-full border border-dashed border-gray-300 bg-gray-50 px-2.5 py-1 text-xs text-gray-600 dark:border-gray-600 dark:bg-gray-900/50 dark:text-gray-300"
+                  title="End of range always matches the current time while Today is on"
+                >
+                  Now
+                </span>
+              ) : (
+                <input
+                  type="datetime-local"
+                  value={timeTo}
+                  onChange={(e) => {
+                    update({ dashboard_time_frame_today: false });
+                    setTimeTo(e.target.value);
+                  }}
+                  disabled={allTime}
+                  className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60"
+                />
+              )}
               {scopeUnit === "days" && (
                 <label className="inline-flex items-center gap-2">
                   <input
@@ -1043,6 +1131,7 @@ export default function Dashboard() {
                     onChange={(e) => {
                       const next = e.target.checked;
                       setAllTime(next);
+                      update({ dashboard_time_frame_today: false });
                       if (next) {
                         setTimeFrom("");
                         setTimeTo("");
@@ -1056,6 +1145,7 @@ export default function Dashboard() {
                 type="button"
                 onClick={() => {
                   setAllTime(false);
+                  update({ dashboard_time_frame_today: false });
                   setTimeFrom("");
                   setTimeTo("");
                 }}

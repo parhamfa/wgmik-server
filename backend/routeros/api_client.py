@@ -113,6 +113,8 @@ class RouterOSApiClient(RouterOSClient):
                         tx_bytes=int(row.get("tx", 0)),
                         last_handshake=self._parse_last_handshake(row.get("last-handshake")),
                         endpoint=row.get("current-endpoint-address", ""),
+                        client_endpoint=(row.get("client-endpoint") or "").strip(),
+                        comment=(row.get("comment") or "").strip(),
                     )
                 )
             return peers
@@ -129,6 +131,74 @@ class RouterOSApiClient(RouterOSClient):
         api = self._conn()
         try:
             api(cmd="/interface/wireguard/peers/set", **{".id": ros_id, "disabled": "yes" if disabled else "no"})
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def set_peer_keys(self, interface: str, ros_id: str, public_key: str, private_key: str) -> None:
+        api = self._conn()
+        try:
+            api(
+                cmd="/interface/wireguard/peers/set",
+                **{".id": ros_id, "public-key": public_key, "private-key": private_key},
+            )
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def set_peer_comment(self, interface: str, ros_id: str, comment: str) -> None:
+        api = self._conn()
+        try:
+            api(cmd="/interface/wireguard/peers/set", **{".id": ros_id, "comment": comment})
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def set_peer_client_endpoint(self, interface: str, ros_id: str, client_endpoint: Optional[str]) -> None:
+        api = self._conn()
+        try:
+            api(
+                cmd="/interface/wireguard/peers/set",
+                **{".id": ros_id, "client-endpoint": (client_endpoint or "").strip()},
+            )
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def set_peer_preshared_key(self, interface: str, ros_id: str, preshared_key: Optional[str]) -> None:
+        api = self._conn()
+        try:
+            params = {".id": ros_id, "preshared-key": preshared_key or ""}
+            api(cmd="/interface/wireguard/peers/set", **params)
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def get_wireguard_peer_preshared_key(self, interface: str, ros_id: str) -> Optional[str]:
+        api = self._conn()
+        try:
+            try:
+                rows = api(cmd="/interface/wireguard/peers/print", proplist=".id,interface,preshared-key")
+            except Exception:
+                rows = api(cmd="/interface/wireguard/peers/print")
+            for row in rows or []:
+                if (row.get(".id") or "") != ros_id:
+                    continue
+                if (row.get("interface") or "") != interface:
+                    continue
+                pk = (row.get("preshared-key") or "").strip()
+                return pk or None
+            return None
         finally:
             try:
                 api.close()

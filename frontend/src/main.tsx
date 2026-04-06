@@ -7,6 +7,8 @@ import PeerDetail from "./pages/PeerDetail";
 import DashboardPage from "./pages/Dashboard";
 import FairUsagePage from "./pages/FairUsage";
 import TelegramPage from "./pages/Telegram";
+import FairUsageRender from "./pages/FairUsageRender";
+import UsageChartRender from "./pages/UsageChartRender";
 import NotFound from "./pages/NotFound";
 import "./styles.css";
 
@@ -109,26 +111,31 @@ function RequireAuth() {
 
 function App() {
   return (
-    <AuthProvider>
-      <BrowserRouter>
-        <Routes>
-          <Route path="/login" element={<LoginSetup />} />
-          <Route path="/setup" element={<LoginSetup />} />
+    <BrowserRouter>
+      <Routes>
+        <Route path="/render/fair-usage" element={<FairUsageRender />} />
+        <Route path="/render/usage-chart" element={<UsageChartRender />} />
+        <Route path="*" element={
+          <AuthProvider>
+            <Routes>
+              <Route path="/login" element={<LoginSetup />} />
+              <Route path="/setup" element={<LoginSetup />} />
 
-          <Route element={<RequireAuth />}>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/settings" element={<SettingsPage />} />
-            <Route path="/fair-usage" element={<FairUsagePage />} />
-            <Route path="/peer/:id" element={<PeerDetail />} />
-            <Route path="/telegram" element={<TelegramPage />} />
+              <Route element={<RequireAuth />}>
+                <Route path="/" element={<Dashboard />} />
+                <Route path="/settings" element={<SettingsPage />} />
+                <Route path="/fair-usage" element={<FairUsagePage />} />
+                <Route path="/peer/:id" element={<PeerDetail />} />
+                <Route path="/telegram" element={<TelegramPage />} />
+              </Route>
 
-          </Route>
-
-          <Route path="*" element={<NotFound />} />
-        </Routes>
-        <ThemeFab />
-      </BrowserRouter>
-    </AuthProvider>
+              <Route path="*" element={<NotFound />} />
+            </Routes>
+            <ThemeFab />
+          </AuthProvider>
+        } />
+      </Routes>
+    </BrowserRouter>
   );
 }
 

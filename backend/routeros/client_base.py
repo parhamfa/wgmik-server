@@ -14,6 +14,9 @@ class WGPeer:
     tx_bytes: int
     last_handshake: Optional[int]  # epoch seconds or None
     endpoint: str
+    # RouterOS 7.x+ /server WG: hostname or host:port for generated client configs (REST: client-endpoint)
+    client_endpoint: str = ""
+    comment: str = ""
 
 
 @dataclass
@@ -36,6 +39,10 @@ class RouterOSClient:
     def set_peer_disabled(self, interface: str, ros_id: str, disabled: bool) -> None:
         raise NotImplementedError
 
+    def set_peer_keys(self, interface: str, ros_id: str, public_key: str, private_key: str) -> None:
+        """Update a peer's WireGuard keypair in place."""
+        raise NotImplementedError
+
     def add_wireguard_peer(
         self,
         interface: str,
@@ -55,6 +62,22 @@ class RouterOSClient:
 
     def get_wireguard_peer_private_key(self, interface: str, ros_id: str) -> Optional[str]:
         """Best-effort read of a peer's private-key from RouterOS (may be blank/unavailable)."""
+        raise NotImplementedError
+
+    def get_wireguard_peer_preshared_key(self, interface: str, ros_id: str) -> Optional[str]:
+        """Best-effort read of a peer's preshared-key from RouterOS (may be blank/unavailable)."""
+        raise NotImplementedError
+
+    def set_peer_comment(self, interface: str, ros_id: str, comment: str) -> None:
+        """Set RouterOS peer comment."""
+        raise NotImplementedError
+
+    def set_peer_client_endpoint(self, interface: str, ros_id: str, client_endpoint: Optional[str]) -> None:
+        """Set RouterOS WireGuard peer client-endpoint (export hostname / host:port). Empty clears."""
+        raise NotImplementedError
+
+    def set_peer_preshared_key(self, interface: str, ros_id: str, preshared_key: Optional[str]) -> None:
+        """Set or clear WireGuard peer preshared-key on RouterOS."""
         raise NotImplementedError
 
     def get_wireguard_interface(self, interface: str) -> WGInterfaceConfig:

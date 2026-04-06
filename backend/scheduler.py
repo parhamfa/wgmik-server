@@ -11,7 +11,8 @@ from typing import Optional, Dict, Tuple
 from .settings import settings
 from .db import SessionLocal
 from .models import Router, Peer, UsageSample, UsageMinute, UsageDaily, UsageMonthly, SettingsKV, Quota, Action
-from .fair_usage_sync import apply_fair_usage_policy, get_effective_fair_usage_rule
+from .wg_export_prefs import parse_wgmik_endpoint_from_comment
+from .fair_usage_sync import apply_fair_usage_policy, get_applicable_fair_usage_rules
 from .routeros.factory import make_client
 from .usage_storage import floor_to_minute_utc, upsert_usage_minute
 
@@ -100,6 +101,24 @@ def _poll_once():
                     peer.name = lp.name or ""
                 if (lp.allowed_address or "") != (peer.allowed_address or ""):
                     peer.allowed_address = lp.allowed_address or ""
+                if (getattr(lp, "comment", "") or "") != (peer.comment or ""):
+                    peer.comment = getattr(lp, "comment", "") or ""
+                cep = (getattr(lp, "client_endpoint", "") or "").strip()
+                if cep:
+                    kv_ep = db.get(SettingsKV, f"peer_export_endpoint:{peer.id}") or SettingsKV(
+                        key=f"peer_export_endpoint:{peer.id}", value=""
+                    )
+                    if (kv_ep.value or "").strip() != cep:
+                        kv_ep.value = cep
+                        db.add(kv_ep)
+                else:
+                    ep = parse_wgmik_endpoint_from_comment(peer.comment)
+                    if ep:
+                        kv_ep = db.get(SettingsKV, f"peer_export_endpoint:{peer.id}") or SettingsKV(
+                            key=f"peer_export_endpoint:{peer.id}", value=""
+                        )
+                        kv_ep.value = ep
+                        db.add(kv_ep)
 
                 # Disabled state must reflect RouterOS. If it differs, assume external change.
                 if bool(peer.disabled) != bool(lp.disabled):
@@ -212,8 +231,7 @@ def _poll_once():
                 try:
                     from .telegram.notifications import check_and_send_notifications
                     from .fair_usage_usage import peer_scope_usage_for_rule as _fu_usage
-                    fu_rule = get_effective_fair_usage_rule(peer, db)
-                    if fu_rule:
+                    for fu_rule in get_applicable_fair_usage_rules(peer, db):
                         _urx, _utx = _fu_usage(peer.id, fu_rule, db, now_utc)
                         check_and_send_notifications(db, peer, fu_rule, _urx, _utx, now_utc)
                 except Exception:

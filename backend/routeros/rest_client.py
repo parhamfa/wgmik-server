@@ -157,6 +157,10 @@ class RouterOSRestClient(RouterOSClient):
                     tx_bytes=int(row.get("tx", 0)),
                     last_handshake=self._parse_last_handshake(row.get("last-handshake")),
                     endpoint=row.get("current-endpoint-address", ""),
+                    client_endpoint=(
+                        (row.get("client-endpoint") or row.get("clientEndpoint") or "") or ""
+                    ).strip(),
+                    comment=(row.get("comment") or "").strip(),
                 )
             )
         return peers
@@ -173,6 +177,59 @@ class RouterOSRestClient(RouterOSClient):
             "/interface/wireguard/peers/set",
             json={"numbers": ros_id, "disabled": "yes" if disabled else "no"},
         )
+
+    def set_peer_keys(self, interface: str, ros_id: str, public_key: str, private_key: str) -> None:
+        self._request(
+            "POST",
+            "/interface/wireguard/peers/set",
+            json={
+                "numbers": ros_id,
+                "public-key": public_key,
+                "private-key": private_key,
+            },
+        )
+
+    def set_peer_comment(self, interface: str, ros_id: str, comment: str) -> None:
+        self._request(
+            "POST",
+            "/interface/wireguard/peers/set",
+            json={"numbers": ros_id, "comment": comment},
+        )
+
+    def set_peer_client_endpoint(self, interface: str, ros_id: str, client_endpoint: Optional[str]) -> None:
+        self._request(
+            "POST",
+            "/interface/wireguard/peers/set",
+            json={"numbers": ros_id, "client-endpoint": (client_endpoint or "").strip()},
+        )
+
+    def set_peer_preshared_key(self, interface: str, ros_id: str, preshared_key: Optional[str]) -> None:
+        payload: dict = {"numbers": ros_id}
+        if preshared_key:
+            payload["preshared-key"] = preshared_key
+        else:
+            payload["preshared-key"] = ""
+        self._request("POST", "/interface/wireguard/peers/set", json=payload)
+
+    def get_wireguard_peer_preshared_key(self, interface: str, ros_id: str) -> Optional[str]:
+        try:
+            row = self._get(f"/interface/wireguard/peers/{ros_id}")
+            if isinstance(row, dict):
+                pk = (row.get("preshared-key") or "").strip()
+                if pk:
+                    return pk
+        except Exception:
+            pass
+        try:
+            rows = self._get("/interface/wireguard/peers")
+            if isinstance(rows, list):
+                for r in rows:
+                    if (r.get(".id") or "") == ros_id and (r.get("interface") or "") == interface:
+                        pk = (r.get("preshared-key") or "").strip()
+                        return pk or None
+        except Exception:
+            pass
+        return None
 
     def add_wireguard_peer(
         self,

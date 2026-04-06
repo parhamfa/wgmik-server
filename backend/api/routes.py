@@ -8,7 +8,7 @@ from ..db import get_db, Base, engine, SessionLocal
 from ..settings import settings
 from ..scheduler import update_scheduler_interval
 from ..security import SecretBox
-from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User, FairUsageRule, FairUsageAssignment, FairUsageState
+from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User, FairUsageRule, FairUsageAssignment, FairUsageState, FairUsageTier
 from ..auth import verify_password, get_password_hash, create_access_token, verify_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from ..routeros.factory import make_client
 from ..usage_maintenance import (
@@ -16,17 +16,25 @@ from ..usage_maintenance import (
     is_usage_maintenance_running,
     start_usage_maintenance,
 )
-from ..fair_usage_sync import apply_fair_usage_policy, FairUsageRouterError, get_effective_fair_usage_rule, peer_ids_with_applicable_fair_usage
+from ..fair_usage_sync import (
+    apply_fair_usage_policy,
+    FairUsageRouterError,
+    peer_ids_with_applicable_fair_usage,
+)
 from ..fair_usage_usage import (
     SCOPE_UNIT_MAX,
     app_zoneinfo,
-    compute_next_reset_utc_for_rule,
     format_scope_label,
     normalize_scope_period,
-    peer_scope_usage_for_rule,
     sync_legacy_time_scope_field,
 )
+from ..fair_usage_peer_status_dto import (
+    FairUsagePeerStatusDTO,
+    build_fair_usage_peer_status_dto,
+)
+from ..fair_usage_tiers import ordered_tiers_for_rule, replace_rule_tiers
 from ..usage_bucketing import aggregate_rows_to_local_buckets, aggregate_router_rows_to_local_buckets
+from ..wg_export_prefs import merge_wgmik_endpoint_in_comment, parse_wgmik_endpoint_from_comment
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 import traceback
@@ -35,6 +43,8 @@ import os
 from zoneinfo import ZoneInfo
 import base64
 import json
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import x25519
 
 try:
     import psutil  # type: ignore
@@ -568,6 +578,8 @@ class SettingsDTO(BaseModel):
     dashboard_selected_router_ids: List[int]
     dashboard_filter_status: str
     dashboard_sort_by: str
+    dashboard_time_frame_today: bool = False
+    peer_time_frame_today: bool = False
     peer_refresh_seconds: int
     raw_sample_retention_hours: int
     minute_rollup_retention_days: int
@@ -645,6 +657,8 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
         "dashboard_selected_router_ids": [],
         "dashboard_filter_status": "all",
         "dashboard_sort_by": "created",
+        "dashboard_time_frame_today": False,
+        "peer_time_frame_today": False,
         "peer_refresh_seconds": 30,
         "raw_sample_retention_hours": 24,
         "minute_rollup_retention_days": 90,
@@ -664,6 +678,8 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
         "dashboard_selected_router_ids",
         "dashboard_filter_status",
         "dashboard_sort_by",
+        "dashboard_time_frame_today",
+        "peer_time_frame_today",
         "peer_refresh_seconds",
         "raw_sample_retention_hours",
         "minute_rollup_retention_days",
@@ -693,7 +709,12 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
                     data[key] = [rid for rid in _normalize_router_ids(parsed) or []]
             except Exception:
                 data[key] = []
-        elif key in ("show_kind_pills", "show_hw_stats"):
+        elif key in (
+            "show_kind_pills",
+            "show_hw_stats",
+            "dashboard_time_frame_today",
+            "peer_time_frame_today",
+        ):
             data[key] = kv.value.lower() == "true"
         else:
             data[key] = kv.value
@@ -742,6 +763,8 @@ def update_settings(dto: SettingsDTO, db: Session = Depends(get_db), current_use
         "dashboard_selected_router_ids": json.dumps(_normalize_router_ids(dto.dashboard_selected_router_ids) or []),
         "dashboard_filter_status": dto.dashboard_filter_status,
         "dashboard_sort_by": dto.dashboard_sort_by,
+        "dashboard_time_frame_today": str(dto.dashboard_time_frame_today).lower(),
+        "peer_time_frame_today": str(dto.peer_time_frame_today).lower(),
         "peer_refresh_seconds": str(dto.peer_refresh_seconds),
         "raw_sample_retention_hours": str(max(1, min(24 * 365, int(dto.raw_sample_retention_hours)))),
         "minute_rollup_retention_days": str(max(1, min(3650, int(dto.minute_rollup_retention_days)))),
@@ -1161,6 +1184,182 @@ def _is_valid_wg_private_key_b64(s: str) -> bool:
         return False
 
 
+def _generate_wg_keypair_b64() -> tuple[str, str]:
+    private_key = x25519.X25519PrivateKey.generate()
+    private_raw = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_raw = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return (
+        base64.b64encode(private_raw).decode("utf-8"),
+        base64.b64encode(public_raw).decode("utf-8"),
+    )
+
+
+def _store_peer_private_key(db: Session, peer_id: int, private_key: str) -> None:
+    pk = (private_key or "").strip()
+    if not _is_valid_wg_private_key_b64(pk):
+        raise HTTPException(status_code=400, detail="invalid private_key (must be base64 32 bytes)")
+    box = SecretBox(settings.secret_key)
+    token = box.encrypt(pk)
+    kv = db.get(SettingsKV, f"peer_private_key:{peer_id}") or SettingsKV(key=f"peer_private_key:{peer_id}", value="")
+    kv.value = token
+    db.add(kv)
+
+
+def _store_peer_preshared_key(db: Session, peer_id: int, preshared_key: str) -> None:
+    pk = (preshared_key or "").strip()
+    if not _is_valid_wg_private_key_b64(pk):
+        raise HTTPException(status_code=400, detail="invalid preshared_key (must be base64 32 bytes)")
+    box = SecretBox(settings.secret_key)
+    token = box.encrypt(pk)
+    kv = db.get(SettingsKV, f"peer_preshared_key:{peer_id}") or SettingsKV(key=f"peer_preshared_key:{peer_id}", value="")
+    kv.value = token
+    db.add(kv)
+
+
+def _get_peer_preshared_key_decrypted(db: Session, peer_id: int) -> Optional[str]:
+    kv = db.get(SettingsKV, f"peer_preshared_key:{peer_id}")
+    if kv and (kv.value or "").strip():
+        box = SecretBox(settings.secret_key)
+        dec = box.decrypt(kv.value)
+        if dec:
+            return dec
+    return None
+
+
+class PeerClientExportPrefsOutDTO(BaseModel):
+    config_name: str = ""
+    custom_endpoint: str = ""
+    preshared_key: Optional[str] = None
+
+
+class PeerClientExportPrefsPatchDTO(BaseModel):
+    config_name: Optional[str] = None
+    custom_endpoint: Optional[str] = None
+    preshared_key: Optional[str] = None
+
+
+def _build_client_export_prefs_out(db: Session, row: Peer) -> PeerClientExportPrefsOutDTO:
+    kv_name = db.get(SettingsKV, f"peer_export_config_name:{row.id}")
+    kv_ep = db.get(SettingsKV, f"peer_export_endpoint:{row.id}")
+    name = (kv_name.value or "").strip() if kv_name and kv_name.value else ""
+    ep = (kv_ep.value or "").strip() if kv_ep and kv_ep.value else ""
+    if not ep:
+        parsed = parse_wgmik_endpoint_from_comment(row.comment)
+        if parsed:
+            ep = parsed
+    psk = _get_peer_preshared_key_decrypted(db, row.id)
+    if psk is None and row.router_id and row.ros_id:
+        router = db.get(Router, row.router_id)
+        if router:
+            try:
+                client = make_client(router)
+                pk = client.get_wireguard_peer_preshared_key(row.interface, row.ros_id)
+                if pk:
+                    box = SecretBox(settings.secret_key)
+                    token = box.encrypt(pk)
+                    kv2 = db.get(SettingsKV, f"peer_preshared_key:{row.id}") or SettingsKV(
+                        key=f"peer_preshared_key:{row.id}", value=""
+                    )
+                    kv2.value = token
+                    db.add(kv2)
+                    db.commit()
+                    psk = pk
+            except Exception:
+                pass
+    return PeerClientExportPrefsOutDTO(config_name=name, custom_endpoint=ep, preshared_key=psk)
+
+
+@router.get("/peers/{peer_id}/client_export_prefs", response_model=PeerClientExportPrefsOutDTO)
+def get_peer_client_export_prefs(peer_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    row = db.get(Peer, peer_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="peer not found")
+    return _build_client_export_prefs_out(db, row)
+
+
+@router.patch("/peers/{peer_id}/client_export_prefs", response_model=PeerClientExportPrefsOutDTO)
+def patch_peer_client_export_prefs(
+    peer_id: int,
+    dto: PeerClientExportPrefsPatchDTO,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    row = db.get(Peer, peer_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="peer not found")
+    router = db.get(Router, row.router_id) if row.router_id else None
+    client = make_client(router) if router and row.ros_id else None
+
+    if dto.config_name is not None:
+        key = f"peer_export_config_name:{peer_id}"
+        if dto.config_name.strip() == "":
+            kv = db.get(SettingsKV, key)
+            if kv:
+                db.delete(kv)
+        else:
+            kv = db.get(SettingsKV, key) or SettingsKV(key=key, value="")
+            kv.value = dto.config_name.strip()
+            db.add(kv)
+
+    if dto.custom_endpoint is not None:
+        ep_st = dto.custom_endpoint.strip()
+        key_ep = f"peer_export_endpoint:{peer_id}"
+        if ep_st == "":
+            kv = db.get(SettingsKV, key_ep)
+            if kv:
+                db.delete(kv)
+        else:
+            kv = db.get(SettingsKV, key_ep) or SettingsKV(key=key_ep, value="")
+            kv.value = ep_st
+            db.add(kv)
+        if client:
+            try:
+                client.set_peer_client_endpoint(row.interface, row.ros_id, ep_st or None)
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"router client-endpoint update failed: {e}")
+        # Strip legacy |WGMIK:ep=… suffix from comment (older app versions used comment as a side channel).
+        cleaned = merge_wgmik_endpoint_in_comment(row.comment, "")
+        if cleaned != (row.comment or ""):
+            row.comment = cleaned
+            if client:
+                try:
+                    client.set_peer_comment(row.interface, row.ros_id, cleaned)
+                except Exception as e:
+                    raise HTTPException(status_code=502, detail=f"router comment cleanup failed: {e}")
+
+    if dto.preshared_key is not None:
+        pk = dto.preshared_key.strip()
+        if pk == "":
+            kv = db.get(SettingsKV, f"peer_preshared_key:{peer_id}")
+            if kv:
+                db.delete(kv)
+            if client:
+                try:
+                    client.set_peer_preshared_key(row.interface, row.ros_id, None)
+                except Exception as e:
+                    raise HTTPException(status_code=502, detail=f"router preshared-key clear failed: {e}")
+        else:
+            if not _is_valid_wg_private_key_b64(pk):
+                raise HTTPException(status_code=400, detail="invalid preshared_key (must be base64 32 bytes)")
+            _store_peer_preshared_key(db, peer_id, pk)
+            if client:
+                try:
+                    client.set_peer_preshared_key(row.interface, row.ros_id, pk)
+                except Exception as e:
+                    raise HTTPException(status_code=502, detail=f"router preshared-key update failed: {e}")
+
+    db.commit()
+    db.refresh(row)
+    return _build_client_export_prefs_out(db, row)
+
+
 @router.post("/routers/{router_id}/peers/add", response_model=PeerListDTO)
 def create_router_peer(router_id: int, dto: PeerCreateRouterDTO, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     router = db.get(Router, router_id)
@@ -1312,15 +1511,54 @@ def patch_peer_client_private_key(peer_id: int, dto: PeerPrivateKeyUpdateDTO, db
             db.commit()
         return PeerPrivateKeyDTO(private_key=None)
 
-    if not _is_valid_wg_private_key_b64(pk):
-        raise HTTPException(status_code=400, detail="invalid private_key (must be base64 32 bytes)")
-    box = SecretBox(settings.secret_key)
-    token = box.encrypt(pk)
-    kv = db.get(SettingsKV, f"peer_private_key:{peer_id}") or SettingsKV(key=f"peer_private_key:{peer_id}", value="")
-    kv.value = token
-    db.add(kv)
+    _store_peer_private_key(db, peer_id, pk)
     db.commit()
     return PeerPrivateKeyDTO(private_key=pk)
+
+
+class PeerRenewKeysDTO(BaseModel):
+    peer: PeerListDTO
+    private_key: str
+
+
+@router.post("/peers/{peer_id}/renew_keys", response_model=PeerRenewKeysDTO)
+def renew_peer_keys(peer_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    row = db.get(Peer, peer_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="peer not found")
+    router = db.get(Router, row.router_id) if row.router_id else None
+    if not router or not row.ros_id:
+        raise HTTPException(status_code=400, detail="peer is not backed by a router")
+
+    private_key, public_key = _generate_wg_keypair_b64()
+    conflict = db.query(Peer.id).filter(
+        Peer.router_id == row.router_id,
+        Peer.interface == row.interface,
+        Peer.public_key == public_key,
+        Peer.id != row.id,
+    ).first()
+    if conflict:
+        raise HTTPException(status_code=409, detail="generated public_key already exists on this interface")
+
+    client = make_client(router)
+    try:
+        client.set_peer_keys(row.interface, row.ros_id, public_key, private_key)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"router key renewal failed: {e}")
+
+    row.public_key = public_key
+    _store_peer_private_key(db, row.id, private_key)
+    db.add(
+        Action(
+            peer_id=row.id,
+            ts=datetime.now(timezone.utc),
+            action="renew_keys",
+            note="generated new WireGuard keypair via API",
+        )
+    )
+    db.commit()
+    db.refresh(row)
+    return PeerRenewKeysDTO(peer=PeerListDTO.model_validate(row), private_key=private_key)
 
 
 @router.post("/routers/{router_id}/test")
@@ -1387,6 +1625,25 @@ def sync_router(router_id: int, db: Session = Depends(get_db), current_user: Use
             if (row.allowed_address or "") != (lp.allowed_address or ""):
                 row.allowed_address = lp.allowed_address or ""
                 changed = True
+            if (row.comment or "") != (lp.comment or ""):
+                row.comment = lp.comment or ""
+                changed = True
+            cep = (getattr(lp, "client_endpoint", "") or "").strip()
+            if cep:
+                kv_ep = db.get(SettingsKV, f"peer_export_endpoint:{row.id}") or SettingsKV(
+                    key=f"peer_export_endpoint:{row.id}", value=""
+                )
+                if (kv_ep.value or "").strip() != cep:
+                    kv_ep.value = cep
+                    db.add(kv_ep)
+            else:
+                ep = parse_wgmik_endpoint_from_comment(row.comment)
+                if ep:
+                    kv_ep = db.get(SettingsKV, f"peer_export_endpoint:{row.id}") or SettingsKV(
+                        key=f"peer_export_endpoint:{row.id}", value=""
+                    )
+                    kv_ep.value = ep
+                    db.add(kv_ep)
             if bool(row.disabled) != bool(lp.disabled):
                 row.disabled = bool(lp.disabled)
                 changed = True
@@ -1536,9 +1793,15 @@ def delete_peer(peer_id: int, skip_router: bool = False, db: Session = Depends(g
             raise HTTPException(status_code=502, detail=f"router delete failed: {e}")
             
     # Remove any stored client secret material for this peer.
-    kv = db.get(SettingsKV, f"peer_private_key:{peer_id}")
-    if kv:
-        db.delete(kv)
+    for suffix in (
+        f"peer_private_key:{peer_id}",
+        f"peer_preshared_key:{peer_id}",
+        f"peer_export_config_name:{peer_id}",
+        f"peer_export_endpoint:{peer_id}",
+    ):
+        kv = db.get(SettingsKV, suffix)
+        if kv:
+            db.delete(kv)
 
     db.delete(row)
     db.commit()
@@ -1655,8 +1918,8 @@ class UsagePointDTO(BaseModel):
     tx: int
 
 
-@router.get("/peers/{peer_id}/usage", response_model=List[UsagePointDTO])
-def get_peer_usage(
+def compute_peer_usage_points(
+    db: Session,
     peer_id: int,
     window: str = "daily",
     seconds: Optional[int] = None,
@@ -1664,13 +1927,9 @@ def get_peer_usage(
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
     all_time: bool = False,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
+) -> List[UsagePointDTO]:
     """
-    window=daily: aggregate per day from UsageDaily (existing behaviour).
-    window=raw: aggregate minute rollups for the requested window. If minute rollups
-    do not exist yet for the window, fall back to raw samples.
+    Same logic as GET /peers/{id}/usage — shared with Telegram usage-chart screenshots.
     """
     start_utc, end_utc = _normalize_time_range(start, end)
 
@@ -1759,6 +2018,35 @@ def get_peer_usage(
         ]
 
     raise HTTPException(status_code=400, detail="window must be 'daily' or 'raw'")
+
+
+@router.get("/peers/{peer_id}/usage", response_model=List[UsagePointDTO])
+def get_peer_usage(
+    peer_id: int,
+    window: str = "daily",
+    seconds: Optional[int] = None,
+    interval: Optional[int] = None,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+    all_time: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    window=daily: aggregate per day from UsageDaily (existing behaviour).
+    window=raw: aggregate minute rollups for the requested window. If minute rollups
+    do not exist yet for the window, fall back to raw samples.
+    """
+    return compute_peer_usage_points(
+        db,
+        peer_id,
+        window,
+        seconds=seconds,
+        interval=interval,
+        start=start,
+        end=end,
+        all_time=all_time,
+    )
 
 
 
@@ -2400,6 +2688,54 @@ def _apply_legacy_time_scope_to_scope(
     return scope_count, scope_unit
 
 
+class FairUsageTierInputDTO(BaseModel):
+    threshold_bytes: int
+    name: str = ""
+    throttle_download_kbps: int = 1000
+    throttle_upload_kbps: int = 1000
+    sort_order: int = 0
+
+
+class FairUsageTierDTO(BaseModel):
+    id: int
+    sort_order: int
+    threshold_bytes: int
+    name: str = ""
+    throttle_download_kbps: int
+    throttle_upload_kbps: int
+
+
+def _validate_tier_list(tiers: List[FairUsageTierInputDTO]) -> None:
+    if not tiers:
+        raise HTTPException(status_code=400, detail="tiered rules require at least one tier")
+    ths = [t.threshold_bytes for t in tiers]
+    if any(x < 0 for x in ths):
+        raise HTTPException(status_code=400, detail="tier thresholds must be >= 0")
+    if len(set(ths)) != len(ths):
+        raise HTTPException(status_code=400, detail="duplicate tier thresholds are not allowed")
+
+
+def _persist_rule_tiers(db: Session, rule_id: int, tiered: bool, tiers_in: Optional[List[FairUsageTierInputDTO]]) -> None:
+    if tiered and tiers_in:
+        _validate_tier_list(tiers_in)
+        ordered = sorted(tiers_in, key=lambda x: (x.threshold_bytes, x.sort_order))
+        rows = [
+            (i, t.threshold_bytes, t.name or "", t.throttle_download_kbps, t.throttle_upload_kbps)
+            for i, t in enumerate(ordered)
+        ]
+        replace_rule_tiers(db, rule_id, rows)
+    else:
+        db.query(FairUsageTier).filter(FairUsageTier.rule_id == rule_id).delete()
+
+
+def _mirror_rule_caps_from_tiers(rule: FairUsageRule, tiers_in: List[FairUsageTierInputDTO]) -> None:
+    ordered = sorted(tiers_in, key=lambda x: x.threshold_bytes)
+    top = ordered[-1]
+    rule.download_quota_bytes = top.threshold_bytes
+    rule.throttle_download_kbps = top.throttle_download_kbps
+    rule.throttle_upload_kbps = top.throttle_upload_kbps
+
+
 class FairUsageRuleCreateDTO(BaseModel):
     name: str
     description: str = ""
@@ -2415,6 +2751,9 @@ class FairUsageRuleCreateDTO(BaseModel):
     router_id: Optional[int] = None
     peer_ids: Optional[List[int]] = None
     enabled: bool = True
+    #: When True with non-empty ``tiers``, one combined-usage ladder per period (soft → hard on one meter).
+    tiered: bool = False
+    tiers: Optional[List[FairUsageTierInputDTO]] = None
 
 
 class FairUsageRuleUpdateDTO(BaseModel):
@@ -2431,6 +2770,8 @@ class FairUsageRuleUpdateDTO(BaseModel):
     scope_type: Optional[str] = None
     router_id: Optional[int] = None
     enabled: Optional[bool] = None
+    tiered: Optional[bool] = None
+    tiers: Optional[List[FairUsageTierInputDTO]] = None
 
 
 class FairUsageAssignedPeerDTO(BaseModel):
@@ -2457,31 +2798,12 @@ class FairUsageRuleDTO(BaseModel):
     scope_type: str
     router_id: Optional[int]
     enabled: bool
+    tiered: bool = False
+    tiers: List[FairUsageTierDTO] = []
     created_at: str
     updated_at: str
     assigned_peer_count: int = 0
     assigned_peers: List[FairUsageAssignedPeerDTO] = []
-
-
-class FairUsagePeerStatusDTO(BaseModel):
-    peer_id: int
-    rule_id: Optional[int] = None
-    rule_name: Optional[str] = None
-    quota_mode: Optional[str] = None
-    download_quota_bytes: int = 0
-    upload_quota_bytes: Optional[int] = None
-    throttle_download_kbps: int = 0
-    throttle_upload_kbps: int = 0
-    time_scope: Optional[str] = None
-    scope_period_count: int = 1
-    scope_period_unit: str = "month"
-    scope_label: str = "Monthly"
-    scope_type: Optional[str] = None
-    used_rx: int = 0
-    used_tx: int = 0
-    throttled: bool = False
-    throttled_at: Optional[str] = None
-    next_reset: Optional[str] = None
 
 
 def _fu_rule_to_dto(rule: FairUsageRule, db: Session, include_peers: bool = False) -> FairUsageRuleDTO:
@@ -2496,6 +2818,19 @@ def _fu_rule_to_dto(rule: FairUsageRule, db: Session, include_peers: bool = Fals
                 router_id=p.router_id, disabled=p.disabled,
             ))
     cnt, unit = normalize_scope_period(rule)
+    tier_out: List[FairUsageTierDTO] = []
+    if rule.tiered:
+        for t in ordered_tiers_for_rule(db, rule.id):
+            tier_out.append(
+                FairUsageTierDTO(
+                    id=t.id,
+                    sort_order=t.sort_order,
+                    threshold_bytes=t.threshold_bytes,
+                    name=t.name or "",
+                    throttle_download_kbps=t.throttle_download_kbps,
+                    throttle_upload_kbps=t.throttle_upload_kbps,
+                )
+            )
     return FairUsageRuleDTO(
         id=rule.id,
         name=rule.name,
@@ -2512,16 +2847,13 @@ def _fu_rule_to_dto(rule: FairUsageRule, db: Session, include_peers: bool = Fals
         scope_type=rule.scope_type,
         router_id=rule.router_id,
         enabled=rule.enabled,
+        tiered=rule.tiered,
+        tiers=tier_out,
         created_at=rule.created_at.replace(tzinfo=timezone.utc).isoformat() if rule.created_at else "",
         updated_at=rule.updated_at.replace(tzinfo=timezone.utc).isoformat() if rule.updated_at else "",
         assigned_peer_count=len(assignments),
         assigned_peers=peers_out,
     )
-
-
-def _get_peer_scope_usage(peer_id: int, rule: FairUsageRule, db: Session) -> tuple[int, int]:
-    """Return (used_rx, used_tx) for the peer in the current fair-usage period."""
-    return peer_scope_usage_for_rule(peer_id, rule, db)
 
 
 @router.post("/fair-usage/rules", response_model=FairUsageRuleDTO)
@@ -2536,24 +2868,42 @@ def create_fair_usage_rule(dto: FairUsageRuleCreateDTO, db: Session = Depends(ge
     sc, su = _apply_legacy_time_scope_to_scope(dto.scope_period_count, dto.scope_period_unit, dto.time_scope)
     _validate_fair_usage_scope(sc, su)
 
+    want_tiered = bool(dto.tiered and dto.tiers and len(dto.tiers) >= 1)
+    if want_tiered:
+        if dto.quota_mode != "combined":
+            raise HTTPException(status_code=400, detail="tiered rules require combined quota mode")
+        _validate_tier_list(dto.tiers)
+        top = max(dto.tiers, key=lambda x: x.threshold_bytes)
+        dl_bytes = top.threshold_bytes
+        qm = "combined"
+        up_bytes = None
+        tdl, tul = top.throttle_download_kbps, top.throttle_upload_kbps
+    else:
+        dl_bytes = dto.download_quota_bytes
+        qm = dto.quota_mode
+        up_bytes = dto.upload_quota_bytes if dto.quota_mode == "independent" else None
+        tdl, tul = dto.throttle_download_kbps, dto.throttle_upload_kbps
+
     rule = FairUsageRule(
         name=dto.name,
         description=dto.description,
-        quota_mode=dto.quota_mode,
-        download_quota_bytes=dto.download_quota_bytes,
-        upload_quota_bytes=dto.upload_quota_bytes if dto.quota_mode == "independent" else None,
-        throttle_download_kbps=dto.throttle_download_kbps,
-        throttle_upload_kbps=dto.throttle_upload_kbps,
+        quota_mode=qm,
+        download_quota_bytes=dl_bytes,
+        upload_quota_bytes=up_bytes,
+        throttle_download_kbps=tdl,
+        throttle_upload_kbps=tul,
         scope_period_count=sc,
         scope_period_unit=su,
         time_scope="monthly",
         scope_type=dto.scope_type,
         router_id=dto.router_id if dto.scope_type == "router" else None,
         enabled=dto.enabled,
+        tiered=want_tiered,
     )
     sync_legacy_time_scope_field(rule)
     db.add(rule)
     db.flush()
+    _persist_rule_tiers(db, rule.id, want_tiered, dto.tiers if want_tiered else None)
 
     if dto.scope_type == "peer" and dto.peer_ids:
         for pid in dto.peer_ids:
@@ -2593,6 +2943,8 @@ def update_fair_usage_rule(rule_id: int, dto: FairUsageRuleUpdateDTO, db: Sessio
     if dto.quota_mode is not None:
         if dto.quota_mode not in ("combined", "independent"):
             raise HTTPException(status_code=400, detail="quota_mode must be 'combined' or 'independent'")
+        if rule.tiered and dto.quota_mode != "combined":
+            raise HTTPException(status_code=400, detail="tiered rules must use combined quota mode")
         rule.quota_mode = dto.quota_mode
     if dto.download_quota_bytes is not None:
         rule.download_quota_bytes = dto.download_quota_bytes
@@ -2620,6 +2972,24 @@ def update_fair_usage_rule(rule_id: int, dto: FairUsageRuleUpdateDTO, db: Sessio
         rule.router_id = dto.router_id
     if dto.enabled is not None:
         rule.enabled = dto.enabled
+
+    if dto.tiers is not None:
+        if len(dto.tiers) >= 1:
+            qm = dto.quota_mode if dto.quota_mode is not None else rule.quota_mode
+            if qm != "combined":
+                raise HTTPException(status_code=400, detail="tiered rules require combined quota mode")
+            rule.tiered = True
+            rule.quota_mode = "combined"
+            rule.upload_quota_bytes = None
+            _mirror_rule_caps_from_tiers(rule, dto.tiers)
+            _persist_rule_tiers(db, rule.id, True, dto.tiers)
+        else:
+            rule.tiered = False
+            _persist_rule_tiers(db, rule.id, False, None)
+    elif dto.tiered is False:
+        rule.tiered = False
+        _persist_rule_tiers(db, rule.id, False, None)
+
     rule.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(rule)
@@ -2707,44 +3077,7 @@ def get_fair_usage_peer_status(peer_id: int, db: Session = Depends(get_db), curr
     peer = db.get(Peer, peer_id)
     if not peer:
         raise HTTPException(status_code=404, detail="peer not found")
-
-    rule = get_effective_fair_usage_rule(peer, db)
-    if not rule:
-        return FairUsagePeerStatusDTO(peer_id=peer_id)
-
-    used_rx, used_tx = _get_peer_scope_usage(peer_id, rule, db)
-    cnt, unit = normalize_scope_period(rule)
-    next_reset = compute_next_reset_utc_for_rule(rule, db)
-
-    state = db.query(FairUsageState).filter(FairUsageState.peer_id == peer_id).first()
-    throttled = state.throttled if state else False
-    throttled_at = None
-    if state and state.throttled_at:
-        t = state.throttled_at
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-        throttled_at = t.isoformat()
-
-    return FairUsagePeerStatusDTO(
-        peer_id=peer_id,
-        rule_id=rule.id,
-        rule_name=rule.name,
-        quota_mode=rule.quota_mode,
-        download_quota_bytes=rule.download_quota_bytes,
-        upload_quota_bytes=rule.upload_quota_bytes,
-        throttle_download_kbps=rule.throttle_download_kbps,
-        throttle_upload_kbps=rule.throttle_upload_kbps,
-        time_scope=rule.time_scope,
-        scope_period_count=cnt,
-        scope_period_unit=unit,
-        scope_label=format_scope_label(cnt, unit),
-        scope_type=rule.scope_type,
-        used_rx=used_rx,
-        used_tx=used_tx,
-        throttled=throttled,
-        throttled_at=throttled_at,
-        next_reset=next_reset.isoformat(),
-    )
+    return build_fair_usage_peer_status_dto(db, peer)
 
 
 @router.post("/fair-usage/peers/{peer_id}/reset")
@@ -2775,6 +3108,7 @@ def reset_fair_usage_peer(peer_id: int, db: Session = Depends(get_db), current_u
 # ── Telegram bot management ─────────────────────────────────────────
 
 from ..models import TelegramUser, TelegramPeerBinding, TelegramSignupToken, TelegramNotificationConfig
+from ..telegram.notifications import USER_NOTIFICATION_EVENT_TYPES, effective_user_notification_enabled
 
 
 class TelegramConfigPayload(BaseModel):
@@ -2953,6 +3287,11 @@ def list_telegram_users(db: Session = Depends(get_db), current_user: User = Depe
             "is_blocked": u.is_blocked,
             "created_at": u.created_at.isoformat() if u.created_at else None,
             "peers": peer_info,
+            "subscribed_notifications": [
+                event_type
+                for event_type in USER_NOTIFICATION_EVENT_TYPES
+                if effective_user_notification_enabled(db, u.id, event_type)
+            ],
         })
     return result
 
@@ -2978,6 +3317,59 @@ def patch_telegram_user(tg_user_db_id: int, payload: TelegramUserPatch, db: Sess
         raise HTTPException(status_code=404, detail="user not found")
     if payload.is_blocked is not None:
         u.is_blocked = payload.is_blocked
+    db.commit()
+    return {"ok": True}
+
+
+class TelegramUserPeersPatch(BaseModel):
+    peer_ids: List[int] = []
+    default_visible: bool = True
+
+
+@router.put("/telegram/users/{tg_user_db_id}/peers")
+def set_telegram_user_peers(
+    tg_user_db_id: int,
+    payload: TelegramUserPeersPatch,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    u = db.get(TelegramUser, tg_user_db_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    wanted: set[int] = set()
+    for pid in payload.peer_ids:
+        try:
+            ipid = int(pid)
+        except Exception:
+            continue
+        if ipid <= 0:
+            continue
+        if db.get(Peer, ipid) is None:
+            continue
+        wanted.add(ipid)
+
+    existing = (
+        db.query(TelegramPeerBinding)
+        .filter(TelegramPeerBinding.telegram_user_id == u.id)
+        .all()
+    )
+    by_peer = {b.peer_id: b for b in existing}
+
+    for b in existing:
+        if b.peer_id not in wanted:
+            db.delete(b)
+
+    for pid in wanted:
+        if pid not in by_peer:
+            db.add(
+                TelegramPeerBinding(
+                    telegram_user_id=u.id,
+                    peer_id=pid,
+                    visible=payload.default_visible,
+                )
+            )
+
     db.commit()
     return {"ok": True}
 
@@ -3066,6 +3458,54 @@ def test_notify(db: Session = Depends(get_db), current_user: User = Depends(get_
     if not admin_id:
         raise HTTPException(status_code=400, detail="Admin chat ID not configured")
     ok = _send_message_sync(admin_id, "WGMik test notification - bot is working!")
+    if not ok:
+        raise HTTPException(status_code=502, detail="Failed to send message. Check bot token and chat ID.")
+    return {"ok": True}
+
+
+@router.post("/telegram/test-notify/{event_type}")
+def test_notify_event(event_type: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from ..telegram.notifications import _get_admin_chat_id, _send_message_sync
+
+    allowed = {
+        "quota_warning_80",
+        "quota_warning_90",
+        "quota_hit",
+        "quota_lifted",
+        "daily_summary",
+        "weekly_summary",
+    }
+    if event_type not in allowed:
+        raise HTTPException(status_code=400, detail="unsupported event type")
+
+    admin_id = _get_admin_chat_id(db)
+    if not admin_id:
+        raise HTTPException(status_code=400, detail="Admin chat ID not configured")
+
+    sample_peer = "peer-test"
+    sample_rule = "Daily"
+    sample_used = "1.2 GB"
+    sample_total = "4.0 GB"
+    if event_type == "quota_warning_80":
+        text = f"[Admin][Test] Warning: peer \"{sample_peer}\" — rule \"{sample_rule}\" — 80% of quota ({sample_used} / {sample_total})."
+    elif event_type == "quota_warning_90":
+        text = f"[Admin][Test] Warning: peer \"{sample_peer}\" — rule \"{sample_rule}\" — 90% of quota ({sample_used} / {sample_total})."
+    elif event_type == "quota_hit":
+        text = (
+            "[Admin][Test] Throttle notification sample\n\n"
+            f"Rule: {sample_rule}\n"
+            "Tier: (example) Soft step\n"
+            "⬇️ 2 Mbps · ⬆️ 1 Mbps\n"
+            f"Usage: 98% ({sample_used} / {sample_total})"
+        )
+    elif event_type == "quota_lifted":
+        text = f"[Admin][Test] Peer \"{sample_peer}\" is no longer throttled. Quota has been reset."
+    elif event_type == "daily_summary":
+        text = "[Admin][Test] Daily Summary\n  peer-test (@user): ↓1.2 GB ↑300 MB"
+    else:  # weekly_summary
+        text = "[Admin][Test] Weekly Summary\n  peer-test (@user): ↓6.8 GB ↑1.5 GB"
+
+    ok = _send_message_sync(admin_id, text)
     if not ok:
         raise HTTPException(status_code=502, detail="Failed to send message. Check bot token and chat ID.")
     return {"ok": True}

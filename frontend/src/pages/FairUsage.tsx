@@ -11,9 +11,19 @@ import {
   listSavedPeers,
   type FairUsageRuleDTO,
   type FairUsageRuleCreateDTO,
+  type FairUsageTierInputDTO,
   type Router,
   type PeerListDTO,
 } from "../api";
+
+type TierFormRow = {
+  threshold_value: number;
+  threshold_unit: "gb" | "mb";
+  name: string;
+  throttle_download_kbps: number;
+  throttle_upload_kbps: number;
+};
+import { useLooseNumberInput } from "../hooks/useLooseNumberInput";
 
 function Card({ className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) {
   const base = "rounded-3xl overflow-hidden ring-1 ring-gray-200 ring-offset-2 ring-offset-gray-50 bg-white shadow-md hover:shadow-lg transition transform hover:-translate-y-0.5 dark:ring-gray-800 dark:ring-offset-gray-950 dark:bg-gray-900";
@@ -35,10 +45,17 @@ function clampScopeCount(unit: string, count: number): number {
   return Math.max(1, Math.min(cap, Math.floor(count || 1)));
 }
 
+const DEFAULT_TIER_ROWS: TierFormRow[] = [
+  { threshold_value: 3, threshold_unit: "gb", name: "Soft", throttle_download_kbps: 500, throttle_upload_kbps: 500 },
+  { threshold_value: 4, threshold_unit: "gb", name: "Hard", throttle_download_kbps: 300, throttle_upload_kbps: 500 },
+];
+
 const EMPTY_FORM = {
   name: "",
   description: "",
   quota_mode: "combined" as "combined" | "independent",
+  tiered: false,
+  tiers: [...DEFAULT_TIER_ROWS] as TierFormRow[],
   download_value: 50,
   download_unit: "gb" as "gb" | "mb",
   upload_value: 25,
@@ -79,6 +96,35 @@ export default function FairUsagePage() {
   const [assignSearch, setAssignSearch] = React.useState("");
   const [assignSelected, setAssignSelected] = React.useState<number[]>([]);
 
+  const scopeCountInput = useLooseNumberInput(
+    form.scope_period_count,
+    (n) => setForm((f) => ({ ...f, scope_period_count: n })),
+    {
+      emptyFallback: 1,
+      transformOnBlur: (n) => clampScopeCount(form.scope_period_unit, n),
+    },
+  );
+  const downloadValueInput = useLooseNumberInput(
+    form.download_value,
+    (n) => setForm((f) => ({ ...f, download_value: n })),
+    { min: 1, emptyFallback: 1 },
+  );
+  const uploadValueInput = useLooseNumberInput(
+    form.upload_value,
+    (n) => setForm((f) => ({ ...f, upload_value: n })),
+    { min: 1, emptyFallback: 1 },
+  );
+  const throttleDlInput = useLooseNumberInput(
+    form.throttle_download_kbps,
+    (n) => setForm((f) => ({ ...f, throttle_download_kbps: n })),
+    { min: 100, emptyFallback: 100 },
+  );
+  const throttleUlInput = useLooseNumberInput(
+    form.throttle_upload_kbps,
+    (n) => setForm((f) => ({ ...f, throttle_upload_kbps: n })),
+    { min: 100, emptyFallback: 100 },
+  );
+
   const load = React.useCallback(async () => {
     try {
       const [r, rt, p] = await Promise.all([listFairUsageRules(), listRouters(), listSavedPeers()]);
@@ -97,23 +143,56 @@ export default function FairUsagePage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!form.name.trim()) { setErr("Rule name is required"); return; }
+    if (form.tiered) {
+      if (form.tiers.length < 1) { setErr("Add at least one usage tier"); return; }
+      const ths = form.tiers.map((t) => toBytes(Math.max(1, t.threshold_value), t.threshold_unit));
+      if (new Set(ths).size !== ths.length) { setErr("Tier thresholds must be unique"); return; }
+    }
     setErr("");
     setSaving(true);
     try {
+      const sortedTiers = form.tiered
+        ? [...form.tiers].sort(
+            (a, b) =>
+              toBytes(Math.max(1, a.threshold_value), a.threshold_unit) -
+              toBytes(Math.max(1, b.threshold_value), b.threshold_unit),
+          )
+        : [];
+      const top = sortedTiers[sortedTiers.length - 1];
+      const tierPayload: FairUsageTierInputDTO[] | undefined = form.tiered
+        ? form.tiers.map((t, i) => ({
+            sort_order: i,
+            threshold_bytes: toBytes(Math.max(1, t.threshold_value), t.threshold_unit),
+            name: t.name.trim(),
+            throttle_download_kbps: Math.max(100, Math.round(t.throttle_download_kbps)),
+            throttle_upload_kbps: Math.max(100, Math.round(t.throttle_upload_kbps)),
+          }))
+        : undefined;
+      const maxTierBytes =
+        form.tiered && form.tiers.length > 0
+          ? Math.max(...form.tiers.map((t) => toBytes(Math.max(1, t.threshold_value), t.threshold_unit)))
+          : toBytes(Math.max(1, form.download_value), form.download_unit);
+
       const dto: FairUsageRuleCreateDTO = {
         name: form.name.trim(),
         description: form.description.trim(),
-        quota_mode: form.quota_mode,
-        download_quota_bytes: toBytes(form.download_value, form.download_unit),
-        upload_quota_bytes: form.quota_mode === "independent" ? toBytes(form.upload_value, form.upload_unit) : null,
-        throttle_download_kbps: form.throttle_download_kbps,
-        throttle_upload_kbps: form.throttle_upload_kbps,
+        quota_mode: form.tiered ? "combined" : form.quota_mode,
+        download_quota_bytes: maxTierBytes,
+        upload_quota_bytes: form.tiered ? null : form.quota_mode === "independent" ? toBytes(Math.max(1, form.upload_value), form.upload_unit) : null,
+        throttle_download_kbps: form.tiered && top
+          ? Math.max(100, Math.round(top.throttle_download_kbps))
+          : Math.max(100, Math.round(form.throttle_download_kbps)),
+        throttle_upload_kbps: form.tiered && top
+          ? Math.max(100, Math.round(top.throttle_upload_kbps))
+          : Math.max(100, Math.round(form.throttle_upload_kbps)),
         scope_period_count: clampScopeCount(form.scope_period_unit, form.scope_period_count),
         scope_period_unit: form.scope_period_unit,
         scope_type: form.scope_type,
         router_id: form.scope_type === "router" ? form.router_id : null,
         peer_ids: form.scope_type === "peer" ? form.peer_ids : [],
         enabled: form.enabled,
+        tiered: form.tiered,
+        tiers: editingId && !form.tiered ? [] : form.tiered ? tierPayload : undefined,
       };
       if (editingId) {
         await updateFairUsageRule(editingId, dto);
@@ -133,10 +212,28 @@ export default function FairUsagePage() {
   const startEdit = (rule: FairUsageRuleDTO) => {
     const dl = fromBytes(rule.download_quota_bytes);
     const ul = rule.upload_quota_bytes ? fromBytes(rule.upload_quota_bytes) : { value: 25, unit: "gb" as const };
+    const tiered = !!(rule.tiered && rule.tiers?.length);
+    const tiers: TierFormRow[] =
+      tiered && rule.tiers?.length
+        ? [...rule.tiers]
+            .sort((a, b) => a.threshold_bytes - b.threshold_bytes)
+            .map((t) => {
+              const th = fromBytes(t.threshold_bytes);
+              return {
+                threshold_value: th.value,
+                threshold_unit: th.unit,
+                name: t.name || "",
+                throttle_download_kbps: t.throttle_download_kbps,
+                throttle_upload_kbps: t.throttle_upload_kbps,
+              };
+            })
+        : [...DEFAULT_TIER_ROWS];
     setForm({
       name: rule.name,
       description: rule.description,
       quota_mode: rule.quota_mode as "combined" | "independent",
+      tiered,
+      tiers,
       download_value: dl.value,
       download_unit: dl.unit,
       upload_value: ul.value,
@@ -278,10 +375,41 @@ export default function FairUsagePage() {
                       Combined
                     </label>
                     <label className="inline-flex items-center gap-1.5 text-sm text-gray-700 dark:text-gray-200 cursor-pointer">
-                      <input type="radio" name="quota_mode" checked={form.quota_mode === "independent"} onChange={() => setForm(f => ({ ...f, quota_mode: "independent" }))} className="text-gray-900 dark:text-gray-100" />
+                      <input
+                        type="radio"
+                        name="quota_mode"
+                        checked={form.quota_mode === "independent"}
+                        disabled={form.tiered}
+                        onChange={() => setForm(f => ({ ...f, quota_mode: "independent" }))}
+                        className="text-gray-900 dark:text-gray-100"
+                      />
                       Separate
                     </label>
                   </div>
+                </div>
+                <div className="grid gap-1 md:col-span-2">
+                  <label className="inline-flex items-start gap-2 text-sm text-gray-700 dark:text-gray-200 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={form.tiered}
+                      onChange={(e) => {
+                        const t = e.target.checked;
+                        setForm((f) => ({
+                          ...f,
+                          tiered: t,
+                          quota_mode: t ? "combined" : f.quota_mode,
+                          tiers: t && f.tiers.length === 0 ? [...DEFAULT_TIER_ROWS] : f.tiers,
+                        }));
+                      }}
+                      className="rounded border-gray-300 dark:border-gray-700 mt-0.5"
+                    />
+                    <span>
+                      <span className="font-medium">Tiered ladder</span>
+                      <span className="block text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">
+                        One combined usage meter per period. Each step sets the throttle from its threshold upward until a higher threshold applies.
+                      </span>
+                    </span>
+                  </label>
                 </div>
                 <div className="grid gap-1">
                   <label className="text-xs text-gray-500 dark:text-gray-400">Time scope</label>
@@ -291,14 +419,8 @@ export default function FairUsagePage() {
                       type="number"
                       min={1}
                       max={SCOPE_UNIT_MAX[form.scope_period_unit] ?? 24}
-                      value={form.scope_period_count}
-                      onChange={e =>
-                        setForm(f => ({
-                          ...f,
-                          scope_period_count: clampScopeCount(f.scope_period_unit, Number(e.target.value || 1)),
-                        }))
-                      }
                       className="w-20 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                      {...scopeCountInput}
                     />
                     <select
                       value={form.scope_period_unit}
@@ -322,6 +444,142 @@ export default function FairUsagePage() {
                 </div>
               </div>
 
+              {form.tiered && (
+                <div className="grid gap-3 rounded-xl border border-indigo-200/60 dark:border-indigo-500/30 bg-indigo-50/40 dark:bg-indigo-950/20 p-4">
+                  <div className="text-xs font-medium text-indigo-900 dark:text-indigo-200">Tiers (ascending thresholds)</div>
+                  {form.tiers.map((row, idx) => (
+                    <div
+                      key={idx}
+                      className="grid gap-3 md:grid-cols-12 md:items-end border-b border-indigo-100 dark:border-indigo-900/40 pb-3 last:border-0 last:pb-0"
+                    >
+                      <div className="md:col-span-3 grid gap-1">
+                        <label className="text-[11px] text-gray-500 dark:text-gray-400">From usage ≥</label>
+                        <div className="flex gap-2">
+                          <input
+                            type="number"
+                            min={0}
+                            step={0.01}
+                            className="w-20 rounded-lg border border-gray-200 dark:border-gray-800 px-2 py-1.5 text-sm dark:bg-gray-950 dark:text-gray-100"
+                            value={row.threshold_value}
+                            onChange={(e) => {
+                              const v = parseFloat(e.target.value);
+                              setForm((f) => {
+                                const next = [...f.tiers];
+                                next[idx] = { ...next[idx], threshold_value: Number.isFinite(v) ? v : 0 };
+                                return { ...f, tiers: next };
+                              });
+                            }}
+                          />
+                          <select
+                            value={row.threshold_unit}
+                            onChange={(e) => {
+                              const u = e.target.value as "gb" | "mb";
+                              setForm((f) => {
+                                const next = [...f.tiers];
+                                next[idx] = { ...next[idx], threshold_unit: u };
+                                return { ...f, tiers: next };
+                              });
+                            }}
+                            className="rounded-lg border border-gray-200 dark:border-gray-800 px-2 py-1.5 text-sm dark:bg-gray-950 dark:text-gray-100"
+                          >
+                            <option value="gb">GB</option>
+                            <option value="mb">MB</option>
+                          </select>
+                        </div>
+                      </div>
+                      <div className="md:col-span-3 grid gap-1">
+                        <label className="text-[11px] text-gray-500 dark:text-gray-400">Label</label>
+                        <input
+                          value={row.name}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setForm((f) => {
+                              const next = [...f.tiers];
+                              next[idx] = { ...next[idx], name: v };
+                              return { ...f, tiers: next };
+                            });
+                          }}
+                          className="rounded-lg border border-gray-200 dark:border-gray-800 px-2 py-1.5 text-sm dark:bg-gray-950 dark:text-gray-100"
+                          placeholder="e.g. Soft"
+                        />
+                      </div>
+                      <div className="md:col-span-2 grid gap-1">
+                        <label className="text-[11px] text-gray-500 dark:text-gray-400">↓ kbps</label>
+                        <input
+                          type="number"
+                          min={100}
+                          className="rounded-lg border border-gray-200 dark:border-gray-800 px-2 py-1.5 text-sm dark:bg-gray-950 dark:text-gray-100"
+                          value={row.throttle_download_kbps}
+                          onChange={(e) => {
+                            const v = parseInt(e.target.value, 10);
+                            setForm((f) => {
+                              const next = [...f.tiers];
+                              next[idx] = { ...next[idx], throttle_download_kbps: Number.isFinite(v) ? v : 100 };
+                              return { ...f, tiers: next };
+                            });
+                          }}
+                        />
+                      </div>
+                      <div className="md:col-span-2 grid gap-1">
+                        <label className="text-[11px] text-gray-500 dark:text-gray-400">↑ kbps</label>
+                        <input
+                          type="number"
+                          min={100}
+                          className="rounded-lg border border-gray-200 dark:border-gray-800 px-2 py-1.5 text-sm dark:bg-gray-950 dark:text-gray-100"
+                          value={row.throttle_upload_kbps}
+                          onChange={(e) => {
+                            const v = parseInt(e.target.value, 10);
+                            setForm((f) => {
+                              const next = [...f.tiers];
+                              next[idx] = { ...next[idx], throttle_upload_kbps: Number.isFinite(v) ? v : 100 };
+                              return { ...f, tiers: next };
+                            });
+                          }}
+                        />
+                      </div>
+                      <div className="md:col-span-2 flex justify-end">
+                        <button
+                          type="button"
+                          disabled={form.tiers.length <= 1}
+                          onClick={() =>
+                            setForm((f) => ({
+                              ...f,
+                              tiers: f.tiers.filter((_, i) => i !== idx),
+                            }))
+                          }
+                          className="text-xs text-rose-600 dark:text-rose-400 hover:underline disabled:opacity-40 disabled:hover:no-underline"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setForm((f) => ({
+                        ...f,
+                        tiers: [
+                          ...f.tiers,
+                          {
+                            threshold_value: 1,
+                            threshold_unit: "gb" as const,
+                            name: "",
+                            throttle_download_kbps: 1000,
+                            throttle_upload_kbps: 1000,
+                          },
+                        ],
+                      }))
+                    }
+                    className="text-xs text-indigo-700 dark:text-indigo-300 hover:underline w-fit"
+                  >
+                    + Add tier
+                  </button>
+                </div>
+              )}
+
+              {!form.tiered && (
+              <>
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="grid gap-1">
                   <label className="text-xs text-gray-500 dark:text-gray-400">
@@ -331,9 +589,8 @@ export default function FairUsagePage() {
                     <input
                       type="number"
                       min={1}
-                      value={form.download_value}
-                      onChange={e => setForm(f => ({ ...f, download_value: Math.max(1, Number(e.target.value || 1)) }))}
                       className="w-24 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                      {...downloadValueInput}
                     />
                     <select
                       value={form.download_unit}
@@ -352,9 +609,8 @@ export default function FairUsagePage() {
                       <input
                         type="number"
                         min={1}
-                        value={form.upload_value}
-                        onChange={e => setForm(f => ({ ...f, upload_value: Math.max(1, Number(e.target.value || 1)) }))}
                         className="w-24 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                        {...uploadValueInput}
                       />
                       <select
                         value={form.upload_unit}
@@ -375,9 +631,8 @@ export default function FairUsagePage() {
                   <input
                     type="number"
                     min={100}
-                    value={form.throttle_download_kbps}
-                    onChange={e => setForm(f => ({ ...f, throttle_download_kbps: Math.max(100, Number(e.target.value || 100)) }))}
                     className="w-32 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                    {...throttleDlInput}
                   />
                   <span className="text-[11px] text-gray-400 dark:text-gray-500">{(form.throttle_download_kbps / 1000).toFixed(1)} Mbps</span>
                 </div>
@@ -386,13 +641,14 @@ export default function FairUsagePage() {
                   <input
                     type="number"
                     min={100}
-                    value={form.throttle_upload_kbps}
-                    onChange={e => setForm(f => ({ ...f, throttle_upload_kbps: Math.max(100, Number(e.target.value || 100)) }))}
                     className="w-32 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                    {...throttleUlInput}
                   />
                   <span className="text-[11px] text-gray-400 dark:text-gray-500">{(form.throttle_upload_kbps / 1000).toFixed(1)} Mbps</span>
                 </div>
               </div>
+              </>
+              )}
 
               <div className="grid gap-4 md:grid-cols-2 pt-3 border-t border-gray-100 dark:border-gray-800">
                 <div className="grid gap-1">
@@ -511,10 +767,19 @@ export default function FairUsagePage() {
                       <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">{rule.description}</div>
                     )}
                     <div className="text-xs text-gray-600 dark:text-gray-300 mt-2">
-                      Quota: {formatBytes(rule.download_quota_bytes)}
-                      {rule.quota_mode === "independent" && rule.upload_quota_bytes ? ` ↓ / ${formatBytes(rule.upload_quota_bytes)} ↑` : ""}
-                      {rule.quota_mode === "combined" ? " total" : ""}
-                      {" · "}Throttle: {(rule.throttle_download_kbps / 1000).toFixed(1)}/{(rule.throttle_upload_kbps / 1000).toFixed(1)} Mbps
+                      {rule.tiered && rule.tiers?.length ? (
+                        <>
+                          Tiered: {rule.tiers.length} step{rule.tiers.length === 1 ? "" : "s"} up to {formatBytes(Math.max(...rule.tiers.map((t) => t.threshold_bytes)))}{" "}
+                          combined
+                        </>
+                      ) : (
+                        <>
+                          Quota: {formatBytes(rule.download_quota_bytes)}
+                          {rule.quota_mode === "independent" && rule.upload_quota_bytes ? ` ↓ / ${formatBytes(rule.upload_quota_bytes)} ↑` : ""}
+                          {rule.quota_mode === "combined" ? " total" : ""}
+                          {" · "}Throttle: {(rule.throttle_download_kbps / 1000).toFixed(1)}/{(rule.throttle_upload_kbps / 1000).toFixed(1)} Mbps
+                        </>
+                      )}
                     </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">

@@ -1,6 +1,7 @@
 import React from "react";
 import { Link } from "react-router-dom";
 import { getSettings, putSettings, listRouters, getActiveRouter, setActiveRouter, createRouter, updateRouter, deleteRouter, testRouter, syncRouter, purgeUsage, purgePeers, getUsageMaintenanceStatus, runUsageMaintenance, fetchJson, type Router, type RouterProto, type UsageMaintenanceStatusDTO } from "../api";
+import { useLooseNumberInput } from "../hooks/useLooseNumberInput";
 
 function getUtcOffsetMinutes(timeZone: string, date: Date) {
   // Robust cross-browser offset calc without relying on timeZoneName formatting.
@@ -69,6 +70,8 @@ export default function SettingsPage() {
     dashboard_selected_router_ids: [] as number[],
     dashboard_filter_status: "all",
     dashboard_sort_by: "created",
+    dashboard_time_frame_today: false,
+    peer_time_frame_today: false,
     peer_refresh_seconds: 30,
     raw_sample_retention_hours: 24,
     minute_rollup_retention_days: 90,
@@ -116,6 +119,57 @@ export default function SettingsPage() {
   const [userErr, setUserErr] = React.useState("");
   const [userMsg, setUserMsg] = React.useState("");
   const [userBusy, setUserBusy] = React.useState(false);
+
+  const pollIntervalInput = useLooseNumberInput(
+    form.poll_interval_seconds,
+    (n) => setForm((f) => ({ ...f, poll_interval_seconds: n })),
+    { min: 5, emptyFallback: 5 },
+  );
+  const onlineThresholdInput = useLooseNumberInput(
+    form.online_threshold_seconds,
+    (n) => setForm((f) => ({ ...f, online_threshold_seconds: n })),
+    { min: 5, emptyFallback: 5 },
+  );
+  const monthlyResetInput = useLooseNumberInput(
+    form.monthly_reset_day,
+    (n) => setForm((f) => ({ ...f, monthly_reset_day: n })),
+    { min: 1, max: 28, emptyFallback: 1 },
+  );
+  const dashboardRefreshInput = useLooseNumberInput(
+    form.dashboard_refresh_seconds,
+    (n) => setForm((f) => ({ ...f, dashboard_refresh_seconds: n })),
+    { min: 5, emptyFallback: 5 },
+  );
+  const dashboardScopeValInput = useLooseNumberInput(
+    form.dashboard_scope_value,
+    (n) => setForm((f) => ({ ...f, dashboard_scope_value: n })),
+    { min: 1, emptyFallback: 1 },
+  );
+  const peerDefaultScopeValInput = useLooseNumberInput(
+    form.peer_default_scope_value,
+    (n) => setForm((f) => ({ ...f, peer_default_scope_value: n })),
+    { min: 1, emptyFallback: 1 },
+  );
+  const peerRefreshInput = useLooseNumberInput(
+    form.peer_refresh_seconds,
+    (n) => setForm((f) => ({ ...f, peer_refresh_seconds: n })),
+    { min: 5, emptyFallback: 5 },
+  );
+  const rawRetentionInput = useLooseNumberInput(
+    form.raw_sample_retention_hours,
+    (n) => setForm((f) => ({ ...f, raw_sample_retention_hours: n })),
+    { min: 1, max: 8760, emptyFallback: 1 },
+  );
+  const minuteRetentionInput = useLooseNumberInput(
+    form.minute_rollup_retention_days,
+    (n) => setForm((f) => ({ ...f, minute_rollup_retention_days: n })),
+    { min: 1, max: 3650, emptyFallback: 1 },
+  );
+  const dailyRetentionInput = useLooseNumberInput(
+    form.daily_rollup_retention_days,
+    (n) => setForm((f) => ({ ...f, daily_rollup_retention_days: n })),
+    { min: 0, max: 36500, emptyFallback: 0 },
+  );
 
   const timezoneOptions = React.useMemo(() => {
     const supportedValuesOf = (Intl as any)?.supportedValuesOf as undefined | ((key: string) => string[]);
@@ -396,15 +450,15 @@ export default function SettingsPage() {
         <div className="grid gap-4">
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Poll interval (seconds)</label>
-            <input type="number" min={5} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" value={form.poll_interval_seconds} onChange={e => setForm({ ...form, poll_interval_seconds: Math.max(5, Number(e.target.value || 0)) })} />
+            <input type="number" min={5} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...pollIntervalInput} />
           </div>
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Online threshold (seconds)</label>
-            <input type="number" min={5} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" value={form.online_threshold_seconds} onChange={e => setForm({ ...form, online_threshold_seconds: Math.max(5, Number(e.target.value || 0)) })} />
+            <input type="number" min={5} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...onlineThresholdInput} />
           </div>
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Monthly reset day (1–28)</label>
-            <input type="number" min={1} max={28} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" value={form.monthly_reset_day} onChange={e => setForm({ ...form, monthly_reset_day: Math.min(28, Math.max(1, Number(e.target.value || 1))) })} />
+            <input type="number" min={1} max={28} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...monthlyResetInput} />
           </div>
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Timezone</label>
@@ -469,13 +523,7 @@ export default function SettingsPage() {
                 type="number"
                 min={5}
                 className="w-20 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                value={form.dashboard_refresh_seconds}
-                onChange={(e) =>
-                  setForm({
-                    ...form,
-                    dashboard_refresh_seconds: Math.max(5, Number(e.target.value || 5)),
-                  })
-                }
+                {...dashboardRefreshInput}
               />
               <span className="text-gray-500 dark:text-gray-400">seconds</span>
             </div>
@@ -485,13 +533,7 @@ export default function SettingsPage() {
                 type="number"
                 min={1}
                 className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                value={form.dashboard_scope_value}
-                onChange={(e) =>
-                  setForm({
-                    ...form,
-                    dashboard_scope_value: Math.max(1, Number(e.target.value || 1)),
-                  })
-                }
+                {...dashboardScopeValInput}
               />
               <select
                 className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
@@ -514,13 +556,7 @@ export default function SettingsPage() {
                 type="number"
                 min={1}
                 className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                value={form.peer_default_scope_value}
-                onChange={(e) =>
-                  setForm({
-                    ...form,
-                    peer_default_scope_value: Math.max(1, Number(e.target.value || 1)),
-                  })
-                }
+                {...peerDefaultScopeValInput}
               />
               <select
                 className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
@@ -542,13 +578,7 @@ export default function SettingsPage() {
                   type="number"
                   min={5}
                   className="w-20 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                  value={form.peer_refresh_seconds}
-                  onChange={(e) =>
-                    setForm({
-                      ...form,
-                      peer_refresh_seconds: Math.max(5, Number(e.target.value || 5)),
-                    })
-                  }
+                  {...peerRefreshInput}
                 />
                 <span className="text-gray-500 dark:text-gray-400">seconds</span>
               </div>
@@ -567,14 +597,8 @@ export default function SettingsPage() {
                   min={1}
                   max={8760}
                   className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                  value={form.raw_sample_retention_hours}
                   disabled={retentionLocked}
-                  onChange={(e) =>
-                    setForm({
-                      ...form,
-                      raw_sample_retention_hours: Math.max(1, Math.min(8760, Number(e.target.value || 1))),
-                    })
-                  }
+                  {...rawRetentionInput}
                 />
                 <span className="text-gray-500 dark:text-gray-400">hours</span>
               </div>
@@ -585,14 +609,8 @@ export default function SettingsPage() {
                   min={1}
                   max={3650}
                   className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                  value={form.minute_rollup_retention_days}
                   disabled={retentionLocked}
-                  onChange={(e) =>
-                    setForm({
-                      ...form,
-                      minute_rollup_retention_days: Math.max(1, Math.min(3650, Number(e.target.value || 1))),
-                    })
-                  }
+                  {...minuteRetentionInput}
                 />
                 <span className="text-gray-500 dark:text-gray-400">days</span>
               </div>
@@ -603,14 +621,8 @@ export default function SettingsPage() {
                   min={0}
                   max={36500}
                   className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                  value={form.daily_rollup_retention_days}
                   disabled={retentionLocked}
-                  onChange={(e) =>
-                    setForm({
-                      ...form,
-                      daily_rollup_retention_days: Math.max(0, Math.min(36500, Number(e.target.value || 0))),
-                    })
-                  }
+                  {...dailyRetentionInput}
                 />
                 <span className="text-gray-500 dark:text-gray-400">days</span>
                 <span className="text-[11px] text-gray-400 dark:text-gray-500">0 means keep forever</span>

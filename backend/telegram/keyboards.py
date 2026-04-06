@@ -9,24 +9,19 @@ from .i18n import t
 
 def main_menu(lang: str = "en") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=t("btn_my_peers", lang), callback_data="menu:peers"),
-            InlineKeyboardButton(text=t("btn_usage", lang), callback_data="menu:usage"),
-        ],
-        [
-            InlineKeyboardButton(text=t("btn_fair_usage", lang), callback_data="menu:fair_usage"),
-            InlineKeyboardButton(text=t("btn_settings", lang), callback_data="menu:settings"),
-        ],
+        [InlineKeyboardButton(text=t("btn_usage_history", lang), callback_data="menu:usage_history")],
+        [InlineKeyboardButton(text=t("btn_status", lang), callback_data="menu:status")],
+        [InlineKeyboardButton(text=t("btn_settings", lang), callback_data="menu:settings")],
     ])
 
 
-def back_button(lang: str = "en") -> InlineKeyboardMarkup:
+def home_button(lang: str = "en") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=t("btn_back", lang), callback_data="menu:main")],
     ])
 
 
-def usage_scope_selector(lang: str = "en") -> InlineKeyboardMarkup:
+def usage_history_menu(lang: str = "en") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=t("btn_today", lang), callback_data="usage:today"),
@@ -38,15 +33,22 @@ def usage_scope_selector(lang: str = "en") -> InlineKeyboardMarkup:
 
 
 def settings_menu(lang: str = "en") -> InlineKeyboardMarkup:
-    other = "fa" if lang == "en" else "en"
-    label = "فارسی" if other == "fa" else "English"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Language: {label}", callback_data=f"settings:lang:{other}")],
+        [InlineKeyboardButton(text=t("btn_language", lang), callback_data="settings:language")],
+        [InlineKeyboardButton(text=t("btn_notifications", lang), callback_data="settings:notifications")],
         [InlineKeyboardButton(text=t("btn_back", lang), callback_data="menu:main")],
     ])
 
 
-def peer_list_keyboard(peers: list[tuple[int, str]], lang: str = "en") -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=name, callback_data=f"peer:{pid}")] for pid, name in peers]
-    rows.append([InlineKeyboardButton(text=t("btn_back", lang), callback_data="menu:main")])
+def language_menu(lang: str = "en") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="English", callback_data="settings:lang:en")],
+        [InlineKeyboardButton(text="فارسی", callback_data="settings:lang:fa")],
+        [InlineKeyboardButton(text=t("btn_back", lang), callback_data="menu:settings")],
+    ])
+
+
+def notifications_menu(items: list[tuple[str, str]], lang: str = "en") -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"settings:notif:{event_type}")] for event_type, label in items]
+    rows.append([InlineKeyboardButton(text=t("btn_back", lang), callback_data="menu:settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
