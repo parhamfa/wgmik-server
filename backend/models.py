@@ -118,6 +118,9 @@ class FairUsageRule(Base):
     scope_period_unit: Mapped[str] = mapped_column(String(8), default="month")  # hour | day | week | month
     scope_type: Mapped[str] = mapped_column(String(16), default="global")  # global | router | peer
     router_id: Mapped[int] = mapped_column(ForeignKey("routers.id", ondelete="CASCADE"), nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    #: If True and this rule matches, later rules may still run and override its throttle.
+    passthrough: Mapped[bool] = mapped_column(Boolean, default=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     #: When True, enforcement uses :class:`FairUsageTier` rows (combined usage only); thresholds are a ladder.
     tiered: Mapped[bool] = mapped_column(Boolean, default=False)

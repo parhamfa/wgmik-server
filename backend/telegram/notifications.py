@@ -256,6 +256,13 @@ def _throttle_episode_key(state: Optional[FairUsageState]) -> str:
     return str(int(ts.timestamp()))
 
 
+def _quota_hit_dedup_key(rule: FairUsageRule, state: Optional[FairUsageState]) -> str:
+    """Dedup one throttle alert per effective rule/tier within a throttle episode."""
+    episode = _throttle_episode_key(state)
+    tier_key = str(state.tier_id) if rule.tiered and state and state.tier_id else "-"
+    return f"{rule.id}:{tier_key}:{episode}"
+
+
 def check_and_send_notifications(
     db: Session,
     peer: Peer,
@@ -304,13 +311,13 @@ def check_and_send_notifications(
         )
     # Quota reached / throttled — only for *this* rule if it is actually over quota.
     # (Peer may be throttled because another applicable rule fired; do not blame every rule.)
-    if is_throttled and is_rule_over_quota(used_rx, used_tx, rule, db):
+    if is_throttled and state and state.rule_id == rule.id and is_rule_over_quota(used_rx, used_tx, rule, db):
         tier_label, tdl, tul = _throttle_detail_for_notification(db, rule, used_rx, used_tx, state)
         _notify_event(
             db, bindings, admin_chat_id, peer, "quota_hit",
             peer_name=peer_name, pct=pct, used=used, total=total,
             rule_name=rule_label,
-            dedup_extra=f"{rule_key}:{_throttle_episode_key(state)}",
+            dedup_extra=_quota_hit_dedup_key(rule, state),
             tier_label=tier_label,
             throttle_dl_kbps=tdl,
             throttle_ul_kbps=tul,

@@ -54,6 +54,8 @@ const EMPTY_FORM = {
   name: "",
   description: "",
   quota_mode: "combined" as "combined" | "independent",
+  sort_order: 0,
+  passthrough: false,
   tiered: false,
   tiers: [...DEFAULT_TIER_ROWS] as TierFormRow[],
   download_value: 50,
@@ -190,6 +192,8 @@ export default function FairUsagePage() {
         scope_type: form.scope_type,
         router_id: form.scope_type === "router" ? form.router_id : null,
         peer_ids: form.scope_type === "peer" ? form.peer_ids : [],
+        sort_order: Math.max(0, Math.floor(form.sort_order || 0)),
+        passthrough: !!form.passthrough,
         enabled: form.enabled,
         tiered: form.tiered,
         tiers: editingId && !form.tiered ? [] : form.tiered ? tierPayload : undefined,
@@ -232,6 +236,8 @@ export default function FairUsagePage() {
       name: rule.name,
       description: rule.description,
       quota_mode: rule.quota_mode as "combined" | "independent",
+      sort_order: rule.sort_order ?? 0,
+      passthrough: !!rule.passthrough,
       tiered,
       tiers,
       download_value: dl.value,
@@ -260,6 +266,24 @@ export default function FairUsagePage() {
     } catch (e: any) {
       setErr(e?.message || "Failed to delete rule");
       setConfirmDelete(null);
+    }
+  };
+
+  const moveRule = async (ruleId: number, delta: -1 | 1) => {
+    const ordered = [...rules].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.id - b.id);
+    const idx = ordered.findIndex((r) => r.id === ruleId);
+    const nextIdx = idx + delta;
+    if (idx < 0 || nextIdx < 0 || nextIdx >= ordered.length) return;
+    const current = ordered[idx];
+    const other = ordered[nextIdx];
+    try {
+      await Promise.all([
+        updateFairUsageRule(current.id, { sort_order: other.sort_order ?? nextIdx }),
+        updateFairUsageRule(other.id, { sort_order: current.sort_order ?? idx }),
+      ]);
+      await load();
+    } catch (e: any) {
+      setErr(e?.message || "Failed to reorder rules");
     }
   };
 
@@ -363,6 +387,36 @@ export default function FairUsagePage() {
                     className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
                     placeholder="Optional note"
                   />
+                </div>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="grid gap-1">
+                  <label className="text-xs text-gray-500 dark:text-gray-400">Order</label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={form.sort_order}
+                    onChange={(e) => setForm((f) => ({ ...f, sort_order: Math.max(0, Math.floor(Number(e.target.value) || 0)) }))}
+                    className="w-28 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                  />
+                </div>
+                <div className="grid gap-1">
+                  <label className="text-xs text-gray-500 dark:text-gray-400">Chain behavior</label>
+                  <label className="inline-flex items-start gap-2 text-sm text-gray-700 dark:text-gray-200 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={form.passthrough}
+                      onChange={(e) => setForm((f) => ({ ...f, passthrough: e.target.checked }))}
+                      className="rounded border-gray-300 dark:border-gray-700 mt-0.5"
+                    />
+                    <span>
+                      <span className="font-medium">Passthrough</span>
+                      <span className="block text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">
+                        If this rule matches, keep evaluating later rules so they can override it.
+                      </span>
+                    </span>
+                  </label>
                 </div>
               </div>
 
@@ -753,6 +807,9 @@ export default function FairUsagePage() {
                   <div>
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="text-sm font-medium text-gray-900 dark:text-gray-100">{rule.name}</span>
+                      <span className="rounded-full bg-gray-100 text-gray-700 px-2 py-0.5 text-[11px] dark:bg-gray-800 dark:text-gray-300">
+                        #{rule.sort_order ?? 0}
+                      </span>
                       <span className={`rounded-full px-2 py-0.5 text-[11px] ${rule.enabled ? "bg-green-100 text-green-800 dark:bg-green-500/10 dark:text-green-300" : "bg-gray-200 text-gray-600 dark:bg-gray-800 dark:text-gray-400"}`}>
                         {rule.enabled ? "Active" : "Disabled"}
                       </span>
@@ -761,6 +818,9 @@ export default function FairUsagePage() {
                       </span>
                       <span className="rounded-full bg-indigo-50 text-indigo-700 px-2 py-0.5 text-[11px] dark:bg-indigo-500/10 dark:text-indigo-300 capitalize">
                         {rule.scope_type}{rule.scope_type === "router" && rule.router_id ? ` · ${routerById[rule.router_id]?.name || rule.router_id}` : ""}
+                      </span>
+                      <span className={`rounded-full px-2 py-0.5 text-[11px] ${rule.passthrough ? "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300" : "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"}`}>
+                        {rule.passthrough ? "Passthrough" : "Stop"}
                       </span>
                     </div>
                     {rule.description && (
@@ -783,6 +843,20 @@ export default function FairUsagePage() {
                     </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => moveRule(rule.id, -1)}
+                      className="rounded-full bg-gray-100 text-gray-800 px-2.5 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                      title="Move up"
+                    >
+                      ↑
+                    </button>
+                    <button
+                      onClick={() => moveRule(rule.id, 1)}
+                      className="rounded-full bg-gray-100 text-gray-800 px-2.5 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                      title="Move down"
+                    >
+                      ↓
+                    </button>
                     <button onClick={() => openAssignModal(rule)} className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700">
                       Peers
                     </button>

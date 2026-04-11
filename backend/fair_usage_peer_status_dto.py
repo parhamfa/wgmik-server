@@ -8,7 +8,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from .fair_usage_sync import get_applicable_fair_usage_rules, is_rule_over_quota
+from .fair_usage_sync import evaluate_fair_usage_chain, get_applicable_fair_usage_rules, is_rule_over_quota
 from .fair_usage_tiers import active_tier_for_combined_usage, ordered_tiers_for_rule
 from .fair_usage_usage import (
     compute_next_reset_utc_for_rule,
@@ -42,9 +42,12 @@ class FairUsageRuleStatusItemDTO(BaseModel):
     scope_period_unit: str = "month"
     scope_label: str = ""
     scope_type: Optional[str] = None
+    sort_order: int = 0
+    passthrough: bool = False
     used_rx: int = 0
     used_tx: int = 0
     over_quota: bool = False
+    is_effective: bool = False
     next_reset: Optional[str] = None
     tiered: bool = False
     tiers: List[FairUsageTierStatusDTO] = []
@@ -65,6 +68,8 @@ class FairUsagePeerStatusDTO(BaseModel):
     scope_period_unit: str = "month"
     scope_label: str = "Monthly"
     scope_type: Optional[str] = None
+    sort_order: int = 0
+    passthrough: bool = False
     used_rx: int = 0
     used_tx: int = 0
     throttled: bool = False
@@ -86,6 +91,8 @@ def build_fair_usage_peer_status_dto(db: Session, peer: Peer) -> FairUsagePeerSt
         if t.tzinfo is None:
             t = t.replace(tzinfo=timezone.utc)
         throttled_at = t.isoformat()
+    winner = evaluate_fair_usage_chain(db, peer)
+    winning_rule_id = winner[0].id if winner else None
 
     items: List[FairUsageRuleStatusItemDTO] = []
     for rule in applicable:
@@ -124,35 +131,43 @@ def build_fair_usage_peer_status_dto(db: Session, peer: Peer) -> FairUsagePeerSt
                 scope_period_unit=unit,
                 scope_label=format_scope_label(cnt, unit),
                 scope_type=rule.scope_type,
+                sort_order=rule.sort_order,
+                passthrough=rule.passthrough,
                 used_rx=urx,
                 used_tx=utx,
                 over_quota=oq,
+                is_effective=winning_rule_id == rule.id,
                 next_reset=nxt.isoformat(),
                 tiered=rule.tiered,
                 tiers=tier_status,
             )
         )
 
-    first = applicable[0]
-    ur0, ut0 = peer_scope_usage_for_rule(peer.id, first, db)
-    c0, u0 = normalize_scope_period(first)
-    n0 = compute_next_reset_utc_for_rule(first, db)
+    primary_rule = winner[0] if winner else applicable[0]
+    primary_tier = winner[1] if winner else None
+    ur0, ut0 = peer_scope_usage_for_rule(peer.id, primary_rule, db)
+    c0, u0 = normalize_scope_period(primary_rule)
+    n0 = compute_next_reset_utc_for_rule(primary_rule, db)
+    throttle_download = primary_tier.throttle_download_kbps if primary_tier else primary_rule.throttle_download_kbps
+    throttle_upload = primary_tier.throttle_upload_kbps if primary_tier else primary_rule.throttle_upload_kbps
 
     return FairUsagePeerStatusDTO(
         peer_id=peer.id,
         rules=items,
-        rule_id=first.id,
-        rule_name=first.name,
-        quota_mode=first.quota_mode,
-        download_quota_bytes=first.download_quota_bytes,
-        upload_quota_bytes=first.upload_quota_bytes,
-        throttle_download_kbps=first.throttle_download_kbps,
-        throttle_upload_kbps=first.throttle_upload_kbps,
-        time_scope=first.time_scope,
+        rule_id=primary_rule.id,
+        rule_name=primary_rule.name,
+        quota_mode=primary_rule.quota_mode,
+        download_quota_bytes=primary_rule.download_quota_bytes,
+        upload_quota_bytes=primary_rule.upload_quota_bytes,
+        throttle_download_kbps=throttle_download,
+        throttle_upload_kbps=throttle_upload,
+        time_scope=primary_rule.time_scope,
         scope_period_count=c0,
         scope_period_unit=u0,
         scope_label=format_scope_label(c0, u0),
-        scope_type=first.scope_type,
+        scope_type=primary_rule.scope_type,
+        sort_order=primary_rule.sort_order,
+        passthrough=primary_rule.passthrough,
         used_rx=ur0,
         used_tx=ut0,
         throttled=throttled,

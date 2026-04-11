@@ -2750,6 +2750,8 @@ class FairUsageRuleCreateDTO(BaseModel):
     scope_type: str = "global"  # global | router | peer
     router_id: Optional[int] = None
     peer_ids: Optional[List[int]] = None
+    sort_order: int = 0
+    passthrough: bool = False
     enabled: bool = True
     #: When True with non-empty ``tiers``, one combined-usage ladder per period (soft → hard on one meter).
     tiered: bool = False
@@ -2769,6 +2771,8 @@ class FairUsageRuleUpdateDTO(BaseModel):
     time_scope: Optional[str] = None
     scope_type: Optional[str] = None
     router_id: Optional[int] = None
+    sort_order: Optional[int] = None
+    passthrough: Optional[bool] = None
     enabled: Optional[bool] = None
     tiered: Optional[bool] = None
     tiers: Optional[List[FairUsageTierInputDTO]] = None
@@ -2797,6 +2801,8 @@ class FairUsageRuleDTO(BaseModel):
     scope_label: str = "Monthly"
     scope_type: str
     router_id: Optional[int]
+    sort_order: int = 0
+    passthrough: bool = False
     enabled: bool
     tiered: bool = False
     tiers: List[FairUsageTierDTO] = []
@@ -2846,6 +2852,8 @@ def _fu_rule_to_dto(rule: FairUsageRule, db: Session, include_peers: bool = Fals
         scope_label=format_scope_label(cnt, unit),
         scope_type=rule.scope_type,
         router_id=rule.router_id,
+        sort_order=rule.sort_order,
+        passthrough=rule.passthrough,
         enabled=rule.enabled,
         tiered=rule.tiered,
         tiers=tier_out,
@@ -2897,6 +2905,8 @@ def create_fair_usage_rule(dto: FairUsageRuleCreateDTO, db: Session = Depends(ge
         time_scope="monthly",
         scope_type=dto.scope_type,
         router_id=dto.router_id if dto.scope_type == "router" else None,
+        sort_order=dto.sort_order,
+        passthrough=dto.passthrough,
         enabled=dto.enabled,
         tiered=want_tiered,
     )
@@ -2918,7 +2928,7 @@ def create_fair_usage_rule(dto: FairUsageRuleCreateDTO, db: Session = Depends(ge
 
 @router.get("/fair-usage/rules", response_model=List[FairUsageRuleDTO])
 def list_fair_usage_rules(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    rules = db.query(FairUsageRule).order_by(FairUsageRule.id.asc()).all()
+    rules = db.query(FairUsageRule).order_by(FairUsageRule.sort_order.asc(), FairUsageRule.id.asc()).all()
     return [_fu_rule_to_dto(r, db, include_peers=True) for r in rules]
 
 
@@ -2970,6 +2980,10 @@ def update_fair_usage_rule(rule_id: int, dto: FairUsageRuleUpdateDTO, db: Sessio
         rule.scope_type = dto.scope_type
     if dto.router_id is not None:
         rule.router_id = dto.router_id
+    if dto.sort_order is not None:
+        rule.sort_order = dto.sort_order
+    if dto.passthrough is not None:
+        rule.passthrough = dto.passthrough
     if dto.enabled is not None:
         rule.enabled = dto.enabled
 

@@ -105,7 +105,7 @@ def _status_caption_text(dto, peer_label: str, lang: str) -> str:
         f"{t('btn_status', lang)}: {status_label}",
     ]
     if dto.throttled:
-        effective_rule = next((rule for rule in dto.rules if rule.over_quota), None) or (dto.rules[0] if dto.rules else None)
+        effective_rule = next((rule for rule in dto.rules if getattr(rule, "is_effective", False)), None) or (dto.rules[0] if dto.rules else None)
         rule_label = effective_rule.rule_name if effective_rule else t("status_no_active_rule", lang)
         reset_line = (
             format_next_reset_from_iso(effective_rule.next_reset, lang)

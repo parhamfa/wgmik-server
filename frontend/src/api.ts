@@ -564,6 +564,8 @@ export type FairUsageRuleDTO = {
   scope_label: string;
   scope_type: "global" | "router" | "peer";
   router_id: number | null;
+  sort_order: number;
+  passthrough: boolean;
   enabled: boolean;
   tiered: boolean;
   tiers: FairUsageTierDTO[];
@@ -596,6 +598,8 @@ export type FairUsageRuleCreateDTO = {
   scope_type: "global" | "router" | "peer";
   router_id?: number | null;
   peer_ids?: number[];
+  sort_order?: number;
+  passthrough?: boolean;
   enabled?: boolean;
   tiered?: boolean;
   tiers?: FairUsageTierInputDTO[];
@@ -624,9 +628,12 @@ export type FairUsageRuleStatusItemDTO = {
   scope_period_unit: string;
   scope_label: string;
   scope_type: string | null;
+  sort_order?: number;
+  passthrough?: boolean;
   used_rx: number;
   used_tx: number;
   over_quota: boolean;
+  is_effective?: boolean;
   next_reset: string | null;
   tiered?: boolean;
   tiers?: FairUsageTierStatusDTO[];
@@ -648,6 +655,8 @@ export type FairUsagePeerStatusDTO = {
   scope_period_unit: string;
   scope_label: string;
   scope_type: string | null;
+  sort_order?: number;
+  passthrough?: boolean;
   used_rx: number;
   used_tx: number;
   throttled: boolean;

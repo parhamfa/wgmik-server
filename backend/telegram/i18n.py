@@ -281,7 +281,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         "fa": "\u062e\u0644\u0627\u0635\u0647 \u0647\u0641\u062a\u06af\u06cc",
     },
     "notif_quota_warning": {
-        "en": "{name} is at {pct}% of its limit ({used} / {total}).",
+        "en": "Warning: {name} — rule {rule} — {pct}% of the limit ({used} / {total}).",
         "fa": "\u0647\u0634\u062f\u0627\u0631: \u067e\u06cc\u0631 \u00ab{name}\u00bb \u2014 \u0642\u0627\u0639\u062f\u0647 \u00ab{rule}\u00bb \u2014 {pct}\u066a \u0627\u0632 \u0633\u0647\u0645\u06cc\u0647 ({used} / {total}).",
     },
     "notif_quota_hit": {

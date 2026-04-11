@@ -92,7 +92,7 @@ def ensure_fair_usage_scope_columns() -> None:
 
 
 def ensure_fair_usage_tier_schema() -> None:
-    """Add tiered column, fair_usage_tiers table, fair_usage_state.tier_id (SQLite migrations)."""
+    """Add tier/ordering columns used by fair-usage rules (SQLite migrations)."""
     if not db_url.startswith("sqlite:"):
         return
     with engine.begin() as conn:
@@ -117,10 +117,25 @@ def ensure_fair_usage_tier_schema() -> None:
         col_names = {r[1] for r in rows}
         if "tiered" not in col_names:
             conn.execute(text("ALTER TABLE fair_usage_rules ADD COLUMN tiered BOOLEAN DEFAULT 0"))
+        if "sort_order" not in col_names:
+            conn.execute(text("ALTER TABLE fair_usage_rules ADD COLUMN sort_order INTEGER DEFAULT 0"))
+        if "passthrough" not in col_names:
+            conn.execute(text("ALTER TABLE fair_usage_rules ADD COLUMN passthrough BOOLEAN DEFAULT 0"))
         rows_s = conn.execute(text("PRAGMA table_info(fair_usage_state)")).fetchall()
         col_names_s = {r[1] for r in rows_s}
         if "tier_id" not in col_names_s:
             conn.execute(text("ALTER TABLE fair_usage_state ADD COLUMN tier_id INTEGER REFERENCES fair_usage_tiers (id)"))
+        conn.execute(
+            text(
+                """
+                UPDATE fair_usage_rules
+                SET sort_order = CASE
+                    WHEN sort_order IS NULL OR sort_order = 0 THEN id
+                    ELSE sort_order
+                END
+                """
+            )
+        )
 
 
 def prepare_sqlite_database():

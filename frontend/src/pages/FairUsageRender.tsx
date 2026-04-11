@@ -13,7 +13,7 @@ function fmtBytes(n: number) {
 function effectiveThrottleForRule(fr: FairUsageRuleStatusItemDTO): { dl: number; ul: number; label: string } {
   if (fr.tiered && fr.tiers?.length) {
     const a = fr.tiers.find((t) => t.is_active);
-    if (a) return { dl: a.throttle_download_kbps, ul: a.throttle_upload_kbps, label: (a.name || "").trim() || fr.rule_name };
+    if (a) return { dl: a.throttle_download_kbps, ul: a.throttle_upload_kbps, label: (a.name || "").trim() ? `${fr.rule_name} · ${a.name.trim()}` : fr.rule_name };
   }
   return { dl: fr.throttle_download_kbps, ul: fr.throttle_upload_kbps, label: fr.rule_name };
 }
@@ -39,6 +39,7 @@ export default function FairUsageRender() {
   const fuStatus = data.status;
   const fuRules = fuStatus.rules || [];
   const peerName = data.peerName || "Peer";
+  const effectiveFuRule = fuRules.find((r) => r.is_effective) ?? (fuStatus.rule_id ? fuRules.find((r) => r.rule_id === fuStatus.rule_id) : undefined);
 
   return (
     <div id="fu-card" className="p-5 bg-white dark:bg-gray-950 inline-block" style={{ minWidth: 420, maxWidth: 560 }}>
@@ -58,14 +59,10 @@ export default function FairUsageRender() {
               {fuStatus.throttled ? "Throttled" : "Normal"}
             </span>
             {fuStatus.throttled && (() => {
-              const v = fuRules.filter((r) => r.over_quota);
-              const eff = (r: FairUsageRuleStatusItemDTO) => effectiveThrottleForRule(r);
-              const d = v.length ? Math.min(...v.map((r) => eff(r).dl)) : fuStatus.throttle_download_kbps;
-              const u = v.length ? Math.min(...v.map((r) => eff(r).ul)) : fuStatus.throttle_upload_kbps;
-              const dlNames = v.filter((r) => eff(r).dl === d).map((r) => eff(r).label);
-              const ulNames = v.filter((r) => eff(r).ul === u).map((r) => eff(r).label);
-              const names = [...new Set([...dlNames, ...ulNames])];
-              const label = names.length > 0 ? names.join(" · ") : fuStatus.rule_name ?? "Rule";
+              const eff = effectiveFuRule ? effectiveThrottleForRule(effectiveFuRule) : null;
+              const d = eff?.dl ?? fuStatus.throttle_download_kbps;
+              const u = eff?.ul ?? fuStatus.throttle_upload_kbps;
+              const label = eff?.label ?? fuStatus.rule_name ?? "Rule";
               return (
                 <span className="text-[11px] text-amber-700 dark:text-amber-300">
                   {label}: {(d / 1000).toFixed(1)}/{(u / 1000).toFixed(1)} Mbps
@@ -85,11 +82,16 @@ export default function FairUsageRender() {
               <div className="flex items-center justify-between gap-2 flex-wrap">
                 <div className="text-xs text-gray-600 dark:text-gray-300">
                   Rule: <span className="font-medium text-gray-900 dark:text-gray-100">{fr.rule_name}</span>
-                  {fr.over_quota ? <span className="ml-2 text-amber-700 dark:text-amber-300">Over quota</span> : null}
+                  {fr.over_quota ? <span className="ml-2 text-amber-700 dark:text-amber-300">Matched</span> : null}
+                  {fr.is_effective ? <span className="ml-2 text-indigo-700 dark:text-indigo-300">Effective</span> : null}
                 </div>
                 <div className="flex items-center gap-1.5">
+                  <span className="rounded-full bg-gray-100 text-gray-700 px-2 py-0.5 text-[11px] dark:bg-gray-800 dark:text-gray-300">#{fr.sort_order ?? 0}</span>
                   <span className="rounded-full bg-gray-100 text-gray-700 px-2 py-0.5 text-[11px] dark:bg-gray-800 dark:text-gray-300">{fr.scope_label}</span>
                   <span className="rounded-full bg-indigo-50 text-indigo-700 px-2 py-0.5 text-[11px] dark:bg-indigo-500/10 dark:text-indigo-300 capitalize">{fr.scope_type}</span>
+                  <span className={`rounded-full px-2 py-0.5 text-[11px] ${fr.passthrough ? "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300" : "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"}`}>
+                    {fr.passthrough ? "Pass" : "Stop"}
+                  </span>
                 </div>
               </div>
               <div className="grid gap-3">

@@ -14,7 +14,7 @@ from ..models import (
     UsageDaily,
     UsageMonthly,
 )
-from ..fair_usage_sync import get_applicable_fair_usage_rules, is_rule_over_quota
+from ..fair_usage_sync import evaluate_fair_usage_chain, get_applicable_fair_usage_rules, is_rule_over_quota
 from ..fair_usage_tiers import active_tier_for_combined_usage, ordered_tiers_for_rule
 from ..fair_usage_usage import (
     app_zoneinfo,
@@ -108,11 +108,12 @@ def format_usage_scope(
 
 
 def format_fair_usage_condensed(peer: Peer, db: Session, lang: str = "en", now_utc: datetime | None = None) -> str:
-    """One-line summary for daily/weekly TG summaries (no rule names — period + % only)."""
+    """Short summary for daily/weekly TG summaries."""
     now_utc = now_utc or datetime.now(timezone.utc)
     rules = get_applicable_fair_usage_rules(peer, db)
     if not rules:
         return ""
+    state = db.query(FairUsageState).filter(FairUsageState.peer_id == peer.id).first()
     parts: list[str] = []
     for rule in rules:
         urx, utx = peer_scope_usage_for_rule(peer.id, rule, db, now_utc)
@@ -131,6 +132,14 @@ def format_fair_usage_condensed(peer: Peer, db: Session, lang: str = "en", now_u
         cnt, unit = normalize_scope_period(rule)
         slab = format_scope_label(cnt, unit)
         parts.append(f"{slab} {pct}%")
+    winner = evaluate_fair_usage_chain(db, peer, now_utc)
+    if state and state.throttled and winner:
+        winner_rule, winner_tier = winner
+        effective_label = winner_rule.name
+        if winner_tier:
+            tier_name = (winner_tier.name or "").strip() or f"≥{_fmt_bytes(winner_tier.threshold_bytes)}"
+            effective_label = f"{effective_label} / {tier_name}"
+        parts.append(f"{t('status_effective_rule', lang)}: {effective_label}")
     return " · ".join(parts)
 
 
@@ -156,6 +165,8 @@ def format_fair_usage_status(
     throttled = state.throttled if state else False
     status = t("fu_throttled", lang) if throttled else t("fu_ok", lang)
     label = _escape_telegram_md(peer.name or peer.public_key[:12])
+    winner = evaluate_fair_usage_chain(db, peer, now_utc)
+    winning_rule_id = winner[0].id if winner else None
 
     blocks: list[str] = []
     if detailed and len(rules) > 1:
@@ -170,11 +181,12 @@ def format_fair_usage_status(
         slab = format_scope_label(cnt, unit)
         stype = rule.scope_type or "?"
         oq = is_rule_over_quota(used_rx, used_tx, rule, db)
+        effective = throttled and winning_rule_id == rule.id
 
         if detailed:
-            rule_hdr = f"  • **{rn}** · {slab} · `{stype}`{' ⚠' if oq else ''}"
+            rule_hdr = f"  • **{rn}** · {slab} · `{stype}`{' ⚠' if oq else ''}{' [effective]' if effective else ''}"
         else:
-            rule_hdr = f"  • {slab}{' ⚠' if oq else ''}"
+            rule_hdr = f"  • {slab}{' ⚠' if oq else ''}{' [effective]' if effective else ''}"
 
         if rule.tiered:
             tiers = ordered_tiers_for_rule(db, rule.id)
