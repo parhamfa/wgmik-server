@@ -1,6 +1,9 @@
-from fastapi import FastAPI, Request
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from .api.routes import router as api_router
 from .destructive_ops import exclusive_operation_gate
 from .scheduler import ensure_scheduler
@@ -94,6 +97,8 @@ def _start():
     # Clear a maintenance status left "running" by a crashed/restarted process
     from .usage_maintenance import reset_stale_usage_maintenance_status
     reset_stale_usage_maintenance_status()
+    from .backup_restore import reset_stale_backup_status
+    reset_stale_backup_status()
 
     ensure_scheduler()
 
@@ -107,6 +112,33 @@ def _start():
 
 app.include_router(api_router)
 
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+if STATIC_DIR.is_dir():
+    assets_dir = STATIC_DIR / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    def _safe_static_file(relative_path: str) -> Path | None:
+        if not relative_path or relative_path.endswith("/"):
+            return None
+        candidate = (STATIC_DIR / relative_path).resolve()
+        try:
+            candidate.relative_to(STATIC_DIR.resolve())
+        except ValueError:
+            return None
+        return candidate if candidate.is_file() else None
+
+    @app.get("/")
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str = ""):
+        static_file = _safe_static_file(full_path)
+        if static_file is not None:
+            return FileResponse(static_file)
+        index = STATIC_DIR / "index.html"
+        if index.is_file():
+            return FileResponse(index)
+        raise HTTPException(status_code=404, detail="Frontend not built")
+
 
 def _allow_during_exclusive_operation(request: Request) -> bool:
     path = request.url.path
@@ -119,6 +151,10 @@ def _allow_during_exclusive_operation(request: Request) -> bool:
     if path == "/api/admin/usage_maintenance" and request.method == "GET":
         return True
     if path == "/api/admin/usage_maintenance/cancel" and request.method == "POST":
+        return True
+    if path == "/api/admin/backup" and request.method == "GET":
+        return True
+    if path == "/api/admin/backup/download" and request.method == "GET":
         return True
     if request.method == "GET" and (
         path == "/api/settings"

@@ -2,7 +2,7 @@ services:
   api:
     # Prebuilt image from GHCR. `docker compose pull` fetches it; running
     # `docker compose up --build` instead builds locally and tags it the same.
-    image: ghcr.io/parhamfa/wgmik-server-api:${WGMIK_TAG:-latest}
+    image: ghcr.io/parhamfa/wgmik-server:${WGMIK_TAG:-latest}
     build:
       context: .
       dockerfile: backend/Dockerfile
@@ -17,6 +17,7 @@ services:
     volumes:
       - ./data:/data
     ports:
+      - "5173:8000"
       - "8000:8000"
     restart: unless-stopped
     healthcheck:
@@ -30,22 +31,3 @@ services:
       interval: 10s
       timeout: 3s
       retries: 10
-
-  web:
-    image: ghcr.io/parhamfa/wgmik-server-web:${WGMIK_TAG:-latest}
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    depends_on:
-      api:
-        condition: service_healthy
-    ports:
-      # Web UI (nginx serves built frontend, proxies /api to backend)
-      - "5173:80"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-

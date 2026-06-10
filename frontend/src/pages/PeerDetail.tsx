@@ -53,6 +53,43 @@ function RenewKeyButton({
   );
 }
 
+function EyeOpenIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  );
+}
+
+function SecretRevealOverlay({
+  hidden,
+  onReveal,
+  children,
+  rounded = "rounded-2xl",
+}: {
+  hidden: boolean;
+  onReveal: () => void;
+  children: React.ReactNode;
+  rounded?: string;
+}) {
+  if (!hidden) return <>{children}</>;
+  return (
+    <div className="group relative">
+      {children}
+      <button
+        type="button"
+        onClick={onReveal}
+        aria-label="Show sensitive config"
+        className={`absolute inset-0 z-10 flex cursor-pointer flex-col items-center justify-center gap-1.5 ${rounded} bg-gray-900/0 text-white opacity-0 transition group-hover:bg-gray-900/50 group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40`}
+      >
+        <EyeOpenIcon size={22} />
+        <span className="text-xs font-medium">Click to view</span>
+      </button>
+    </div>
+  );
+}
+
 function generatePresharedKey(): string {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
@@ -1045,7 +1082,7 @@ export default function PeerDetail() {
                       }
                     }}
                     disabled={nameSaving}
-                    className="w-full min-w-0 max-w-full rounded border border-transparent bg-transparent px-1 -mx-1 text-base text-gray-500 dark:text-gray-400 focus:border-indigo-500/40 focus:outline-none focus:ring-0 disabled:opacity-60"
+                    className="w-full min-w-0 max-w-full rounded border border-transparent !bg-transparent px-1 -mx-1 text-base text-gray-500 dark:text-gray-400 focus:border-indigo-500/40 focus:outline-none focus:ring-0 disabled:opacity-60"
                     aria-label="Peer name"
                   />
                   {nameErr ? (
@@ -1638,14 +1675,19 @@ export default function PeerDetail() {
 	                  </div>
 	                  <div className="grid gap-1">
 	                    <div className="text-gray-500 dark:text-gray-400 text-sm">Config</div>
-	                    <textarea
-	                      readOnly
-	                      value={clientConfig}
-	                      rows={12}
-	                      className={`w-full rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 px-3 py-2 text-xs font-mono text-gray-900 dark:text-gray-100 focus:outline-none transition-[filter] ${
-	                        showClientSecrets ? "" : "blur-[3px] select-none"
-	                      }`}
-	                    />
+	                    <SecretRevealOverlay
+	                      hidden={!showClientSecrets}
+	                      onReveal={() => setShowClientSecrets(true)}
+	                    >
+	                      <textarea
+	                        readOnly
+	                        value={clientConfig}
+	                        rows={12}
+	                        className={`w-full rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 px-3 py-2 text-xs font-mono text-gray-900 dark:text-gray-100 focus:outline-none transition-[filter] ${
+	                          showClientSecrets ? "" : "blur-[3px] select-none"
+	                        }`}
+	                      />
+	                    </SecretRevealOverlay>
 	                    <div className="mt-3 flex flex-wrap items-center gap-2">
 	                      <button
 	                        type="button"
@@ -1674,9 +1716,15 @@ export default function PeerDetail() {
 	                </div>
 	                <div className="rounded-3xl ring-1 ring-gray-200 dark:ring-gray-800 bg-white dark:bg-gray-950 p-4 flex items-center justify-center min-h-[240px]">
 	                  {isValidWgPrivateKey ? (
-	                    <div className={`transition-[filter] ${showClientSecrets ? "" : "blur-[3px] select-none"}`}>
-	                      <QRCode value={clientConfig} size={220} />
-	                    </div>
+	                    <SecretRevealOverlay
+	                      hidden={!showClientSecrets}
+	                      onReveal={() => setShowClientSecrets(true)}
+	                      rounded="rounded-xl"
+	                    >
+	                      <div className={`transition-[filter] ${showClientSecrets ? "" : "blur-[3px] select-none"}`}>
+	                        <QRCode value={clientConfig} size={220} />
+	                      </div>
+	                    </SecretRevealOverlay>
 	                  ) : (
 	                    <div className="text-sm text-gray-500 dark:text-gray-400 text-center">
 	                      Paste a valid private key to render a QR code.

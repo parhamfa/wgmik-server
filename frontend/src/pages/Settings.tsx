@@ -1,6 +1,6 @@
 import React from "react";
 import { Link } from "react-router-dom";
-import { getSettings, putSettings, listRouters, createRouter, updateRouter, deleteRouter, getRouterDeleteImpact, testRouter, setRouterEnabled, purgeUsage, purgePeers, getUsageMaintenanceStatus, runUsageMaintenance, cancelUsageMaintenance, listUsers, createUser, updateUserAccount, resetUserPassword, deleteUserAccount, changePassword, type LocalUserDTO, type Router, type RouterDeleteImpactDTO, type RouterProto, type UsageMaintenanceStatusDTO } from "../api";
+import { getSettings, putSettings, listRouters, createRouter, updateRouter, deleteRouter, getRouterDeleteImpact, testRouter, setRouterEnabled, purgeUsage, purgePeers, getUsageMaintenanceStatus, runUsageMaintenance, cancelUsageMaintenance, getBackupStatus, runBackup, backupDownloadUrl, restoreBackup, waitForHealth, listUsers, createUser, updateUserAccount, resetUserPassword, deleteUserAccount, changePassword, startTlsSetup, getTlsSetupStatus, applyTlsSetup, type LocalUserDTO, type Router, type RouterDeleteImpactDTO, type RouterProto, type UsageMaintenanceStatusDTO, type BackupStatusDTO, type TlsSetupJobDTO, type TlsSetupMethod } from "../api";
 import { useAuth } from "../auth";
 import { useLooseNumberInput } from "../hooks/useLooseNumberInput";
 import { formatCalendarDateTime } from "../datetimeLocal";
@@ -104,12 +104,12 @@ export default function SettingsPage() {
     raw_sample_retention_hours: 24,
     minute_rollup_retention_days: 90,
     daily_rollup_retention_days: 0,
-    usage_maintenance_auto_enabled: false,
+    usage_maintenance_auto_enabled: true,
     usage_maintenance_auto_frequency: "daily" as "daily" | "every_n_days" | "weekly",
     usage_maintenance_auto_interval_days: 2,
     usage_maintenance_auto_weekday: 6,
-    usage_maintenance_auto_time: "04:30",
-    usage_maintenance_backup_keep: 3,
+    usage_maintenance_auto_time: "03:00",
+    usage_maintenance_backup_keep: 2,
   });
   const [err, setErr] = React.useState("");
   const [saveState, setSaveState] = React.useState<"idle" | "dirty" | "saving" | "saved" | "error">("idle");
@@ -127,6 +127,7 @@ export default function SettingsPage() {
   const [pauseBusyId, setPauseBusyId] = React.useState<number | null>(null);
   const [showRouterModal, setShowRouterModal] = React.useState(false);
   const [editingRouter, setEditingRouter] = React.useState<Router | null>(null);
+  const [tlsSetupRouter, setTlsSetupRouter] = React.useState<Router | null>(null);
   const defaultProtoPort: Record<RouterProto, number> = { rest: 443, "rest-http": 80, api: 8729, "api-plain": 8728 };
   const [routerForm, setRouterForm] = React.useState({
     name: "",
@@ -150,6 +151,19 @@ export default function SettingsPage() {
   const [usageMaintenance, setUsageMaintenance] = React.useState<UsageMaintenanceStatusDTO | null>(null);
   const [showMaintenanceModal, setShowMaintenanceModal] = React.useState(false);
   const [maintenanceCancelBusy, setMaintenanceCancelBusy] = React.useState(false);
+  const [backupStatus, setBackupStatus] = React.useState<BackupStatusDTO | null>(null);
+  const [showBackupModal, setShowBackupModal] = React.useState(false);
+  const [backupBusy, setBackupBusy] = React.useState(false);
+  const [backupErr, setBackupErr] = React.useState("");
+  const [backupKeyCopied, setBackupKeyCopied] = React.useState(false);
+  const [restoreFile, setRestoreFile] = React.useState<File | null>(null);
+  const [restoreKey, setRestoreKey] = React.useState("");
+  const [confirmRestore, setConfirmRestore] = React.useState(false);
+  const [restoreBusy, setRestoreBusy] = React.useState(false);
+  const [restoreRestarting, setRestoreRestarting] = React.useState(false);
+  const [restoreErr, setRestoreErr] = React.useState("");
+  const [restoreMsg, setRestoreMsg] = React.useState("");
+  const [advancedOpen, setAdvancedOpen] = React.useState(false);
 
   // User management state
   const [users, setUsers] = React.useState<LocalUserDTO[]>([]);
@@ -207,13 +221,17 @@ export default function SettingsPage() {
   const backupKeepInput = useLooseNumberInput(
     form.usage_maintenance_backup_keep,
     (n) => setForm((f) => ({ ...f, usage_maintenance_backup_keep: n })),
-    { min: 1, max: 50, emptyFallback: 3 },
+    { min: 1, max: 50, emptyFallback: 2 },
   );
 
   const maintenanceProgress = Math.max(0, Math.min(100, Number(usageMaintenance?.progress_percent ?? 0)));
   const maintenancePhaseProgress = Math.max(0, Math.min(100, Number(usageMaintenance?.phase_progress_percent ?? 0)));
   const maintenanceIsTerminal = !!usageMaintenance && !usageMaintenance.running && ["complete", "failed", "cancelled"].includes(usageMaintenance.phase);
   const maintenanceStatusLabel = usageMaintenance?.phase_label || usageMaintenance?.phase || "Idle";
+  const backupProgress = Math.max(0, Math.min(100, Number(backupStatus?.progress_percent ?? 0)));
+  const backupIsTerminal = !!backupStatus && !backupStatus.running && ["complete", "failed"].includes(backupStatus.phase);
+  const backupStatusLabel = backupStatus?.phase_label || backupStatus?.phase || "Idle";
+  const dataOpsLocked = !!usageMaintenance?.running || !!backupStatus?.running || restoreRestarting;
 
   const timezoneOptions = React.useMemo(() => {
     const supportedValuesOf = (Intl as any)?.supportedValuesOf as undefined | ((key: string) => string[]);
@@ -337,6 +355,22 @@ export default function SettingsPage() {
   React.useEffect(() => {
     if (saveState === "saved") loadUsageMaintenance();
   }, [saveState, loadUsageMaintenance]);
+  const loadBackupStatus = React.useCallback(async () => {
+    try {
+      const status = await getBackupStatus();
+      setBackupStatus(status);
+    } catch {
+      setBackupStatus(null);
+    }
+  }, []);
+  React.useEffect(() => { loadBackupStatus(); }, [loadBackupStatus]);
+  React.useEffect(() => {
+    if (!backupStatus?.running) return;
+    const timer = window.setInterval(() => {
+      loadBackupStatus();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [backupStatus?.running, loadBackupStatus]);
   React.useEffect(() => {
     if (!confirmDeleteRouter) return;
     let cancelled = false;
@@ -458,7 +492,7 @@ export default function SettingsPage() {
   };
 
   React.useEffect(() => { loadUsers(); }, [loadUsers]);
-  const retentionLocked = !!usageMaintenance?.running;
+  const retentionLocked = dataOpsLocked;
   const blockingPasswordChange = !!user?.must_change_password;
   React.useEffect(() => {
     if (blockingPasswordChange) {
@@ -638,23 +672,24 @@ export default function SettingsPage() {
           </div>
         </div>
         <div className="grid gap-4">
+          <div className="grid gap-4 md:grid-flow-col md:grid-rows-3 md:grid-cols-2">
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Poll interval (seconds)</label>
-            <input type="number" min={5} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...pollIntervalInput} />
+            <input type="number" min={5} className="w-full max-w-xs rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...pollIntervalInput} />
           </div>
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Online threshold (seconds)</label>
-            <input type="number" min={5} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...onlineThresholdInput} />
+            <input type="number" min={5} className="w-full max-w-xs rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...onlineThresholdInput} />
           </div>
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Monthly reset day (selected calendar)</label>
-            <input type="number" min={1} max={31} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...monthlyResetInput} />
+            <input type="number" min={1} max={31} className="w-full max-w-xs rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...monthlyResetInput} />
           </div>
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Timezone</label>
             {timezoneOptions.length ? (
               <select
-                className="w-full md:w-80 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
+                className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
                 value={form.timezone}
                 onChange={(e) => setForm({ ...form, timezone: e.target.value })}
               >
@@ -666,7 +701,7 @@ export default function SettingsPage() {
               </select>
             ) : (
               <input
-                className="w-full md:w-80 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+                className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
                 value={form.timezone}
                 onChange={(e) => setForm({ ...form, timezone: e.target.value })}
               />
@@ -675,7 +710,7 @@ export default function SettingsPage() {
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Calendar</label>
             <select
-              className="w-full md:w-80 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
+              className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
               value={form.date_calendar}
               onChange={(e) => setForm({ ...form, date_calendar: e.target.value as "gregorian" | "persian" })}
             >
@@ -686,7 +721,7 @@ export default function SettingsPage() {
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Week starts on</label>
             <select
-              className="w-full md:w-80 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
+              className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
               value={form.week_start_day}
               onChange={(e) => setForm({ ...form, week_start_day: Number(e.target.value) })}
             >
@@ -698,6 +733,7 @@ export default function SettingsPage() {
               <option value={5}>Saturday</option>
               <option value={6}>Sunday</option>
             </select>
+          </div>
           </div>
           <div className="grid gap-2 pt-2 border-t border-gray-100 dark:border-gray-800">
             <label className="inline-flex items-center gap-2 text-xs text-gray-700 dark:text-gray-200">
@@ -769,6 +805,16 @@ export default function SettingsPage() {
 	                          Unsupported: requires RouterOS 7.15+
 	                        </span>
 	                      )}
+	                      {(r.proto === "rest-http" || r.proto === "api-plain") && (
+	                        <button
+	                          type="button"
+	                          onClick={() => setTlsSetupRouter(r)}
+	                          title="This profile sends credentials and WireGuard keys unencrypted. Click to set up TLS."
+	                          className="whitespace-nowrap rounded-full bg-yellow-100 text-yellow-800 px-2.5 py-1 font-medium shadow-sm hover:bg-yellow-200 dark:bg-yellow-500/15 dark:text-yellow-300 dark:hover:bg-yellow-500/25"
+	                        >
+	                          Unencrypted — set up TLS
+	                        </button>
+	                      )}
 	                    </div>
                   </div>
                   <div className="flex shrink-0 flex-wrap items-center gap-2 self-start sm:self-auto">
@@ -835,12 +881,273 @@ export default function SettingsPage() {
       <div className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 mb-6">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-3">
           <div>
+            <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">Backup & restore</div>
+            <div className="text-xs text-gray-500 dark:text-gray-400">
+              Create an encrypted full backup (all routers, peers, settings, usage) or restore one on this server.
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={backupBusy || dataOpsLocked}
+            onClick={async () => {
+              setBackupErr("");
+              setBackupKeyCopied(false);
+              setShowBackupModal(true);
+              try {
+                setBackupBusy(true);
+                const status = await runBackup();
+                setBackupStatus(status);
+              } catch (e: any) {
+                setBackupErr(e?.message || "Failed to start backup");
+                await loadBackupStatus();
+              } finally {
+                setBackupBusy(false);
+              }
+            }}
+            className="inline-flex shrink-0 items-center gap-2 self-start whitespace-nowrap rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white sm:self-auto"
+          >
+            {backupStatus?.running ? "Backup running" : backupBusy ? "Starting..." : "Create backup"}
+          </button>
+        </div>
+        {backupErr && <div className="text-sm text-red-600 mb-3">{backupErr}</div>}
+        {restoreMsg && <div className="text-sm text-green-700 dark:text-green-300 mb-3">{restoreMsg}</div>}
+        {restoreErr && <div className="text-sm text-red-600 mb-3">{restoreErr}</div>}
+        {restoreRestarting && (
+          <div className="text-sm text-amber-700 dark:text-amber-300 mb-3">
+            Restoring — server is restarting. You will be redirected to sign in when it is back online.
+          </div>
+        )}
+        <div className="grid gap-3 pt-1 border-t border-gray-100 dark:border-gray-800">
+          <div className="text-xs font-semibold text-gray-900 dark:text-gray-100 pt-3">Restore from backup</div>
+          <div className="text-xs text-gray-500 dark:text-gray-400">
+            Upload a `.wgmik` backup file and enter the secret key shown when that backup was created. This replaces all data on this server.
+          </div>
+          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-end">
+            <label className="grid gap-1 text-xs text-gray-700 dark:text-gray-200">
+              <span className="text-gray-500 dark:text-gray-400">Backup file</span>
+              <input
+                type="file"
+                accept=".wgmik,application/octet-stream"
+                disabled={dataOpsLocked || restoreBusy || restoreRestarting}
+                onChange={(e) => {
+                  setRestoreErr("");
+                  setRestoreMsg("");
+                  setRestoreFile(e.target.files?.[0] || null);
+                }}
+                className="block w-full text-xs file:mr-3 file:rounded-full file:border-0 file:bg-gray-100 file:px-3 file:py-1.5 file:text-gray-800 dark:file:bg-gray-800 dark:file:text-gray-100"
+              />
+            </label>
+            <label className="grid gap-1 text-xs text-gray-700 dark:text-gray-200">
+              <span className="text-gray-500 dark:text-gray-400">Secret key</span>
+              <input
+                type="password"
+                value={restoreKey}
+                disabled={dataOpsLocked || restoreBusy || restoreRestarting}
+                onChange={(e) => {
+                  setRestoreErr("");
+                  setRestoreKey(e.target.value);
+                }}
+                placeholder="Paste backup secret key"
+                className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+              />
+            </label>
+            <button
+              type="button"
+              disabled={!restoreFile || !restoreKey.trim() || dataOpsLocked || restoreBusy || restoreRestarting}
+              onClick={() => {
+                setRestoreErr("");
+                setRestoreMsg("");
+                setConfirmRestore(true);
+              }}
+              className="rounded-full bg-rose-600 text-white px-4 py-2 text-sm shadow hover:bg-rose-700 disabled:opacity-50"
+            >
+              Restore backup
+            </button>
+          </div>
+          {backupStatus && (
+            <div className="text-[11px] text-gray-500 dark:text-gray-400">
+              Last backup: {backupStatus.phase === "complete" && backupStatus.finished_at
+                ? formatCalendarDateTime(backupStatus.finished_at, { timeZone: form.timezone, dateCalendar: form.date_calendar })
+                : backupStatus.running
+                  ? `${backupStatusLabel} · ${backupProgress.toFixed(0)}%`
+                  : backupStatus.last_error || "Never completed"}
+              {backupStatus.file_size ? ` · ${formatBytes(backupStatus.file_size)}` : ""}
+            </div>
+          )}
+        </div>
+      </div>
+      {/* User Management Section */}
+      <div className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 mb-6">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">User Management</div>
+            <div className="text-xs text-gray-500 dark:text-gray-400">Add admin logins, reset passwords, and deactivate accounts.</div>
+          </div>
+        </div>
+        {userMsg && <div className="text-sm text-green-700 dark:text-green-300 mb-3">{userMsg}</div>}
+        {userErr && <div className="text-sm text-red-600 dark:text-red-300 mb-3">{userErr}</div>}
+        <form onSubmit={handleCreateUser} className="flex flex-wrap gap-3 mb-4">
+          <input
+            type="text"
+            placeholder="Username"
+            className="flex-1 min-w-[120px] rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+            value={newUsername}
+            onChange={(e) => setNewUsername(e.target.value)}
+            required
+          />
+          <input
+            type="password"
+            placeholder="Password"
+            className="flex-1 min-w-[120px] rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            required
+          />
+          <button
+            type="submit"
+            disabled={userBusy}
+            className="rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+          >
+            {userBusy ? "Adding..." : "Add User"}
+          </button>
+        </form>
+        <div className="text-xs text-gray-500 dark:text-gray-400 mb-4">New local users are full admins. Passwords must be at least 12 characters.</div>
+        <div className="grid gap-2">
+          {users.map((u) => (
+            <div key={u.id} className="rounded-2xl ring-1 ring-gray-200 dark:ring-gray-800 bg-white dark:bg-gray-950 p-4 grid gap-3">
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <div className="text-sm font-medium text-gray-900 dark:text-gray-100">{u.username}</div>
+                    {u.id === user?.id && (
+                      <span className="rounded-full bg-gray-100 text-gray-700 px-2.5 py-1 text-[11px] dark:bg-gray-800 dark:text-gray-300">You</span>
+                    )}
+                    <span className={`rounded-full px-2.5 py-1 text-[11px] ${u.is_active ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300" : "bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300"}`}>
+                      {u.is_active ? "Active" : "Inactive"}
+                    </span>
+                    {isAccountLocked(u.locked_until) && (
+                      <span className="rounded-full bg-amber-50 text-amber-700 px-2.5 py-1 text-[11px] dark:bg-amber-500/10 dark:text-amber-300">Locked</span>
+                    )}
+                    {u.must_change_password && (
+                      <span className="rounded-full bg-indigo-50 text-indigo-700 px-2.5 py-1 text-[11px] dark:bg-indigo-500/10 dark:text-indigo-300">Must change password</span>
+                    )}
+                  </div>
+                  <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                    Created: {formatCalendarDateTime(u.created_at, { timeZone: form.timezone, dateCalendar: form.date_calendar, includeTime: false })}
+                  </div>
+                  <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                    Last login: {u.last_login_at ? formatCalendarDateTime(u.last_login_at, { timeZone: form.timezone, dateCalendar: form.date_calendar }) : "Never"}
+                  </div>
+                  {isAccountLocked(u.locked_until) && (
+                    <div className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                      Locked until {formatCalendarDateTime(u.locked_until || "", { timeZone: form.timezone, dateCalendar: form.date_calendar })}
+                    </div>
+                  )}
+                </div>
+                <div className={`flex gap-2 ${u.id === user?.id ? "flex-col items-end" : "flex-wrap"}`}>
+                  {u.id !== user?.id && (
+                    <button
+                      type="button"
+                      disabled={userBusy}
+                      onClick={() => setResetPasswordUser(u)}
+                      className="rounded-full bg-gray-100 text-gray-800 px-3 py-1.5 text-xs shadow hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                    >
+                      Reset password
+                    </button>
+                  )}
+                  {isAccountLocked(u.locked_until) && (
+                    <button
+                      type="button"
+                      disabled={userBusy}
+                      onClick={() => handleUpdateUser(u.id, { unlock: true }, `Unlocked ${u.username}.`)}
+                      className="rounded-full bg-amber-50 text-amber-700 px-3 py-1.5 text-xs shadow hover:bg-amber-100 disabled:opacity-50 dark:bg-amber-500/10 dark:text-amber-300 dark:hover:bg-amber-500/20"
+                    >
+                      Unlock
+                    </button>
+                  )}
+                  {u.is_active ? (
+                    <>
+                      <button
+                        type="button"
+                        disabled={userBusy || u.id === user?.id}
+                        onClick={() => handleUpdateUser(u.id, { is_active: false }, `Deactivated ${u.username}.`)}
+                        className="rounded-full bg-rose-50 text-rose-700 px-3 py-1.5 text-xs shadow hover:bg-rose-100 disabled:opacity-50 dark:bg-rose-500/10 dark:text-rose-300 dark:hover:bg-rose-500/20"
+                      >
+                        Deactivate
+                      </button>
+                      {u.id === user?.id && (
+                        <button
+                          type="button"
+                          onClick={() => setShowMyPasswordModal(true)}
+                          className="rounded-full bg-gray-100 text-gray-800 px-3 py-1.5 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                        >
+                          Change my password
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        disabled={userBusy}
+                        onClick={() => handleUpdateUser(u.id, { is_active: true }, `Reactivated ${u.username}.`)}
+                        className="rounded-full bg-emerald-50 text-emerald-700 px-3 py-1.5 text-xs shadow hover:bg-emerald-100 disabled:opacity-50 dark:bg-emerald-500/10 dark:text-emerald-300 dark:hover:bg-emerald-500/20"
+                      >
+                        Reactivate
+                      </button>
+                      <button
+                        type="button"
+                        disabled={userBusy}
+                        onClick={() => handleDeleteUser(u)}
+                        className="rounded-full bg-rose-600 text-white px-3 py-1.5 text-xs shadow hover:bg-rose-700 disabled:opacity-50"
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+          {users.length === 0 && (
+            <div className="rounded-2xl border border-dashed border-gray-200 dark:border-gray-800 p-4 text-sm text-gray-500 dark:text-gray-400">No users found.</div>
+          )}
+        </div>
+      </div>
+      <div className="mb-6 flex flex-col items-center gap-5">
+        <button
+          type="button"
+          onClick={() => setAdvancedOpen((open) => !open)}
+          aria-expanded={advancedOpen}
+          className="group inline-flex items-center gap-2 rounded-full border border-gray-200/80 bg-gray-50/90 px-4 py-2 text-sm font-medium text-gray-700 shadow-sm backdrop-blur transition hover:-translate-y-0.5 hover:bg-white hover:shadow-md dark:border-gray-700 dark:bg-gray-800/90 dark:text-gray-200 dark:hover:bg-gray-800"
+        >
+          <span>{advancedOpen ? "Hide advanced settings" : "Advanced settings"}</span>
+          <svg
+            viewBox="0 0 20 20"
+            fill="none"
+            className={`h-4 w-4 transition-transform ${advancedOpen ? "rotate-180" : ""}`}
+            aria-hidden="true"
+          >
+            <path
+              d="M5 7.5 10 12.5 15 7.5"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </button>
+        {advancedOpen && (
+          <div className="w-full rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 grid gap-6">
+            <div>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-3">
+          <div>
             <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">Data maintenance</div>
             <div className="text-xs text-gray-500 dark:text-gray-400">Run controlled cleanup or use the destructive purge actions below.</div>
           </div>
           <button
             type="button"
-            disabled={maintBusy !== null || !!usageMaintenance?.running}
+            disabled={maintBusy !== null || dataOpsLocked}
             onClick={async () => {
               setMaintErr("");
               setMaintMsg("");
@@ -975,7 +1282,7 @@ export default function SettingsPage() {
                   type="time"
                   className="rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
                   value={form.usage_maintenance_auto_time}
-                  onChange={(e) => setForm((f) => ({ ...f, usage_maintenance_auto_time: e.target.value || "04:30" }))}
+                  onChange={(e) => setForm((f) => ({ ...f, usage_maintenance_auto_time: e.target.value || "03:00" }))}
                 />
                 <span className="text-gray-500 dark:text-gray-400">({form.timezone || "UTC"})</span>
               </div>
@@ -1054,7 +1361,7 @@ export default function SettingsPage() {
             <div className="text-xs text-gray-600 dark:text-gray-300">Purge all usage data (raw samples, minute, daily and monthly rollups). Peers and routers stay.</div>
             <button
               type="button"
-              disabled={maintBusy !== null || !!usageMaintenance?.running}
+              disabled={maintBusy !== null || dataOpsLocked}
               onClick={() => { setMaintErr(""); setMaintMsg(""); setConfirmAction("usage"); }}
               className="shrink-0 self-start whitespace-nowrap rounded-full bg-rose-50 text-rose-700 px-4 py-1.5 text-xs shadow hover:bg-rose-100 disabled:opacity-50 sm:self-auto"
             >
@@ -1065,7 +1372,7 @@ export default function SettingsPage() {
             <div className="text-xs text-gray-600 dark:text-gray-300">Delete all peers (and their quotas/usages). Routers remain configured.</div>
             <button
               type="button"
-              disabled={maintBusy !== null || !!usageMaintenance?.running}
+              disabled={maintBusy !== null || dataOpsLocked}
               onClick={() => { setMaintErr(""); setMaintMsg(""); setConfirmAction("peers"); }}
               className="shrink-0 self-start whitespace-nowrap rounded-full bg-rose-600 text-white px-4 py-1.5 text-xs shadow hover:bg-rose-700 disabled:opacity-50 sm:self-auto"
             >
@@ -1073,144 +1380,9 @@ export default function SettingsPage() {
             </button>
           </div>
         </div>
-      </div>
-      {/* User Management Section */}
-      <div className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 mb-6">
-        <div className="flex items-center justify-between mb-4">
-          <div>
-            <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">User Management</div>
-            <div className="text-xs text-gray-500 dark:text-gray-400">Manage admin accounts without drifting into full RBAC.</div>
-          </div>
-        </div>
-        {userMsg && <div className="text-sm text-green-700 dark:text-green-300 mb-3">{userMsg}</div>}
-        {userErr && <div className="text-sm text-red-600 dark:text-red-300 mb-3">{userErr}</div>}
-        <form onSubmit={handleCreateUser} className="flex flex-wrap gap-3 mb-4">
-          <input
-            type="text"
-            placeholder="Username"
-            className="flex-1 min-w-[120px] rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
-            value={newUsername}
-            onChange={(e) => setNewUsername(e.target.value)}
-            required
-          />
-          <input
-            type="password"
-            placeholder="Password"
-            className="flex-1 min-w-[120px] rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
-            value={newPassword}
-            onChange={(e) => setNewPassword(e.target.value)}
-            required
-          />
-          <button
-            type="submit"
-            disabled={userBusy}
-            className="rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
-          >
-            {userBusy ? "Adding..." : "Add User"}
-          </button>
-        </form>
-        <div className="text-xs text-gray-500 dark:text-gray-400 mb-4">New local users are full admins. Passwords must be at least 12 characters.</div>
-        <div className="grid gap-2">
-          {users.map((u) => (
-            <div key={u.id} className="rounded-2xl ring-1 ring-gray-200 dark:ring-gray-800 bg-white dark:bg-gray-950 p-4 grid gap-3">
-              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-                <div>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <div className="text-sm font-medium text-gray-900 dark:text-gray-100">{u.username}</div>
-                    {u.id === user?.id && (
-                      <span className="rounded-full bg-gray-100 text-gray-700 px-2.5 py-1 text-[11px] dark:bg-gray-800 dark:text-gray-300">You</span>
-                    )}
-                    <span className={`rounded-full px-2.5 py-1 text-[11px] ${u.is_active ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300" : "bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300"}`}>
-                      {u.is_active ? "Active" : "Inactive"}
-                    </span>
-                    {isAccountLocked(u.locked_until) && (
-                      <span className="rounded-full bg-amber-50 text-amber-700 px-2.5 py-1 text-[11px] dark:bg-amber-500/10 dark:text-amber-300">Locked</span>
-                    )}
-                    {u.must_change_password && (
-                      <span className="rounded-full bg-indigo-50 text-indigo-700 px-2.5 py-1 text-[11px] dark:bg-indigo-500/10 dark:text-indigo-300">Must change password</span>
-                    )}
-                  </div>
-                  <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-                    Created: {formatCalendarDateTime(u.created_at, { timeZone: form.timezone, dateCalendar: form.date_calendar, includeTime: false })}
-                  </div>
-                  <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                    Last login: {u.last_login_at ? formatCalendarDateTime(u.last_login_at, { timeZone: form.timezone, dateCalendar: form.date_calendar }) : "Never"}
-                  </div>
-                  {isAccountLocked(u.locked_until) && (
-                    <div className="mt-1 text-xs text-amber-700 dark:text-amber-300">
-                      Locked until {formatCalendarDateTime(u.locked_until || "", { timeZone: form.timezone, dateCalendar: form.date_calendar })}
-                    </div>
-                  )}
-                </div>
-                <div className={`flex gap-2 ${u.id === user?.id ? "flex-col items-end" : "flex-wrap"}`}>
-                  {u.id !== user?.id && (
-                    <button
-                      type="button"
-                      disabled={userBusy}
-                      onClick={() => setResetPasswordUser(u)}
-                      className="rounded-full bg-gray-100 text-gray-800 px-3 py-1.5 text-xs shadow hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
-                    >
-                      Reset password
-                    </button>
-                  )}
-                  {isAccountLocked(u.locked_until) && (
-                    <button
-                      type="button"
-                      disabled={userBusy}
-                      onClick={() => handleUpdateUser(u.id, { unlock: true }, `Unlocked ${u.username}.`)}
-                      className="rounded-full bg-amber-50 text-amber-700 px-3 py-1.5 text-xs shadow hover:bg-amber-100 disabled:opacity-50 dark:bg-amber-500/10 dark:text-amber-300 dark:hover:bg-amber-500/20"
-                    >
-                      Unlock
-                    </button>
-                  )}
-                  {u.is_active ? (
-                    <>
-                      <button
-                        type="button"
-                        disabled={userBusy || u.id === user?.id}
-                        onClick={() => handleUpdateUser(u.id, { is_active: false }, `Deactivated ${u.username}.`)}
-                        className="rounded-full bg-rose-50 text-rose-700 px-3 py-1.5 text-xs shadow hover:bg-rose-100 disabled:opacity-50 dark:bg-rose-500/10 dark:text-rose-300 dark:hover:bg-rose-500/20"
-                      >
-                        Deactivate
-                      </button>
-                      {u.id === user?.id && (
-                        <button
-                          type="button"
-                          onClick={() => setShowMyPasswordModal(true)}
-                          className="rounded-full bg-gray-100 text-gray-800 px-3 py-1.5 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
-                        >
-                          Change my password
-                        </button>
-                      )}
-                    </>
-                  ) : (
-                    <>
-                      <button
-                        type="button"
-                        disabled={userBusy}
-                        onClick={() => handleUpdateUser(u.id, { is_active: true }, `Reactivated ${u.username}.`)}
-                        className="rounded-full bg-emerald-50 text-emerald-700 px-3 py-1.5 text-xs shadow hover:bg-emerald-100 disabled:opacity-50 dark:bg-emerald-500/10 dark:text-emerald-300 dark:hover:bg-emerald-500/20"
-                      >
-                        Reactivate
-                      </button>
-                      <button
-                        type="button"
-                        disabled={userBusy}
-                        onClick={() => handleDeleteUser(u)}
-                        className="rounded-full bg-rose-600 text-white px-3 py-1.5 text-xs shadow hover:bg-rose-700 disabled:opacity-50"
-                      >
-                        Delete
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
             </div>
-          ))}
-          {users.length === 0 && (
-            <div className="rounded-2xl border border-dashed border-gray-200 dark:border-gray-800 p-4 text-sm text-gray-500 dark:text-gray-400">No users found.</div>
-          )}
-        </div>
+          </div>
+        )}
       </div>
         </>
       )}
@@ -1478,6 +1650,114 @@ export default function SettingsPage() {
           </div>
         </div>
       )}
+      {showBackupModal && backupStatus && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-xl rounded-2xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-5">
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">Manual backup</div>
+                <div className="text-sm text-gray-600 dark:text-gray-300">
+                  {backupStatusLabel}
+                  {backupStatus.running ? ` · ${backupProgress.toFixed(0)}%` : backupIsTerminal ? ` · ${backupStatus.phase}` : ""}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowBackupModal(false)}
+                disabled={backupStatus.running}
+                className="rounded-full bg-gray-100 text-gray-800 h-8 w-8 flex items-center justify-center hover:bg-gray-200 disabled:opacity-40 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                aria-label="Close backup dialog"
+              >
+                x
+              </button>
+            </div>
+
+            <div className="grid gap-2">
+              <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+                <span>Progress</span>
+                <span>{backupProgress.toFixed(0)}%</span>
+              </div>
+              <div className="h-3 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-800">
+                <div
+                  className={`h-full rounded-full transition-all ${backupStatus.phase === "failed" ? "bg-rose-600" : "bg-gray-900 dark:bg-gray-100"}`}
+                  style={{ width: `${backupProgress}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="rounded-2xl bg-gray-50 dark:bg-gray-950 ring-1 ring-gray-200 dark:ring-gray-800 p-4 grid gap-3">
+              <div className="text-sm text-gray-700 dark:text-gray-200">
+                {backupStatus.detail || "Preparing backup."}
+              </div>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
+                <div>
+                  <div className="text-gray-500 dark:text-gray-400">Elapsed</div>
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{formatDuration(backupStatus.elapsed_seconds)}</div>
+                </div>
+                <div>
+                  <div className="text-gray-500 dark:text-gray-400">Bundle size</div>
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{formatBytes(backupStatus.file_size ?? null)}</div>
+                </div>
+              </div>
+              {backupStatus.last_error && (
+                <div className="text-sm text-rose-600 dark:text-rose-300">{backupStatus.last_error}</div>
+              )}
+            </div>
+
+            {backupStatus.phase === "complete" && backupStatus.secret_key && (
+              <div className="rounded-2xl ring-1 ring-amber-200 bg-amber-50 dark:bg-amber-500/10 dark:ring-amber-500/30 p-4 grid gap-3">
+                <div className="text-sm font-medium text-amber-900 dark:text-amber-200">Save this secret key</div>
+                <div className="text-xs text-amber-800 dark:text-amber-300">
+                  You need this key to restore this backup on another server. It is shown only here — copy it now and store it somewhere safe.
+                </div>
+                <div className="flex items-stretch gap-2">
+                  <code className="flex-1 break-all rounded-xl bg-white/80 dark:bg-gray-950 px-3 py-2 text-xs text-gray-900 dark:text-gray-100 ring-1 ring-amber-200 dark:ring-amber-500/30">
+                    {backupStatus.secret_key}
+                  </code>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(backupStatus.secret_key || "");
+                        setBackupKeyCopied(true);
+                      } catch {
+                        setBackupErr("Could not copy to clipboard. Select the key and copy manually.");
+                      }
+                    }}
+                    className={`shrink-0 rounded-full px-4 py-2 text-sm shadow ${backupKeyCopied ? "bg-emerald-600 text-white" : "bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900"}`}
+                  >
+                    {backupKeyCopied ? "Copied" : "Copy key"}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-3">
+              {!backupStatus.running && (
+                <button
+                  type="button"
+                  onClick={() => setShowBackupModal(false)}
+                  className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                >
+                  Close
+                </button>
+              )}
+              {backupStatus.phase === "complete" && backupStatus.download_token && (
+                <button
+                  type="button"
+                  disabled={!backupKeyCopied}
+                  onClick={() => {
+                    window.location.href = backupDownloadUrl(backupStatus.download_token || "");
+                  }}
+                  className="rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+                >
+                  Download backup
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
       {showRouterModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
           <div className="w-full max-w-lg rounded-3xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-4">
@@ -1656,6 +1936,55 @@ export default function SettingsPage() {
           </div>
         </div>
       )}
+      {confirmRestore && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-4">
+            <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">Restore backup</div>
+            <div className="text-sm text-gray-600 dark:text-gray-300 grid gap-2">
+              <p>This replaces all data on this server with the uploaded backup.</p>
+              <p>Routers, peers, usage, settings, and users will be overwritten. Everyone will be signed out and must sign in again after the server restarts.</p>
+              {restoreFile && (
+                <p className="text-xs text-gray-500 dark:text-gray-400 break-all">File: {restoreFile.name}</p>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setConfirmRestore(false)}
+                disabled={restoreBusy}
+                className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={restoreBusy || !restoreFile || !restoreKey.trim()}
+                onClick={async () => {
+                  if (!restoreFile) return;
+                  setRestoreErr("");
+                  setRestoreMsg("");
+                  setConfirmRestore(false);
+                  setRestoreBusy(true);
+                  setRestoreRestarting(true);
+                  try {
+                    await restoreBackup(restoreFile, restoreKey);
+                    await waitForHealth();
+                    window.location.href = "/login";
+                  } catch (e: any) {
+                    setRestoreRestarting(false);
+                    setRestoreErr(e?.message || "Restore failed");
+                  } finally {
+                    setRestoreBusy(false);
+                  }
+                }}
+                className="rounded-full bg-rose-600 text-white px-4 py-2 text-sm shadow hover:bg-rose-700 disabled:opacity-50"
+              >
+                {restoreBusy ? "Restoring..." : "Yes, replace everything"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {confirmAction && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
           <div className="w-full max-w-sm rounded-2xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-4">
@@ -1707,6 +2036,311 @@ export default function SettingsPage() {
           </div>
         </div>
       )}
+      {tlsSetupRouter && (
+        <TlsSetupModal
+          router={tlsSetupRouter}
+          onClose={async (changed) => {
+            setTlsSetupRouter(null);
+            if (changed) {
+              setRouterMsg(`Profile ${tlsSetupRouter.name} now uses TLS.`);
+              setRouterErr("");
+              await loadRouters();
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function TlsSetupModal({ router, onClose }: { router: Router; onClose: (changed: boolean) => void | Promise<void> }) {
+  type Phase = "configure" | "running" | "ready" | "applied";
+  const isRest = router.proto === "rest-http";
+  const targetService = isRest ? "www-ssl" : "api-ssl";
+  const plainService = isRest ? "www" : "api";
+  const targetProto = isRest ? "REST HTTPS" : "API TLS";
+  const defaultTlsPort = isRest ? 443 : 8729;
+
+  const [phase, setPhase] = React.useState<Phase>("configure");
+  const [method, setMethod] = React.useState<TlsSetupMethod>("self_signed");
+  const [commonName, setCommonName] = React.useState(router.host);
+  const [daysValid, setDaysValid] = React.useState(3650);
+  const [dnsName, setDnsName] = React.useState("");
+  const [job, setJob] = React.useState<TlsSetupJobDTO | null>(null);
+  const [err, setErr] = React.useState("");
+  const [applyBusy, setApplyBusy] = React.useState(false);
+  const [disablePlain, setDisablePlain] = React.useState(false);
+  const [disableBusy, setDisableBusy] = React.useState(false);
+  const [disableDone, setDisableDone] = React.useState(false);
+  const [disableErr, setDisableErr] = React.useState("");
+  const pollRef = React.useRef<number | null>(null);
+
+  React.useEffect(() => () => {
+    if (pollRef.current !== null) window.clearInterval(pollRef.current);
+  }, []);
+
+  const startRun = async () => {
+    setErr("");
+    if (method === "letsencrypt" && !dnsName.trim()) {
+      setErr("A public DNS name is required for Let's Encrypt.");
+      return;
+    }
+    try {
+      setPhase("running");
+      const initial = await startTlsSetup(router.id, {
+        method,
+        common_name: commonName.trim() || router.host,
+        days_valid: daysValid,
+        dns_name: dnsName.trim(),
+      });
+      setJob(initial);
+      pollRef.current = window.setInterval(async () => {
+        try {
+          const status = await getTlsSetupStatus(router.id);
+          setJob(status);
+          if (status.status !== "running") {
+            if (pollRef.current !== null) window.clearInterval(pollRef.current);
+            pollRef.current = null;
+            if (status.status === "ok") setPhase("ready");
+          }
+        } catch {
+          // transient poll failure; keep trying until the job resolves
+        }
+      }, 1500);
+    } catch (e: any) {
+      setErr(e?.message || "Failed to start TLS setup");
+      setPhase("configure");
+    }
+  };
+
+  const stepIcon = (status: string) =>
+    status === "ok" ? "✓" : status === "failed" ? "✕" : status === "running" ? "…" : "·";
+  const stepColor = (status: string) =>
+    status === "ok"
+      ? "text-emerald-600 dark:text-emerald-400"
+      : status === "failed"
+        ? "text-rose-600 dark:text-rose-400"
+        : status === "running"
+          ? "text-gray-900 dark:text-gray-100"
+          : "text-gray-400 dark:text-gray-600";
+
+  const result = job?.result || {};
+  const failed = job?.status === "failed";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
+      <div className="w-full max-w-lg rounded-3xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-4 max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between">
+          <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">Set up TLS for {router.name}</div>
+          <button
+            onClick={() => void onClose(phase === "applied")}
+            className="rounded-full bg-gray-100 text-gray-800 h-8 w-8 flex items-center justify-center hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+          >
+            ✕
+          </button>
+        </div>
+
+        {phase === "configure" && (
+          <>
+            <div className="rounded-2xl bg-yellow-50 dark:bg-yellow-500/10 ring-1 ring-yellow-200 dark:ring-yellow-500/20 px-4 py-3 grid gap-1 text-sm text-yellow-900 dark:text-yellow-200">
+              <div className="font-medium">This connection is unencrypted.</div>
+              <div className="text-xs text-yellow-800/90 dark:text-yellow-200/80">
+                {isRest
+                  ? "REST over HTTP sends the router password (Basic auth) and all data — including WireGuard private and preshared keys — in cleartext."
+                  : "The plain RouterOS API sends the login password and all data — including WireGuard private and preshared keys — in cleartext."}
+              </div>
+              <div className="text-xs text-yellow-800/90 dark:text-yellow-200/80">
+                Note: this setup itself runs over the current plaintext channel. Run it from a trusted network segment.
+              </div>
+            </div>
+            <div className="grid gap-3">
+              <div className="grid gap-1">
+                <label className="text-xs text-gray-500 dark:text-gray-400">Certificate method</label>
+                <select
+                  value={method}
+                  onChange={(e) => setMethod(e.target.value as TlsSetupMethod)}
+                  className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
+                >
+                  <option value="self_signed">Self-signed (generated on the router)</option>
+                  <option value="letsencrypt">Let's Encrypt (router built-in ACME)</option>
+                </select>
+              </div>
+              {method === "self_signed" ? (
+                <>
+                  <div className="text-xs text-gray-500 dark:text-gray-400">
+                    Works with private IPs. The profile will skip certificate verification; the certificate fingerprint is shown after setup so you can compare it manually.
+                  </div>
+                  <div className="grid gap-2 md:grid-cols-2">
+                    <div className="grid gap-1">
+                      <label className="text-xs text-gray-500 dark:text-gray-400">Common name</label>
+                      <input
+                        value={commonName}
+                        onChange={(e) => setCommonName(e.target.value)}
+                        className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+                      />
+                    </div>
+                    <div className="grid gap-1">
+                      <label className="text-xs text-gray-500 dark:text-gray-400">Days valid</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={daysValid}
+                        onChange={(e) => setDaysValid(Math.max(1, Number(e.target.value) || 1))}
+                        className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+                      />
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="text-xs text-gray-500 dark:text-gray-400">
+                    Requires a public DNS name resolving to the router's public IP. The www service is temporarily enabled on port 80 for the ACME challenge and restored afterwards — but your firewall must allow TCP/80 from the internet (this app does not change firewall rules). The profile host will be updated to this DNS name and certificate verification will be enabled.
+                  </div>
+                  <div className="grid gap-1">
+                    <label className="text-xs text-gray-500 dark:text-gray-400">Public DNS name</label>
+                    <input
+                      value={dnsName}
+                      onChange={(e) => setDnsName(e.target.value)}
+                      placeholder="router.example.com"
+                      className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+                    />
+                  </div>
+                </>
+              )}
+              <div className="rounded-2xl bg-gray-50 dark:bg-gray-950 ring-1 ring-gray-200 dark:ring-gray-800 px-4 py-3 text-xs text-gray-600 dark:text-gray-300 grid gap-1">
+                <div>Target service: <span className="font-medium text-gray-900 dark:text-gray-100">{targetService}</span> (TLS port, typically {defaultTlsPort})</div>
+                <div>Profile will switch to: <span className="font-medium text-gray-900 dark:text-gray-100">{targetProto}</span></div>
+                <div>Router user needs <span className="font-medium">write</span> and <span className="font-medium">sensitive</span> policies for certificate management.</div>
+              </div>
+            </div>
+            {err && <div className="text-sm text-rose-600">{err}</div>}
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                onClick={() => void onClose(false)}
+                className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void startRun()}
+                className="rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+              >
+                Run TLS setup
+              </button>
+            </div>
+          </>
+        )}
+
+        {(phase === "running" || phase === "ready" || phase === "applied") && (
+          <>
+            <div className="rounded-2xl bg-gray-50 dark:bg-gray-950 ring-1 ring-gray-200 dark:ring-gray-800 p-4 grid gap-2">
+              {(job?.steps || []).map((s) => (
+                <div key={s.id} className="flex items-start gap-2 text-sm">
+                  <span className={`w-4 shrink-0 text-center font-semibold ${stepColor(s.status)}`}>{stepIcon(s.status)}</span>
+                  <div className="min-w-0">
+                    <span className={stepColor(s.status)}>{s.label}</span>
+                    {s.detail && !(failed && s.status === "failed" && job?.error) && (
+                      <div className="text-xs text-gray-500 dark:text-gray-400 break-words whitespace-pre-wrap">{s.detail}</div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {!job && <div className="text-sm text-gray-500 dark:text-gray-400">Starting...</div>}
+            </div>
+            {failed && (
+              <div className="rounded-2xl bg-rose-50 dark:bg-rose-500/10 ring-1 ring-rose-200 dark:ring-rose-500/20 px-4 py-3 grid gap-1">
+                <div className="text-sm text-rose-700 dark:text-rose-300 break-words whitespace-pre-wrap">{job?.error || "TLS setup failed"}</div>
+                <div className="text-xs text-rose-700/80 dark:text-rose-300/80">Nothing was changed on the connection profile. Retrying reuses any certificate that was already created.</div>
+              </div>
+            )}
+            {(phase === "ready" || phase === "applied") && (
+              <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-500/10 ring-1 ring-emerald-200 dark:ring-emerald-500/20 px-4 py-3 grid gap-1 text-xs text-emerald-900 dark:text-emerald-200">
+                <div className="text-sm font-medium">TLS is working on {result.host}:{result.port}</div>
+                {result.cert_name && <div>Certificate: {result.cert_name}</div>}
+                {result.fingerprint && <div className="break-all">SHA256 fingerprint: {result.fingerprint}</div>}
+                {result.expires_after && <div>Valid until: {result.expires_after}</div>}
+              </div>
+            )}
+            {phase === "applied" && (
+              <div className="grid gap-2">
+                <div className="text-sm text-emerald-700 dark:text-emerald-300">Profile switched to {targetProto}.</div>
+                <label className="inline-flex items-start gap-2 text-sm text-gray-700 dark:text-gray-200">
+                  <input
+                    type="checkbox"
+                    checked={disablePlain}
+                    disabled={disableBusy || disableDone}
+                    onChange={(e) => setDisablePlain(e.target.checked)}
+                    className="mt-0.5 rounded border-gray-300 text-gray-900 focus:ring-gray-300 dark:border-gray-700 dark:text-gray-100 dark:focus:ring-gray-700"
+                  />
+                  <span>
+                    Disable the plaintext service (<span className="font-mono">{plainService}</span>) on the router.
+                    <span className="block text-xs text-gray-500 dark:text-gray-400">Warning: if anything else relies on it, you lose that access method. Don't do this if it's your only fallback.</span>
+                  </span>
+                </label>
+                {disableDone && <div className="text-sm text-emerald-700 dark:text-emerald-300">Plaintext service disabled.</div>}
+                {disableErr && <div className="text-sm text-rose-600 break-words">{disableErr}</div>}
+              </div>
+            )}
+            {err && <div className="text-sm text-rose-600 break-words">{err}</div>}
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                onClick={() => void onClose(phase === "applied")}
+                className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+              >
+                Close
+              </button>
+              {failed && (
+                <button
+                  onClick={() => { setJob(null); setPhase("configure"); }}
+                  className="rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+                >
+                  Back and retry
+                </button>
+              )}
+              {phase === "ready" && (
+                <button
+                  disabled={applyBusy}
+                  onClick={async () => {
+                    setErr("");
+                    try {
+                      setApplyBusy(true);
+                      await applyTlsSetup(router.id, {});
+                      setPhase("applied");
+                    } catch (e: any) {
+                      setErr(e?.message || "Failed to switch profile to TLS");
+                    } finally {
+                      setApplyBusy(false);
+                    }
+                  }}
+                  className="rounded-full bg-emerald-600 text-white px-4 py-2 text-sm shadow hover:bg-emerald-700 disabled:opacity-50"
+                >
+                  {applyBusy ? "Switching..." : "Switch profile to TLS"}
+                </button>
+              )}
+              {phase === "applied" && disablePlain && !disableDone && (
+                <button
+                  disabled={disableBusy}
+                  onClick={async () => {
+                    setDisableErr("");
+                    try {
+                      setDisableBusy(true);
+                      await applyTlsSetup(router.id, { disable_plain: true });
+                      setDisableDone(true);
+                    } catch (e: any) {
+                      setDisableErr(e?.message || "Failed to disable the plaintext service");
+                    } finally {
+                      setDisableBusy(false);
+                    }
+                  }}
+                  className="rounded-full bg-rose-600 text-white px-4 py-2 text-sm shadow hover:bg-rose-700 disabled:opacity-50"
+                >
+                  {disableBusy ? "Disabling..." : "Disable plaintext service"}
+                </button>
+              )}
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }

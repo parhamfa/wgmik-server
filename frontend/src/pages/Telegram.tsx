@@ -121,6 +121,7 @@ export default function TelegramPage() {
   const [config, setConfig] = React.useState<TelegramConfigDTO | null>(null);
   const [botStatus, setBotStatus] = React.useState<TelegramStatusDTO | null>(null);
   const [tokenInput, setTokenInput] = React.useState("");
+  const savedTokenRef = React.useRef("");
   const [showToken, setShowToken] = React.useState(false);
   const [chatIdInput, setChatIdInput] = React.useState("");
   const [langInput, setLangInput] = React.useState("both");
@@ -178,6 +179,9 @@ export default function TelegramPage() {
       setRouters(rts);
       setPeers(prs);
       setSettings(appSettings);
+      const token = cfg.tg_bot_token || "";
+      setTokenInput(token);
+      savedTokenRef.current = token;
       setChatIdInput(cfg.tg_admin_chat_id || "");
       setLangInput(cfg.tg_bot_language || "both");
       setEnabledInput(cfg.tg_bot_enabled === "true" || cfg.tg_bot_enabled === "1");
@@ -200,9 +204,8 @@ export default function TelegramPage() {
         tg_admin_chat_id: chatIdInput,
         tg_bot_language: langInput,
       };
-      if (tokenInput) payload.tg_bot_token = tokenInput;
+      if (tokenInput !== savedTokenRef.current) payload.tg_bot_token = tokenInput;
       await updateTelegramConfig(payload);
-      setTokenInput("");
       flash("Configuration saved");
       await load();
     } catch (e: any) {
@@ -373,7 +376,7 @@ export default function TelegramPage() {
                     type={showToken ? "text" : "password"}
                     value={tokenInput}
                     onChange={e => setTokenInput(e.target.value)}
-                    placeholder={config?.tg_bot_token || "Paste bot token from @BotFather"}
+                    placeholder="Paste bot token from @BotFather"
                     className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm pr-16 focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
                   />
                   <button type="button" onClick={() => setShowToken(s => !s)} className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">

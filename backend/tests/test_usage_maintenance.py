@@ -323,7 +323,7 @@ def test_normalize_auto_maintenance_settings_validates_inputs():
     assert data["usage_maintenance_auto_frequency"] == "daily"
     assert data["usage_maintenance_auto_interval_days"] == 30
     assert data["usage_maintenance_auto_weekday"] == 6
-    assert data["usage_maintenance_auto_time"] == "04:30"
+    assert data["usage_maintenance_auto_time"] == "03:00"
     assert data["usage_maintenance_backup_keep"] == 1
 
 

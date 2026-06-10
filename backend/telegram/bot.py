@@ -43,8 +43,25 @@ def _bot_commands_for_language(lang: str):
 
 
 async def _sync_bot_commands(bot) -> None:
+    from aiogram.types import BotCommand, BotCommandScopeChat
+
     await bot.set_my_commands(_bot_commands_for_language("en"))
     await bot.set_my_commands(_bot_commands_for_language("fa"), language_code="fa")
+
+    cfg = _get_tg_settings()
+    admin_chat_raw = (cfg.get("tg_admin_chat_id") or "").strip()
+    lang = (cfg.get("tg_bot_language") or "en").strip()
+    if lang not in ("en", "fa"):
+        lang = "en"
+    if admin_chat_raw:
+        try:
+            admin_chat_id = int(admin_chat_raw)
+            admin_cmds = _bot_commands_for_language(lang) + [
+                BotCommand(command="admin", description=t("cmd_desc_admin", lang)),
+            ]
+            await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=admin_chat_id))
+        except ValueError:
+            logger.warning("Invalid tg_admin_chat_id for scoped bot commands: %r", admin_chat_raw)
 
 
 def _get_tg_settings() -> dict:
@@ -86,6 +103,7 @@ def _run_bot(token: str) -> None:
     async def _main() -> None:
         global _bot_running, _bot_started_at
         from aiogram import Bot, Dispatcher
+        from .admin_handlers import register_admin_handlers
         from .handlers import register_handlers
 
         bot = Bot(token=token)
@@ -94,6 +112,7 @@ def _run_bot(token: str) -> None:
         except Exception:
             logger.exception("Telegram bot command sync failed")
         dp = Dispatcher()
+        register_admin_handlers(dp)
         register_handlers(dp)
 
         _bot_running = True

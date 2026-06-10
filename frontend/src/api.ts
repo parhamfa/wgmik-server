@@ -316,6 +316,60 @@ export async function testRouter(routerId: number): Promise<{ ok: boolean; ros_v
   return fetchJson(`/api/routers/${routerId}/test`, { method: "POST" });
 }
 
+// ... Automated TLS setup ...
+
+export type TlsSetupMethod = "self_signed" | "letsencrypt";
+
+export type TlsSetupStepDTO = {
+  id: "check" | "certificate" | "service" | "verify";
+  label: string;
+  status: "pending" | "running" | "ok" | "failed";
+  detail: string;
+};
+
+export type TlsSetupJobDTO = {
+  router_id: number;
+  method: TlsSetupMethod;
+  status: "running" | "ok" | "failed";
+  error: string;
+  steps: TlsSetupStepDTO[];
+  result: {
+    proto?: RouterProto;
+    host?: string;
+    port?: number;
+    tls_verify?: boolean;
+    service?: string;
+    plain_service?: string;
+    cert_name?: string;
+    fingerprint?: string;
+    expires_after?: string;
+    ros_version?: string;
+  };
+};
+
+export async function startTlsSetup(
+  routerId: number,
+  dto: { method: TlsSetupMethod; common_name?: string; days_valid?: number; dns_name?: string },
+): Promise<TlsSetupJobDTO> {
+  return fetchJson(`/api/routers/${routerId}/tls-setup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(dto),
+  });
+}
+
+export async function getTlsSetupStatus(routerId: number): Promise<TlsSetupJobDTO> {
+  return fetchJson(`/api/routers/${routerId}/tls-setup/status`);
+}
+
+export async function applyTlsSetup(routerId: number, dto: { disable_plain?: boolean } = {}): Promise<RouterDTO> {
+  return fetchJson(`/api/routers/${routerId}/tls-setup/apply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(dto),
+  });
+}
+
 // ... Peer Types ...
 
 export type PeerListDTO = {
@@ -915,6 +969,80 @@ export async function runUsageMaintenance(): Promise<UsageMaintenanceStatusDTO> 
 }
 export async function cancelUsageMaintenance(): Promise<UsageMaintenanceStatusDTO> {
   return fetchJson("/api/admin/usage_maintenance/cancel", { method: "POST" });
+}
+
+export type BackupStatusDTO = {
+  running: boolean;
+  phase: string;
+  phase_label?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  updated_at?: string | null;
+  last_error?: string | null;
+  detail?: string | null;
+  file_size?: number | null;
+  download_token?: string | null;
+  download_filename?: string | null;
+  secret_key?: string | null;
+  elapsed_seconds: number;
+  progress_percent: number;
+};
+
+export type BackupRestoreResultDTO = {
+  ok: boolean;
+  message: string;
+  pre_restore_backup?: string | null;
+};
+
+export async function getBackupStatus(): Promise<BackupStatusDTO> {
+  return fetchJson("/api/admin/backup");
+}
+
+export async function runBackup(): Promise<BackupStatusDTO> {
+  return fetchJson("/api/admin/backup/run", { method: "POST" });
+}
+
+export function backupDownloadUrl(token: string): string {
+  return `${base}/api/admin/backup/download?token=${encodeURIComponent(token)}`;
+}
+
+export async function restoreBackup(file: File, key: string): Promise<BackupRestoreResultDTO> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("key", key.trim());
+  const res = await fetch(`${base}/api/admin/backup/restore`, {
+    method: "POST",
+    body: form,
+    credentials: "include",
+  });
+  if (res.status === 401) {
+    if (window.location.pathname !== "/login") {
+      window.location.href = "/login";
+    }
+    throw new Error("Unauthorized");
+  }
+  if (!res.ok) {
+    const text = await res.text();
+    let msg = text;
+    try {
+      const json = JSON.parse(text);
+      if (json.detail) msg = formatApiErrorDetail(json.detail);
+    } catch { /* ignore */ }
+    throw new Error(msg || res.statusText);
+  }
+  return res.json();
+}
+
+export async function waitForHealth(timeoutMs = 120000, intervalMs = 2000): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const res = await fetch(`${base}/health`, { credentials: "include" });
+      if (res.ok) return;
+    } catch { /* server restarting */ }
+    await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+  }
+  throw new Error("Timed out waiting for the server to restart");
 }
 
 // ── Telegram Bot ────────────────────────────────────────────────────

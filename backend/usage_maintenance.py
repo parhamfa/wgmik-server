@@ -68,12 +68,12 @@ DEFAULT_RETENTION = {
 }
 AUTO_FREQUENCIES = ("daily", "every_n_days", "weekly")
 DEFAULT_AUTO_SCHEDULE: dict[str, Any] = {
-    "usage_maintenance_auto_enabled": False,
+    "usage_maintenance_auto_enabled": True,
     "usage_maintenance_auto_frequency": "daily",
     "usage_maintenance_auto_interval_days": 2,
     "usage_maintenance_auto_weekday": 6,  # 0=Monday ... 6=Sunday
-    "usage_maintenance_auto_time": "04:30",
-    "usage_maintenance_backup_keep": 3,
+    "usage_maintenance_auto_time": "03:00",
+    "usage_maintenance_backup_keep": 2,
 }
 LAST_AUTO_RUN_KEY = "usage_maintenance_last_auto_run"
 BACKUP_FILE_SUFFIX = "-maintenance-backup.db"

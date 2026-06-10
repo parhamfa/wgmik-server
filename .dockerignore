@@ -22,7 +22,7 @@ __pycache__
 # Local secrets
 .env
 
-# Frontend artifacts (web image uses frontend/Dockerfile and copies what it needs)
+# Frontend build artifacts (merged image builds frontend in a Docker stage)
 frontend/node_modules
 frontend/dist
 

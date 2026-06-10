@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, Response, Request, Query, status
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, Response, Request, Query, status, UploadFile, File, Form
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, text
@@ -17,6 +17,7 @@ from ..security import SecretBox
 from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User, UserSecurityEvent, FairUsageRule, FairUsageAssignment, FairUsageState, FairUsageTier, PeerTotalsMerge, TelegramPeerBinding, TelegramSignupToken, TelegramNotificationLog
 from ..auth import verify_password, get_password_hash, create_access_token, verify_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from ..routeros.factory import make_client
+from ..routeros import tls_setup as router_tls_setup
 from ..routeros.version import assert_routeros_supported, is_routeros_supported
 from ..usage_maintenance import (
     cancel_usage_maintenance,
@@ -26,6 +27,13 @@ from ..usage_maintenance import (
     load_auto_maintenance_settings,
     normalize_auto_maintenance_settings,
     start_usage_maintenance,
+)
+from ..backup_restore import (
+    get_backup_status,
+    is_backup_running,
+    resolve_backup_download,
+    restore_backup_from_upload,
+    start_backup,
 )
 from ..fair_usage_sync import (
     FU_QUEUE_PREFIX,
@@ -986,12 +994,12 @@ class SettingsDTO(BaseModel):
     raw_sample_retention_hours: int
     minute_rollup_retention_days: int
     daily_rollup_retention_days: int
-    usage_maintenance_auto_enabled: bool = False
+    usage_maintenance_auto_enabled: bool = True
     usage_maintenance_auto_frequency: str = "daily"
     usage_maintenance_auto_interval_days: int = 2
     usage_maintenance_auto_weekday: int = 6
-    usage_maintenance_auto_time: str = "04:30"
-    usage_maintenance_backup_keep: int = 3
+    usage_maintenance_auto_time: str = "03:00"
+    usage_maintenance_backup_keep: int = 2
 
 
 def _normalize_usage_time_mode(value: Optional[str]) -> str:
@@ -2473,6 +2481,96 @@ def test_router_connection(router_id: int, db: Session = Depends(get_db), curren
         raise HTTPException(status_code=502, detail=f"router connection failed: {e}")
 
 
+class TlsSetupStartDTO(BaseModel):
+    method: str  # self_signed | letsencrypt
+    common_name: Optional[str] = None
+    days_valid: int = 3650
+    dns_name: Optional[str] = None
+
+
+class TlsSetupApplyDTO(BaseModel):
+    disable_plain: bool = False
+
+
+def _router_plain_password(row: Router) -> str:
+    box = SecretBox(settings.secret_key)
+    return box.decrypt(row.secret_enc) or ""
+
+
+@router.post("/routers/{router_id}/tls-setup")
+def start_router_tls_setup(router_id: int, dto: TlsSetupStartDTO, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    row = db.get(Router, router_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="router not found")
+    if row.proto not in router_tls_setup.TLS_TARGETS:
+        raise HTTPException(status_code=400, detail="this profile already uses TLS")
+    try:
+        return router_tls_setup.start_tls_setup(
+            router_id=row.id,
+            proto=row.proto,
+            host=row.host,
+            port=row.port,
+            username=row.username,
+            password=_router_plain_password(row),
+            method=dto.method,
+            common_name=(dto.common_name or "").strip(),
+            days_valid=dto.days_valid,
+            dns_name=(dto.dns_name or "").strip(),
+        )
+    except router_tls_setup.TlsSetupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/routers/{router_id}/tls-setup/status")
+def get_router_tls_setup_status(router_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    snapshot = router_tls_setup.get_job(router_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="no TLS setup job for this router")
+    return snapshot
+
+
+@router.post("/routers/{router_id}/tls-setup/apply", response_model=RouterDTO)
+def apply_router_tls_setup(router_id: int, dto: TlsSetupApplyDTO, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    row = db.get(Router, router_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="router not found")
+    snapshot = router_tls_setup.get_job(router_id)
+    if not snapshot or snapshot.get("status") != "ok":
+        raise HTTPException(status_code=409, detail="no successful TLS setup to apply; run the setup first")
+    result = snapshot.get("result") or {}
+    password = _router_plain_password(row)
+
+    if row.proto in router_tls_setup.TLS_TARGETS:
+        # Re-verify before flipping the profile; nothing is changed if this fails.
+        try:
+            router_tls_setup.verify_target(result, row.username, password)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"TLS verification failed: {exc}") from exc
+        row.proto = str(result.get("proto") or row.proto)
+        row.host = str(result.get("host") or row.host)
+        row.port = int(result.get("port") or row.port)
+        row.tls_verify = bool(result.get("tls_verify"))
+        _refresh_router_version_or_raise(row)
+        db.commit()
+        db.refresh(row)
+
+    if dto.disable_plain:
+        try:
+            router_tls_setup.disable_plain_service(
+                proto=row.proto,
+                host=row.host,
+                port=row.port,
+                username=row.username,
+                password=password,
+                tls_verify=row.tls_verify,
+                plain_service=str(result.get("plain_service") or ""),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"profile switched to TLS, but disabling the plaintext service failed: {exc}") from exc
+
+    return row
+
+
 #
 # Demo endpoints removed (project is now RouterOS-backed only).
 #
@@ -3560,9 +3658,12 @@ def read_usage_maintenance_status(
 
 @router.post("/admin/usage_maintenance/run", response_model=UsageMaintenanceStatusDTO, status_code=202)
 def run_usage_maintenance(
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     _require_admin(current_user)
+    if is_backup_running(db):
+        raise HTTPException(status_code=409, detail="A manual backup is running. Wait for it to finish before starting maintenance.")
     try:
         started, status = start_usage_maintenance()
     except RuntimeError as exc:
@@ -3578,6 +3679,88 @@ def cancel_running_usage_maintenance(
 ):
     _require_admin(current_user)
     return UsageMaintenanceStatusDTO(**cancel_usage_maintenance())
+
+
+class BackupStatusDTO(BaseModel):
+    running: bool
+    phase: str
+    phase_label: Optional[str] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    last_error: Optional[str] = None
+    detail: Optional[str] = None
+    file_size: Optional[int] = None
+    download_token: Optional[str] = None
+    download_filename: Optional[str] = None
+    secret_key: Optional[str] = None
+    elapsed_seconds: int = 0
+    progress_percent: float = 0
+
+
+class BackupRestoreResultDTO(BaseModel):
+    ok: bool = True
+    message: str
+    pre_restore_backup: Optional[str] = None
+
+
+@router.get("/admin/backup", response_model=BackupStatusDTO)
+def read_backup_status(
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    return BackupStatusDTO(**get_backup_status())
+
+
+@router.post("/admin/backup/run", response_model=BackupStatusDTO, status_code=202)
+def run_manual_backup(
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    try:
+        started, status = start_backup()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not started:
+        raise HTTPException(status_code=409, detail="A backup is already running")
+    return BackupStatusDTO(**status)
+
+
+@router.get("/admin/backup/download")
+def download_manual_backup(
+    token: str = Query(..., min_length=8),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    try:
+        path, filename = resolve_backup_download(token)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/admin/backup/restore", response_model=BackupRestoreResultDTO)
+async def restore_manual_backup(
+    file: UploadFile = File(...),
+    key: str = Form(...),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Backup file is empty")
+    try:
+        result = restore_backup_from_upload(payload, key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return BackupRestoreResultDTO(**result)
 
 
 @router.post("/admin/purge_usage")
@@ -4128,13 +4311,15 @@ class TelegramConfigPayload(BaseModel):
 
 @router.get("/telegram/config")
 def get_telegram_config(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from ..telegram.bot import _decrypt_token
+
     keys = ("tg_bot_token", "tg_bot_enabled", "tg_admin_chat_id", "tg_bot_language")
     result = {}
     for k in keys:
         kv = db.get(SettingsKV, k)
         v = kv.value if kv else ""
         if k == "tg_bot_token" and v:
-            v = v[:8] + "..." if len(v) > 8 else "***"
+            v = _decrypt_token(v)
         result[k] = v
     return result
 
