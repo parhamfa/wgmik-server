@@ -8,20 +8,20 @@ services:
       # Empty -> auto-generated and persisted to /data/secret_key on first run.
       SECRET_KEY: ${SECRET_KEY:-}
       DEBUG: "true"
-      VITE_PROXY_TARGET: http://127.0.0.1:8000
+      VITE_PROXY_TARGET: http://127.0.0.1:6575
     volumes:
       - ./backend:/app/backend
       - ./frontend:/app/frontend
       - ./data:/data
       - frontend_node_modules:/app/frontend/node_modules
     ports:
-      - "5173:5173"
-      - "8000:8000"
+      - "6574:6574"
+      - "6575:6575"
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()\" && node -e \"require('http').get('http://127.0.0.1:5173', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1));\"",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:6575/health', timeout=2).read()\" && node -e \"require('http').get('http://127.0.0.1:6574', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1));\"",
         ]
       interval: 10s
       timeout: 3s

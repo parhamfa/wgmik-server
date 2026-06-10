@@ -23,7 +23,9 @@ def ensure_backend_deps():
 
 
 def start_api(dev: bool = False):
-    args = [sys.executable, "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    # In dev mode Vite owns 6574, so the API moves behind the proxy on 6575.
+    port = "6575" if dev else "6574"
+    args = [sys.executable, "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", port]
     if dev:
         args.append("--reload")
     return run_cmd(args, cwd=str(ROOT))
@@ -49,9 +51,12 @@ def main():
             procs.append(start_api(dev=True))
         else:
             procs.append(start_api(dev=False))
-        print("Running. API: http://localhost:8000")
-        if args.dev and FRONTEND.exists():
-            print("Frontend (Vite): http://localhost:5173")
+        if args.dev:
+            print("Running. API: http://localhost:6575")
+            if FRONTEND.exists():
+                print("Frontend (Vite): http://localhost:6574")
+        else:
+            print("Running. UI + API: http://localhost:6574")
         for p in procs:
             p.wait()
     except KeyboardInterrupt:

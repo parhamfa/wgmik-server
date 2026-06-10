@@ -1,0 +1,38 @@
+# RouterOS /app definition for wgmik-server (RouterOS 7.23+).
+#
+# Install:
+#   1. Upload this file to the router (Files menu or scp).
+#   2. /app add file=wgmik.tikapp.yaml
+#   3. /app start [find name=wgmik-server]
+#
+# This is the RouterOS /app YAML dialect, NOT docker-compose.
+# Port notation uses the 7.23+ colon style (host:container[:label][:proto]).
+# RouterOS attributes set on the /app entry override YAML.
+name: wgmik-server
+descr: WireGuard management server for MikroTik routers
+page: https://github.com/parhamfa/wgmik-server
+category: networking
+default-credentials: none
+services:
+  wgmik:
+    image: ghcr.io/parhamfa/wgmik-server:latest
+    ports:
+      - 6574:6574:web:tcp
+    environment:
+      DATABASE_URL: sqlite:////data/wgmik.db
+      DEBUG: "false"
+    volumes:
+      # Host side is relative to the app's root-dir on router storage;
+      # holds the SQLite DB, auto-generated secret key, and backups.
+      - wgmik/data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6574/health', timeout=2).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
