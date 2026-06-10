@@ -2,7 +2,7 @@ import React from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import QRCode from "react-qr-code";
-import { listSavedPeers, getPeerUsage, listRouters, routerPeers, routerInterfaceDetail, getPeerClientPrivateKey, getPeerClientExportPrefs, patchPeerClientExportPrefs, renewPeerKeys, patchPeer, getPeerQuota, patchPeerQuota, resetPeerMetrics, deletePeer, reconcilePeer, getPeerActions, type PeerAction, getSettings, type SavedPeer, type UsagePoint, type Router, type PeerView, type Quota, type WGInterfaceConfig, getFairUsagePeerStatus, resetFairUsagePeer, type FairUsagePeerStatusDTO, type FairUsageRuleStatusItemDTO } from "../api";
+import { listSavedPeers, getPeerUsage, listRouters, routerPeers, routerInterfaceDetail, getPeerClientPrivateKey, getPeerClientExportPrefs, patchPeerClientExportPrefs, renewPeerKeys, patchPeer, resolvePeerRouterSync, getPeerQuota, patchPeerQuota, resetPeerMetrics, deletePeer, reconcilePeer, getPeerActions, type PeerAction, getSettings, type SavedPeer, type UsagePoint, type Router, type PeerView, type Quota, type WGInterfaceConfig, getFairUsagePeerStatus, resetFairUsagePeer, type FairUsagePeerStatusDTO, type FairUsageRuleStatusItemDTO } from "../api";
 
 function effectiveThrottleForRule(fr: FairUsageRuleStatusItemDTO): { dl: number; ul: number; label: string } {
   if (fr.tiered && fr.tiers?.length) {
@@ -18,8 +18,48 @@ function effectiveThrottleForRule(fr: FairUsageRuleStatusItemDTO): { dl: number;
   return { dl: fr.throttle_download_kbps, ul: fr.throttle_upload_kbps, label: fr.rule_name };
 }
 import { useAutoSaveSettings, type ScopeUnit } from "../useAutoSaveSettings";
-import { useLooseNumberInput } from "../hooks/useLooseNumberInput";
-import { formatDatetimeLocalValue } from "../datetimeLocal";
+import UsageTimeControls, { normalizeUsageTimeMode } from "../UsageTimeControls";
+import {
+  formatCalendarDateTime,
+  formatCalendarDayLabel,
+  startOfLocalTodayValue,
+  startOfSelectedCalendarMonthValue,
+  zonedWallTimeValueToUtcIso,
+} from "../datetimeLocal";
+
+function RenewKeyButton({
+  onClick,
+  disabled,
+  title,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  title: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-label={title}
+      className="shrink-0 rounded-full border border-gray-200 dark:border-gray-800 p-2 text-gray-600 dark:text-gray-300 bg-white dark:bg-gray-950 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50"
+    >
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+        <path d="M21 3v6h-6" />
+      </svg>
+    </button>
+  );
+}
+
+function generatePresharedKey(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
 
 function Card({ className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) {
   const base = "rounded-3xl overflow-hidden ring-1 ring-gray-200 ring-offset-2 ring-offset-gray-50 bg-white shadow-md hover:shadow-lg transition transform hover:-translate-y-0.5 dark:ring-gray-800 dark:ring-offset-gray-950 dark:bg-gray-900";
@@ -35,7 +75,7 @@ function LockedField({ value, mono, className = "" }: { value: string; mono?: bo
         "px-3 py-2",
         mono ? "font-mono text-xs" : "text-sm",
         "text-gray-900 dark:text-gray-100",
-        "break-words",
+        mono ? "break-all" : "break-words",
         className,
       ].join(" ")}
       title={value}
@@ -72,6 +112,10 @@ export default function PeerDetail() {
   const quotaPendingRef = React.useRef(false);
   const quotaDraftInitRef = React.useRef(false);
   const userEditedRef = React.useRef(false);
+
+  const [peerNameDraft, setPeerNameDraft] = React.useState("");
+  const [nameSaving, setNameSaving] = React.useState(false);
+  const [nameErr, setNameErr] = React.useState("");
 
   const [fuStatus, setFuStatus] = React.useState<FairUsagePeerStatusDTO | null>(null);
   const [fuResetBusy, setFuResetBusy] = React.useState(false);
@@ -111,10 +155,8 @@ export default function PeerDetail() {
     () => fuRules.find((r) => r.is_effective) ?? (fuStatus?.rule_id ? fuRules.find((r) => r.rule_id === fuStatus.rule_id) : undefined),
     [fuRules, fuStatus],
   );
+  const hasFairUsageRules = !!fuStatus && fuRules.length > 0;
 
-  const [timeFrom, setTimeFrom] = React.useState<string>("");
-  const [timeTo, setTimeTo] = React.useState<string>("");
-  const [allTime, setAllTime] = React.useState<boolean>(false);
   const [todayTick, setTodayTick] = React.useState(0);
 
   const [clientCfg, setClientCfg] = React.useState(() => ({
@@ -129,8 +171,7 @@ export default function PeerDetail() {
     customEndpoint: "",
     presharedKey: "",
   }));
-  const [showPrivateKey, setShowPrivateKey] = React.useState(false);
-  const [showPresharedKey, setShowPresharedKey] = React.useState(false);
+  const [showClientSecrets, setShowClientSecrets] = React.useState(false);
   const [exportPrefsServer, setExportPrefsServer] = React.useState<{
     config_name: string;
     custom_endpoint: string;
@@ -150,6 +191,7 @@ export default function PeerDetail() {
     valid_until: "",
   });
   const [confirmRenewKeys, setConfirmRenewKeys] = React.useState(false);
+  const [confirmRenewPsk, setConfirmRenewPsk] = React.useState(false);
   const [confirmDelete, setConfirmDelete] = React.useState(false);
   const windowProgress = React.useMemo(() => {
     if (!quotaDraft.valid_from && !quotaDraft.valid_until) return null;
@@ -184,6 +226,32 @@ export default function PeerDetail() {
 	      } catch { setPeer(null); }
 	    })();
 	  }, [peerId]);
+
+	  React.useEffect(() => {
+	    if (peer) setPeerNameDraft(peer.name || "");
+	  }, [peer?.name, peer?.id]);
+
+	  const commitPeerName = React.useCallback(async () => {
+	    if (!peer) return;
+	    const next = peerNameDraft.trim();
+	    if ((peer.name || "") === next) {
+	      setNameErr("");
+	      return;
+	    }
+	    setNameSaving(true);
+	    setNameErr("");
+	    try {
+	      const saved = await patchPeer(peer.id, { name: next });
+	      setPeer((prev) => (prev ? { ...prev, name: saved.name ?? next } : null));
+	      setPeerNameDraft(saved.name ?? next);
+	    } catch (e: unknown) {
+	      const msg = e instanceof Error ? e.message : "Could not save name";
+	      setNameErr(msg);
+	      setPeerNameDraft(peer.name || "");
+	    } finally {
+	      setNameSaving(false);
+	    }
+	  }, [peer, peerNameDraft]);
 
 	  React.useEffect(() => {
 	    if (!peer) { setIfaceCfg(null); return; }
@@ -258,22 +326,19 @@ export default function PeerDetail() {
   const { settings, update } = useAutoSaveSettings();
 
   // Helpers
-  const refreshSec = settings?.peer_refresh_seconds ?? 30;
-  const scopeValue = settings?.peer_default_scope_value ?? 14;
-  const scopeUnit = (settings?.peer_default_scope_unit as ScopeUnit) ?? "days";
+  const refreshSec = Math.max(5, Number(settings?.poll_interval_seconds) || 30);
+  const scopeValue = Math.max(1, Number(settings?.peer_default_scope_value) || 60);
+  const scopeUnit: ScopeUnit = settings?.peer_default_scope_unit === "hours" || settings?.peer_default_scope_unit === "days"
+    ? settings.peer_default_scope_unit
+    : "minutes";
   const timezone = settings?.timezone ?? "UTC";
-  const todayFrame = Boolean(settings?.peer_time_frame_today);
-
-  const peerRefreshInput = useLooseNumberInput(
-    refreshSec,
-    (n) => update({ peer_refresh_seconds: n }),
-    { min: 5, emptyFallback: 5 },
+  const dateCalendar = settings?.date_calendar ?? "gregorian";
+  const weekStartDay = Number(settings?.week_start_day ?? 0);
+  const timeMode = normalizeUsageTimeMode(
+    settings?.peer_time_mode ?? (settings?.peer_time_frame_today ? "today" : "rolling"),
   );
-  const peerScopeInput = useLooseNumberInput(
-    scopeValue,
-    (n) => update({ peer_default_scope_value: n }),
-    { min: 1, emptyFallback: 1 },
-  );
+  const customStart = settings?.peer_custom_start ?? "";
+  const customEnd = settings?.peer_custom_end ?? "";
   const showKindPills = settings?.show_kind_pills ?? true;
 
   const clientConfig = React.useMemo(() => {
@@ -515,52 +580,48 @@ export default function PeerDetail() {
   ]);
 
   const toIso = React.useCallback((v: string) => {
-    if (!v) return undefined;
-    const d = new Date(v);
-    if (!Number.isFinite(d.getTime())) return undefined;
-    return d.toISOString();
-  }, []);
-  const rawStartIso = toIso(timeFrom);
-  const rawEndIso = toIso(timeTo);
+    return zonedWallTimeValueToUtcIso(v, timezone);
+  }, [timezone]);
+  const customRangeMs = React.useMemo(() => {
+    if (timeMode !== "custom" || !customStart || !customEnd) return 0;
+    const startMs = new Date(customStart).getTime();
+    const endMs = new Date(customEnd).getTime();
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 0;
+    return endMs - startMs;
+  }, [customEnd, customStart, timeMode]);
+  const chartScopeUnit: ScopeUnit = timeMode === "today"
+    ? "hours"
+    : timeMode === "this_month" || timeMode === "all_time"
+      ? "days"
+      : timeMode === "custom"
+        ? customRangeMs > 3 * 24 * 3600 * 1000
+          ? "days"
+          : "hours"
+        : scopeUnit;
+  const effectiveAllTime = timeMode === "all_time";
+  const customStartIso = toIso(customStart);
+  const customEndIso = toIso(customEnd);
 
   const effectiveStartIso = React.useMemo(() => {
-    if (allTime) return undefined;
-    if (todayFrame) {
-      const d = new Date();
-      d.setHours(0, 0, 0, 0);
-      return d.toISOString();
-    }
-    return rawStartIso;
-  }, [allTime, todayFrame, rawStartIso, todayTick]);
+    if (timeMode === "today") return toIso(startOfLocalTodayValue(timezone));
+    if (timeMode === "this_month") return toIso(startOfSelectedCalendarMonthValue(dateCalendar, timezone));
+    if (timeMode === "custom") return customStartIso;
+    return undefined;
+  }, [customStartIso, dateCalendar, timeMode, timezone, toIso, todayTick]);
 
   const effectiveEndIso = React.useMemo(() => {
-    if (allTime) return undefined;
-    if (todayFrame) return new Date().toISOString();
-    return rawEndIso;
-  }, [allTime, todayFrame, rawEndIso, todayTick]);
-
-  const timeFrameActive = allTime || !!rawStartIso || !!rawEndIso || todayFrame;
-
-  const displayTimeFrom = React.useMemo(() => {
-    if (todayFrame) {
-      const d = new Date();
-      d.setHours(0, 0, 0, 0);
-      return formatDatetimeLocalValue(d);
-    }
-    return timeFrom;
-  }, [todayFrame, timeFrom, todayTick]);
+    if (timeMode === "today" || timeMode === "this_month") return new Date().toISOString();
+    if (timeMode === "custom") return customEndIso;
+    return undefined;
+  }, [customEndIso, timeMode, todayTick]);
 
   React.useEffect(() => {
-    if (scopeUnit !== "days" && allTime) setAllTime(false);
-  }, [scopeUnit, allTime]);
-
-  React.useEffect(() => {
-    if (!todayFrame) return;
+    if (timeMode !== "today" && timeMode !== "this_month") return;
     setTodayTick((t) => t + 1);
     const ms = Math.max(5000, refreshSec * 1000);
     const id = window.setInterval(() => setTodayTick((t) => t + 1), ms);
     return () => window.clearInterval(id);
-  }, [todayFrame, refreshSec]);
+  }, [timeMode, refreshSec]);
 
   const fetchActions = React.useCallback(async (limit: number) => {
     const lim = Math.max(1, Math.min(200, limit || 25));
@@ -602,8 +663,8 @@ export default function PeerDetail() {
   const loadUsage = React.useCallback(async () => {
     try {
       if (!peerId) return;
-      if (scopeUnit === "days") {
-        if (allTime) {
+      if (chartScopeUnit === "days") {
+        if (effectiveAllTime) {
           const points = await getPeerUsage(peerId, { window: "daily", allTime: true });
           setUsage(points);
           return;
@@ -618,10 +679,10 @@ export default function PeerDetail() {
         setUsage(trimmed);
       } else {
         const seconds =
-          scopeUnit === "minutes"
+          chartScopeUnit === "minutes"
             ? Math.max(1, scopeValue) * 60
             : Math.max(1, scopeValue) * 3600;
-        const interval = scopeUnit === "minutes" ? 60 : 3600;
+        const interval = chartScopeUnit === "minutes" ? 60 : 3600;
         if (effectiveStartIso || effectiveEndIso) {
           const points = await getPeerUsage(peerId, { window: "raw", seconds: effectiveStartIso ? undefined : seconds, interval, start: effectiveStartIso, end: effectiveEndIso });
           setUsage(points);
@@ -633,7 +694,7 @@ export default function PeerDetail() {
     } catch {
       setUsage([]);
     }
-  }, [peerId, scopeUnit, scopeValue, allTime, effectiveStartIso, effectiveEndIso]);
+  }, [peerId, chartScopeUnit, scopeValue, effectiveAllTime, effectiveStartIso, effectiveEndIso]);
 
 
 
@@ -675,14 +736,38 @@ export default function PeerDetail() {
     } catch {
       // ignore
     }
-  }, [peerId, actionsLimit, fetchActions, loadPeer, loadQuota, loadUsage, peer]);
+	  }, [peerId, actionsLimit, fetchActions, loadPeer, loadQuota, loadUsage, peer]);
+
+	  const resolveRouterSync = React.useCallback(async (action: "hide" | "delete" | "accept") => {
+	    if (!peer) return;
+	    setActionErr("");
+	    try {
+	      setActionBusy(true);
+	      const result = await resolvePeerRouterSync(peer.id, action);
+	      if (action === "delete") {
+	        navigate("/");
+	        return;
+	      }
+	      if (result && typeof result === "object" && "id" in result) {
+	        setPeer(result as SavedPeer);
+	      } else {
+	        await loadPeer();
+	      }
+	      await fetchActions(actionsLimit);
+	    } catch (e: any) {
+	      setActionErr(e?.message || "Failed to resolve RouterOS sync status");
+	    } finally {
+	      setActionBusy(false);
+	    }
+	  }, [actionsLimit, fetchActions, loadPeer, navigate, peer]);
 
 
-  React.useEffect(() => {
+	  React.useEffect(() => {
     loadQuota();
     loadUsage();
     loadFuStatus();
-  }, [loadQuota, loadUsage, loadFuStatus]);
+    void fetchActions(actionsLimit);
+  }, [loadQuota, loadUsage, loadFuStatus, fetchActions, actionsLimit]);
 
   // Auto-refresh peer usage at roughly the poll interval (default 30s)
   React.useEffect(() => {
@@ -692,9 +777,10 @@ export default function PeerDetail() {
       loadQuota();
       loadUsage();
       loadFuStatus();
-    }, refreshSec * 1000);
+      void fetchActions(actionsLimit);
+    }, intervalSec * 1000);
     return () => window.clearInterval(id);
-  }, [refreshSec, loadPeer, loadQuota, loadUsage, loadFuStatus]);
+  }, [refreshSec, loadPeer, loadQuota, loadUsage, loadFuStatus, fetchActions, actionsLimit]);
 
   const serverQuotaDraft = React.useMemo(() => {
     if (!quota) return null;
@@ -926,14 +1012,46 @@ export default function PeerDetail() {
 
   return (
     <div className="mx-auto px-4 md:px-6 py-6">
-      <div className="mx-auto my-12 md:my-16 w-full max-w-[960px] rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 md:p-6 overflow-y-auto overflow-x-hidden">
+      <div className="mx-auto my-12 md:my-16 w-full max-w-[960px]">
+        <div className="mb-3 flex justify-end">
+          <Link
+            to="/"
+            className="inline-flex items-center gap-2 rounded-full bg-white text-gray-900 px-4 py-1.5 text-sm ring-1 ring-gray-200 shadow-sm hover:ring-gray-300 dark:bg-gray-900 dark:text-gray-100 dark:ring-gray-800"
+          >
+            ← Dashboard
+          </Link>
+        </div>
+        <div className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 md:p-6 overflow-y-auto overflow-x-hidden">
         {!peer ? (
           <div className="text-sm text-gray-500 dark:text-gray-400">Loading…</div>
         ) : (
-          <div className="grid gap-6">
+          <div className="grid grid-cols-1 gap-6">
             <div className="flex items-center justify-between mb-2">
               <div className="min-w-0 max-w-[420px] md:max-w-[520px]">
-                <div className="text-base text-gray-500 dark:text-gray-400">{peer.name}</div>
+                <div className="min-w-0">
+                  <input
+                    type="text"
+                    value={peerNameDraft}
+                    onChange={(e) => setPeerNameDraft(e.target.value)}
+                    onBlur={() => void commitPeerName()}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        (e.target as HTMLInputElement).blur();
+                      }
+                      if (e.key === "Escape" && peer) {
+                        setPeerNameDraft(peer.name || "");
+                        setNameErr("");
+                        (e.target as HTMLInputElement).blur();
+                      }
+                    }}
+                    disabled={nameSaving}
+                    className="w-full min-w-0 max-w-full rounded border border-transparent bg-transparent px-1 -mx-1 text-base text-gray-500 dark:text-gray-400 focus:border-indigo-500/40 focus:outline-none focus:ring-0 disabled:opacity-60"
+                    aria-label="Peer name"
+                  />
+                  {nameErr ? (
+                    <div className="mt-0.5 text-xs text-rose-600 dark:text-rose-400">{nameErr}</div>
+                  ) : null}
+                </div>
                 {(() => {
                   const addr = peer.allowed_address.replace("/32", "");
                   const wrap = addr.length > 20;
@@ -952,10 +1070,20 @@ export default function PeerDetail() {
               <div className="flex flex-col items-end gap-2">
                 {/* Allowance status */}
                 {peer && (
-                  <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs ${peer.disabled ? 'bg-rose-100 text-rose-800' : 'bg-indigo-100 text-indigo-800'}`}>
-                    <span className={`inline-block w-2 h-2 rounded-full ${peer.disabled ? 'bg-rose-500' : 'bg-indigo-500'}`} />
-                    {peer.disabled ? 'Deactivated' : 'Active'}
-                  </span>
+	                  <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs ${
+	                    peer.router_sync_status === "new"
+	                      ? "bg-rose-100 text-rose-800 dark:bg-rose-500/10 dark:text-rose-300"
+	                      : peer.selected === false
+	                      ? "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+	                      : peer.disabled
+	                        ? 'bg-rose-100 text-rose-800'
+	                        : 'bg-indigo-100 text-indigo-800'
+	                  }`}>
+	                    <span className={`inline-block w-2 h-2 rounded-full ${
+	                      peer.router_sync_status === "new" ? "bg-rose-500" : peer.selected === false ? "bg-gray-400" : peer.disabled ? 'bg-rose-500' : 'bg-indigo-500'
+	                    }`} />
+	                    {peer.router_sync_status === "new" ? 'Pending' : peer.selected === false ? 'Hidden' : peer.disabled ? 'Deactivated' : 'Active'}
+	                  </span>
                 )}
                 {disableReason && (
                   <span
@@ -968,127 +1096,87 @@ export default function PeerDetail() {
                 {/* switch kind pill to blue/amber scheme */}
                 {kindPill}
                 {statusPill}
-              </div>
-            </div>
+	              </div>
+	            </div>
 
-            {/* Usage (moved to top) */}
-            <div className="p-0 mt-2">
-	              <div className="flex items-center justify-between mb-2">
-	                <div className="text-sm text-gray-700 dark:text-gray-200">Usage</div>
-	                <div className="flex flex-wrap items-center gap-4 text-xs text-gray-600 dark:text-gray-300 justify-end">
-	                  <div className="flex items-center gap-2">
-	                    <span>Auto refresh</span>
-                    <input
-                      type="number"
-                      min={5}
-                      className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                      {...peerRefreshInput}
-                    />
-                    <span>s</span>
-                  </div>
-	                  <div className="flex items-center gap-2">
-	                    <span>Last</span>
-	                    <input
-	                      type="number"
-	                      min={1}
-	                      className="w-14 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-	                      {...peerScopeInput}
-	                    />
-	                    <select
-	                      value={scopeUnit}
-	                      onChange={(e) => update({ peer_default_scope_unit: e.target.value as ScopeUnit })}
-	                      className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
-	                    >
-	                      <option value="minutes">minutes</option>
-	                      <option value="hours">hours</option>
-	                      <option value="days">days</option>
-	                    </select>
+	            {peer.router_sync_status !== "synced" && (
+	              <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-900 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-100">
+	                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+	                  <div>
+	                    <div className="font-medium">
+	                      {peer.router_sync_status === "missing"
+	                        ? "This peer is no longer present on RouterOS."
+	                        : "This peer was found on RouterOS but has not been added to WGMik."}
+	                    </div>
+	                    <div className="mt-1 text-xs text-rose-700 dark:text-rose-200">
+	                      Choose how WGMik should treat this RouterOS change.
+	                    </div>
 	                  </div>
-	                  <div className="basis-full flex flex-wrap items-center gap-2 justify-end">
-	                    <span>Time frame</span>
-	                    <button
-	                      type="button"
-	                      onClick={() => {
-	                        if (todayFrame) {
-	                          const d = new Date();
-	                          d.setHours(0, 0, 0, 0);
-	                          setTimeFrom(formatDatetimeLocalValue(d));
-	                          setTimeTo(formatDatetimeLocalValue(new Date()));
-	                          update({ peer_time_frame_today: false });
-	                        } else {
-	                          setAllTime(false);
-	                          update({ peer_time_frame_today: true });
-	                        }
-	                      }}
-	                      className={`rounded-full px-3 py-1 text-xs border shadow ${
-	                        todayFrame
-	                          ? "border-gray-900 bg-gray-900 text-white dark:border-gray-100 dark:bg-gray-100 dark:text-gray-900"
-	                          : "border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 hover:bg-gray-50 dark:hover:bg-gray-900"
-	                      }`}
-	                    >
-	                      Today
-	                    </button>
-	                    <input
-	                      type="datetime-local"
-	                      value={displayTimeFrom}
-	                      onChange={(e) => {
-	                        update({ peer_time_frame_today: false });
-	                        setTimeFrom(e.target.value);
-	                      }}
-	                      disabled={allTime || todayFrame}
-	                      className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
-	                    />
-	                    <span>to</span>
-	                    {todayFrame ? (
-	                      <span
-	                        className="inline-flex items-center rounded-full border border-dashed border-gray-300 bg-gray-50 px-2.5 py-1 text-xs text-gray-600 dark:border-gray-600 dark:bg-gray-900/50 dark:text-gray-300"
-	                        title="End of range always matches the current time while Today is on"
-	                      >
-	                        Now
-	                      </span>
+	                  <div className="flex flex-wrap items-center gap-2">
+	                    {peer.router_sync_status === "missing" ? (
+	                      <>
+	                        <button
+	                          disabled={actionBusy}
+	                          onClick={() => resolveRouterSync("hide")}
+	                          className="rounded-full bg-white px-3 py-1.5 text-xs font-medium text-rose-800 shadow hover:bg-rose-100 disabled:opacity-50 dark:bg-gray-950 dark:text-rose-100 dark:hover:bg-rose-500/20"
+	                        >
+	                          Hide peer
+	                        </button>
+	                        <button
+	                          disabled={actionBusy}
+	                          onClick={() => resolveRouterSync("delete")}
+	                          className="rounded-full bg-rose-700 px-3 py-1.5 text-xs font-medium text-white shadow hover:bg-rose-800 disabled:opacity-50"
+	                        >
+	                          Delete local record
+	                        </button>
+	                      </>
 	                    ) : (
-	                      <input
-	                        type="datetime-local"
-	                        value={timeTo}
-	                        onChange={(e) => {
-	                          update({ peer_time_frame_today: false });
-	                          setTimeTo(e.target.value);
-	                        }}
-	                        disabled={allTime}
-	                        className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
-	                      />
+	                      <>
+	                        <button
+	                          disabled={actionBusy}
+	                          onClick={() => resolveRouterSync("accept")}
+	                          className="rounded-full bg-rose-700 px-3 py-1.5 text-xs font-medium text-white shadow hover:bg-rose-800 disabled:opacity-50"
+	                        >
+	                          Add to list
+	                        </button>
+	                        <button
+	                          disabled={actionBusy}
+	                          onClick={() => resolveRouterSync("hide")}
+	                          className="rounded-full bg-white px-3 py-1.5 text-xs font-medium text-rose-800 shadow hover:bg-rose-100 disabled:opacity-50 dark:bg-gray-950 dark:text-rose-100 dark:hover:bg-rose-500/20"
+	                        >
+	                          Keep hidden
+	                        </button>
+	                      </>
 	                    )}
-	                    {scopeUnit === "days" ? (
-	                      <label className="inline-flex items-center gap-2">
-	                        <input
-	                          type="checkbox"
-	                          checked={allTime}
-	                          onChange={(e) => {
-	                            const next = e.target.checked;
-	                            setAllTime(next);
-	                            update({ peer_time_frame_today: false });
-	                            if (next) { setTimeFrom(""); setTimeTo(""); }
-	                          }}
-	                        />
-	                        <span>All time</span>
-	                      </label>
-	                    ) : null}
-	                    <button
-	                      type="button"
-	                      onClick={() => {
-	                        setAllTime(false);
-	                        update({ peer_time_frame_today: false });
-	                        setTimeFrom("");
-	                        setTimeTo("");
-	                      }}
-	                      disabled={!timeFrameActive}
-	                      className="rounded-full border border-gray-200 dark:border-gray-800 px-3 py-1 text-xs bg-white dark:bg-gray-950 disabled:opacity-60 disabled:cursor-not-allowed"
-	                    >
-	                      Clear
-	                    </button>
 	                  </div>
 	                </div>
 	              </div>
+	            )}
+	
+	            {/* Usage (moved to top) */}
+            <div className="p-0 mt-2">
+              <div className="mb-3 grid gap-3">
+                <div>
+                  <div className="text-sm text-gray-700 dark:text-gray-200">Usage</div>
+                </div>
+                <UsageTimeControls
+                  mode={timeMode}
+                  rollingValue={scopeValue}
+                  rollingUnit={scopeUnit}
+                  customStart={customStart}
+                  customEnd={customEnd}
+                  autoRefreshSeconds={refreshSec}
+                  showAutoRefresh={false}
+                  dateCalendar={dateCalendar}
+                  timezone={timezone}
+                  weekStartDay={weekStartDay}
+                  onModeChange={(mode) => update({ peer_time_mode: mode, peer_time_frame_today: mode === "today" })}
+                  onRollingValueChange={(value) => update({ peer_default_scope_value: value, peer_time_mode: "rolling", peer_time_frame_today: false })}
+                  onRollingUnitChange={(unit) => update({ peer_default_scope_unit: unit, peer_time_mode: "rolling", peer_time_frame_today: false })}
+                  onCustomStartChange={(value) => update({ peer_custom_start: value, peer_time_mode: "custom", peer_time_frame_today: false })}
+                  onCustomEndChange={(value) => update({ peer_custom_end: value, peer_time_mode: "custom", peer_time_frame_today: false })}
+                />
+              </div>
               <div className="h-56">
                 {usage.length === 0 ? (
                   <div className="h-full flex items-center justify-center text-sm text-gray-500 dark:text-gray-400">No data</div>
@@ -1111,14 +1199,9 @@ export default function PeerDetail() {
                         tick={{ fill: "var(--chart-tick)", fontSize: 12 }}
                         tickFormatter={(val: string) => {
                           try {
-                            if (scopeUnit === "days") {
+                            if (chartScopeUnit === "days") {
                               // val is YYYY-MM-DD (UTC)
-                              const d = new Date(`${val}T00:00:00Z`);
-                              return new Intl.DateTimeFormat(undefined, {
-                                timeZone: timezone || "UTC",
-                                month: "numeric",
-                                day: "numeric",
-                              }).format(d);
+                              return formatCalendarDayLabel(val, { timeZone: timezone || "UTC", dateCalendar });
                             }
                             // raw window: val is ISO timestamp (UTC)
                             const d = new Date(val);
@@ -1143,19 +1226,11 @@ export default function PeerDetail() {
                         ]}
                         labelFormatter={(label) => {
                           try {
-                            if (scopeUnit === "days") {
-                              const d = new Date(`${label}T00:00:00Z`);
-                              return new Intl.DateTimeFormat(undefined, {
-                                timeZone: timezone || "UTC",
-                                dateStyle: "full",
-                              }).format(d);
+                            if (chartScopeUnit === "days") {
+                              return formatCalendarDayLabel(String(label), { timeZone: timezone || "UTC", dateCalendar, long: true });
                             }
                             const d = new Date(label);
-                            return new Intl.DateTimeFormat(undefined, {
-                              timeZone: timezone || "UTC",
-                              dateStyle: "medium",
-                              timeStyle: "medium",
-                            }).format(d);
+                            return formatCalendarDateTime(d, { timeZone: timezone || "UTC", dateCalendar, includeTime: true });
                           } catch {
                             return label;
                           }
@@ -1189,7 +1264,8 @@ export default function PeerDetail() {
                   </ResponsiveContainer>
                 )}
               </div>
-              <div className="flex items-center justify-center gap-6 mt-2 text-xs text-gray-500 dark:text-gray-400">
+              <div className="mt-2 flex flex-col items-center gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex flex-wrap items-center justify-center gap-x-6 gap-y-1 text-xs text-gray-500 dark:text-gray-400 sm:flex-1">
                 {(() => {
                   const totRx = usage.reduce((a, b) => a + (b.rx || 0), 0);
                   const totTx = usage.reduce((a, b) => a + (b.tx || 0), 0);
@@ -1200,11 +1276,33 @@ export default function PeerDetail() {
                     </>
                   );
                 })()}
+                </div>
+                <button
+                  disabled={actionBusy || !peer}
+                  onClick={async () => {
+                    if (!peer) return;
+                    if (!confirm('Reset all usage metrics for this peer? This cannot be undone.')) return;
+                    setActionErr("");
+                    try {
+                      setActionBusy(true);
+                      await resetPeerMetrics(peer.id);
+                      try { const points = await getPeerUsage(peer.id); setUsage(points); } catch { }
+                      try { const q = await getPeerQuota(peer.id); setQuota(q); } catch { }
+                    } catch (e: any) {
+                      setActionErr(e?.message || "Failed to reset metrics");
+                    } finally {
+                      setActionBusy(false);
+                    }
+                  }}
+                  className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                >
+                  Reset metrics
+                </button>
               </div>
             </div>
             {/* Fair Usage Status — each applicable rule has its own period, usage, and reset */}
-            {fuStatus && fuRules.length > 0 ? (
-              <div className="grid gap-4 mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
+            {hasFairUsageRules ? (
+              <div className="grid gap-4 pt-4 border-t border-gray-100 dark:border-gray-800">
                 <div className="flex items-center justify-between gap-2 flex-wrap">
                   <div className="flex items-center gap-2">
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-gray-500 dark:text-gray-400">
@@ -1361,18 +1459,8 @@ export default function PeerDetail() {
                         <div className="text-xs text-gray-500 dark:text-gray-400">
                           Resets:{" "}
                           {fr.scope_period_unit === "hour"
-                            ? new Date(fr.next_reset).toLocaleString(undefined, {
-                                month: "short",
-                                day: "numeric",
-                                year: "numeric",
-                                hour: "numeric",
-                                minute: "2-digit",
-                              })
-                            : new Date(fr.next_reset).toLocaleDateString(undefined, {
-                                month: "short",
-                                day: "numeric",
-                                year: "numeric",
-                              })}
+                            ? formatCalendarDateTime(fr.next_reset, { timeZone: timezone || "UTC", dateCalendar, includeTime: true })
+                            : formatCalendarDateTime(fr.next_reset, { timeZone: timezone || "UTC", dateCalendar, includeTime: false })}
                         </div>
                       )}
                     </div>
@@ -1380,7 +1468,7 @@ export default function PeerDetail() {
                 </div>
               </div>
             ) : (
-              <div className="mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
+              <div className="pt-6 border-t border-gray-100 dark:border-gray-800">
                 <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
                   <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
@@ -1390,49 +1478,54 @@ export default function PeerDetail() {
                 </div>
               </div>
             )}
-	            {/* Details */}
-	            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
-	              <div className="grid grid-cols-2 gap-x-4 gap-y-2">
-	                <div className="text-gray-500 dark:text-gray-400">Interface</div>
-	                <LockedField value={peer.interface} />
-                <div className="text-gray-500 dark:text-gray-400">Router</div>
-                <LockedField value={routerName || `#${peer.router_id} `} />
-                <div className="text-gray-500 dark:text-gray-400">Public key</div>
-                <LockedField value={peer.public_key} mono className="break-all" />
-                <div className="text-gray-500 dark:text-gray-400">Endpoint</div>
-                <LockedField value={liveEndpoint} mono />
-                <div className="text-gray-500 dark:text-gray-400">Last seen</div>
-                <LockedField value={lastSeenLabel} />
-              </div>
-              <div className="grid grid-cols-2 gap-x-4 gap-y-2">
-                <div className="text-gray-500 dark:text-gray-400">Selected</div>
-                <LockedField value={peer.selected ? 'Yes' : 'No'} />
-                <div className="text-gray-500 dark:text-gray-400">Disabled</div>
-                <LockedField value={peer.disabled ? 'Yes' : 'No'} />
-                <div className="text-gray-500 dark:text-gray-400">Monthly download (TX)</div>
-                <LockedField value={fmtBytes(usage.reduce((a, b) => a + (b.tx || 0), 0))} />
-	                <div className="text-gray-500 dark:text-gray-400">Monthly upload (RX)</div>
-	                <LockedField value={fmtBytes(usage.reduce((a, b) => a + (b.rx || 0), 0))} />
-	              </div>
-	            </div>
 
 	            {/* Client config */}
-	            <div className="grid gap-3 mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
-	              <div className="flex items-center justify-between">
+	            <div className="grid gap-3 pt-4 border-t border-gray-100 dark:border-gray-800">
+	              <div className="flex items-center justify-between gap-3">
 	                <div className="text-sm text-gray-700 dark:text-gray-200">Client config</div>
-	                <button
-	                  type="button"
-	                  onClick={async () => {
-	                    try {
-	                      await navigator.clipboard.writeText(clientConfig);
-	                    } catch {
-	                      // ignore
-	                    }
-	                  }}
-	                  className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
-	                >
-	                  Copy
-	                </button>
+	                <div className="flex items-center gap-2">
+	                  <button
+	                    type="button"
+	                    onClick={() => setShowClientSecrets((s) => !s)}
+	                    className="inline-flex items-center justify-center rounded-full p-2 text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-200"
+	                    aria-label={showClientSecrets ? "Hide sensitive config" : "Show sensitive config"}
+	                    title={showClientSecrets ? "Hide sensitive config" : "Show sensitive config"}
+	                  >
+	                    {showClientSecrets ? (
+	                      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+	                        <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" />
+	                        <circle cx="12" cy="12" r="3" />
+	                      </svg>
+	                    ) : (
+	                      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+	                        <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" />
+	                        <path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" />
+	                        <path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" />
+	                        <line x1="2" y1="2" x2="22" y2="22" />
+	                      </svg>
+	                    )}
+	                  </button>
+	                  <button
+	                    type="button"
+	                    role="switch"
+	                    aria-checked={showClientSecrets}
+	                    aria-label={showClientSecrets ? "Hide sensitive config" : "Show sensitive config"}
+	                    onClick={() => setShowClientSecrets((s) => !s)}
+	                    className="inline-flex items-center focus:outline-none focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 rounded-full"
+	                  >
+	                    <span
+	                      className={`relative h-6 w-11 rounded-full transition-colors ${
+	                        showClientSecrets ? "bg-gray-700 dark:bg-gray-300" : "bg-gray-300 dark:bg-gray-700"
+	                      }`}
+	                    >
+	                      <span
+	                        className={`absolute top-[2px] block h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+	                          showClientSecrets ? "translate-x-[22px]" : "translate-x-[2px]"
+	                        }`}
+	                      />
+	                    </span>
+	                  </button>
+	                </div>
 	              </div>
 	              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
 	                <div className="grid gap-3">
@@ -1441,19 +1534,17 @@ export default function PeerDetail() {
 	                      <div className="text-gray-500 dark:text-gray-400">Private key</div>
 	                      <div className="flex items-center gap-2">
 	                        <input
-	                          type={showPrivateKey ? "text" : "password"}
+	                          type={showClientSecrets ? "text" : "password"}
 	                          value={clientCfg.privateKey}
 	                          onChange={(e) => setClientCfg((c) => ({ ...c, privateKey: e.target.value }))}
 	                          placeholder="base64 32-byte key"
 	                          className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 font-mono"
 	                        />
-	                        <button
-	                          type="button"
-	                          onClick={() => setShowPrivateKey((s) => !s)}
-	                          className="rounded-full border border-gray-200 dark:border-gray-800 px-3 py-2 text-xs bg-white dark:bg-gray-950"
-	                        >
-	                          {showPrivateKey ? "Hide" : "Show"}
-	                        </button>
+	                        <RenewKeyButton
+	                          onClick={() => setConfirmRenewKeys(true)}
+	                          disabled={actionBusy || !peer}
+	                          title="Renew private keys"
+	                        />
 	                      </div>
 	                      {(clientCfg.privateKey || "").trim() && !isValidWgPrivateKey && (
 	                        <div className="text-xs text-rose-600">Private key must be base64 (32 bytes).</div>
@@ -1499,19 +1590,17 @@ export default function PeerDetail() {
 	                      <div className="text-gray-500 dark:text-gray-400">Preshared key (optional)</div>
 	                      <div className="flex items-center gap-2">
 	                        <input
-	                          type={showPresharedKey ? "text" : "password"}
+	                          type={showClientSecrets ? "text" : "password"}
 	                          value={clientCfg.presharedKey}
 	                          onChange={(e) => setClientCfg((c) => ({ ...c, presharedKey: e.target.value }))}
 	                          placeholder="base64 32-byte key"
 	                          className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 font-mono"
 	                        />
-	                        <button
-	                          type="button"
-	                          onClick={() => setShowPresharedKey((s) => !s)}
-	                          className="rounded-full border border-gray-200 dark:border-gray-800 px-3 py-2 text-xs bg-white dark:bg-gray-950 shrink-0"
-	                        >
-	                          {showPresharedKey ? "Hide" : "Show"}
-	                        </button>
+	                        <RenewKeyButton
+	                          onClick={() => setConfirmRenewPsk(true)}
+	                          disabled={!peer}
+	                          title="Generate new preshared key"
+	                        />
 	                      </div>
 	                      {(clientCfg.presharedKey || "").trim() && !isValidWgPresharedKey && (
 	                        <div className="text-xs text-rose-600">Preshared key must be base64 (32 bytes), or leave empty.</div>
@@ -1553,21 +1642,41 @@ export default function PeerDetail() {
 	                      readOnly
 	                      value={clientConfig}
 	                      rows={12}
-	                      className="w-full rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 px-3 py-2 text-xs font-mono text-gray-900 dark:text-gray-100 focus:outline-none"
+	                      className={`w-full rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 px-3 py-2 text-xs font-mono text-gray-900 dark:text-gray-100 focus:outline-none transition-[filter] ${
+	                        showClientSecrets ? "" : "blur-[3px] select-none"
+	                      }`}
 	                    />
-	                    <button
-	                      type="button"
-	                      onClick={downloadClientConfigFile}
-	                      disabled={!clientConfig}
-	                      className="justify-self-start rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
-	                    >
-	                      Save config file
-	                    </button>
+	                    <div className="mt-3 flex flex-wrap items-center gap-2">
+	                      <button
+	                        type="button"
+	                        onClick={async () => {
+	                          try {
+	                            await navigator.clipboard.writeText(clientConfig);
+	                          } catch {
+	                            // ignore
+	                          }
+	                        }}
+	                        disabled={!clientConfig}
+	                        className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+	                      >
+	                        Copy
+	                      </button>
+	                      <button
+	                        type="button"
+	                        onClick={downloadClientConfigFile}
+	                        disabled={!clientConfig}
+	                        className="rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+	                      >
+	                        Save config file
+	                      </button>
+	                    </div>
 	                  </div>
 	                </div>
 	                <div className="rounded-3xl ring-1 ring-gray-200 dark:ring-gray-800 bg-white dark:bg-gray-950 p-4 flex items-center justify-center min-h-[240px]">
 	                  {isValidWgPrivateKey ? (
-	                    <QRCode value={clientConfig} size={220} />
+	                    <div className={`transition-[filter] ${showClientSecrets ? "" : "blur-[3px] select-none"}`}>
+	                      <QRCode value={clientConfig} size={220} />
+	                    </div>
 	                  ) : (
 	                    <div className="text-sm text-gray-500 dark:text-gray-400 text-center">
 	                      Paste a valid private key to render a QR code.
@@ -1577,10 +1686,26 @@ export default function PeerDetail() {
 	              </div>
 	            </div>
 
-	            {/* Activity log */}
-	            <div className="grid gap-3 mt-6 pt-4 border-t border-gray-100 dark:border-gray-800">
-	              <div className="flex items-center justify-between">
-	                <div className="text-sm text-gray-700 dark:text-gray-200">Activity log</div>
+            {/* Details + Activity log */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4 border-t border-gray-100 dark:border-gray-800">
+              <div className="grid gap-3 self-start">
+                <div className="text-sm text-gray-700 dark:text-gray-200">Details</div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+                  <div className="text-gray-500 dark:text-gray-400">Interface</div>
+                  <LockedField value={peer.interface} />
+                  <div className="text-gray-500 dark:text-gray-400">Router</div>
+                  <LockedField value={routerName || `#${peer.router_id} `} />
+                  <div className="text-gray-500 dark:text-gray-400">Public key</div>
+                  <LockedField value={peer.public_key} mono />
+                  <div className="text-gray-500 dark:text-gray-400">Endpoint</div>
+                  <LockedField value={liveEndpoint} mono />
+                  <div className="text-gray-500 dark:text-gray-400">Last seen</div>
+                  <LockedField value={lastSeenLabel} />
+                </div>
+              </div>
+              <div className="grid gap-3 self-start">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm text-gray-700 dark:text-gray-200">Activity log</div>
                 <div className="flex items-center gap-2">
                   <div className="text-xs text-gray-500 dark:text-gray-400">Showing {actionsLimit}</div>
                   {actionsHasMore && actionsLimit < 200 && (
@@ -1610,16 +1735,12 @@ export default function PeerDetail() {
               {actions.length === 0 ? (
                 <div className="text-xs text-gray-500 dark:text-gray-400">No log entries yet.</div>
               ) : (
-                <div className="grid gap-2">
+                <div className="grid max-h-72 gap-2 overflow-y-auto overscroll-y-contain pr-1">
                   {actions.map((a, idx) => {
                     const tsLabel = (() => {
                       try {
                         const d = new Date(a.ts);
-                        return new Intl.DateTimeFormat(undefined, {
-                          timeZone: timezone || "UTC",
-                          dateStyle: "medium",
-                          timeStyle: "medium",
-                        }).format(d);
+                        return formatCalendarDateTime(d, { timeZone: timezone || "UTC", dateCalendar, includeTime: true });
                       } catch {
                         return a.ts;
                       }
@@ -1636,13 +1757,13 @@ export default function PeerDetail() {
                           : "bg-gray-50 text-gray-800 dark:bg-gray-950 dark:text-gray-200";
                     return (
                       <div
-                        key={`${a.ts} -${a.action} -${idx} `}
+                        key={`${a.ts}-${a.action}-${idx}`}
                         className="rounded-xl border border-dashed border-gray-200 dark:border-gray-700 bg-white/50 dark:bg-gray-950 px-3 py-2"
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
-                              <span className={`inline - flex items - center rounded - full px - 2 py - 0.5 text - [11px] ${badgeCls} `}>
+                              <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] ${badgeCls}`}>
                                 {a.action}
                               </span>
                               <span className="text-[11px] text-gray-500 dark:text-gray-400">{tsLabel}</span>
@@ -1659,11 +1780,39 @@ export default function PeerDetail() {
                   })}
                 </div>
               )}
+              </div>
             </div>
-            {/* Actions */}
-            <div className="flex items-center justify-between mt-6 pt-4 border-t border-gray-100">
-              <div className="text-sm text-gray-500">Actions</div>
-              <div className="flex items-center gap-3">
+            <div className="grid gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-3">
+                {peer.selected === false && peer.router_sync_status === "synced" && (
+                  <button
+                    disabled={actionBusy || !peer}
+                    onClick={async () => {
+                      if (!peer) return;
+                      setActionErr("");
+                      try {
+                        setActionBusy(true);
+                        const saved = await patchPeer(peer.id, { selected: true });
+                        setPeer({ ...peer, selected: saved.selected });
+                        await fetchActions(actionsLimit);
+                      } catch (e: any) {
+                        setActionErr(e?.message || "Failed to show peer");
+                      } finally {
+                        setActionBusy(false);
+                      }
+                    }}
+                    className="inline-flex items-center gap-2 rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                  >
+                    Show peer
+                  </button>
+                )}
+                <button
+                  disabled={actionBusy || !peer}
+                  onClick={() => setConfirmDelete(true)}
+                  className="inline-flex items-center gap-2 rounded-full bg-rose-600 text-white px-4 py-2 text-sm shadow hover:bg-rose-700 disabled:opacity-50"
+                >
+                  Remove peer
+                </button>
                 <button
                   disabled={actionBusy || !peer}
                   onClick={async () => {
@@ -1680,51 +1829,12 @@ export default function PeerDetail() {
                       setActionBusy(false);
                     }
                   }}
-                  className="inline-flex items-center gap-2 rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50"
+                  className="inline-flex items-center gap-2 rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
                 >
                   {peer?.disabled ? 'Enable peer' : 'Disable peer'}
                 </button>
-                <button
-                  disabled={actionBusy || !peer}
-                  onClick={async () => {
-                    if (!peer) return;
-                    if (!confirm('Reset all usage metrics for this peer? This cannot be undone.')) return;
-                    setActionErr("");
-                    try {
-                      setActionBusy(true);
-                      await resetPeerMetrics(peer.id);
-                      // Refresh usage + quota
-                      try { const points = await getPeerUsage(peer.id); setUsage(points); } catch { }
-                      try { const q = await getPeerQuota(peer.id); setQuota(q); } catch { }
-                    } catch (e: any) {
-                      setActionErr(e?.message || "Failed to reset metrics");
-                    } finally {
-                      setActionBusy(false);
-                    }
-                  }}
-                  className="inline-flex items-center gap-2 rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 disabled:opacity-50"
-                >
-                  Reset metrics
-                </button>
-                <button
-                  disabled={actionBusy || !peer}
-                  onClick={() => setConfirmRenewKeys(true)}
-                  className="inline-flex items-center gap-2 rounded-full bg-amber-500 text-white px-4 py-2 text-sm shadow hover:bg-amber-600 disabled:opacity-50"
-                >
-                  Renew private keys
-                </button>
-                <button
-                  disabled={actionBusy || !peer}
-                  onClick={() => setConfirmDelete(true)}
-                  className="inline-flex items-center gap-2 rounded-full bg-rose-600 text-white px-4 py-2 text-sm shadow hover:bg-rose-700 disabled:opacity-50"
-                >
-                  Remove peer
-                </button>
               </div>
-            </div>
-            {actionErr && <div className="text-sm text-red-600">{actionErr}</div>}
-            <div className="flex justify-end">
-              <Link to="/" className="inline-flex items-center gap-2 rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black">Back to dashboard</Link>
+              {actionErr && <div className="text-sm text-red-600 text-right">{actionErr}</div>}
             </div>
           </div>
         )}
@@ -1764,6 +1874,33 @@ export default function PeerDetail() {
                   className="rounded-full bg-amber-500 text-white px-4 py-2 text-sm shadow hover:bg-amber-600 disabled:opacity-50"
                 >
                   Renew keys
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {confirmRenewPsk && peer && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
+            <div className="w-full max-w-sm rounded-2xl bg-white ring-1 ring-gray-200 shadow-lg p-6 grid gap-4">
+              <div className="text-lg font-semibold text-gray-900">Generate new preshared key</div>
+              <div className="text-sm text-gray-600">
+                This generates a new preshared key for <span className="font-medium text-gray-900">{peer.name}</span>, updates the router, and replaces the current client config. Existing clients using the old preshared key will stop working until they import the new config.
+              </div>
+              <div className="flex items-center justify-end gap-3">
+                <button
+                  onClick={() => setConfirmRenewPsk(false)}
+                  className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    setClientCfg((c) => ({ ...c, presharedKey: generatePresharedKey() }));
+                    setConfirmRenewPsk(false);
+                  }}
+                  className="rounded-full bg-amber-500 text-white px-4 py-2 text-sm shadow hover:bg-amber-600 disabled:opacity-50"
+                >
+                  Generate key
                 </button>
               </div>
             </div>
@@ -1820,6 +1957,7 @@ export default function PeerDetail() {
             </div>
           </div>
         )}
+        </div>
       </div>
     </div>
   );

@@ -15,16 +15,29 @@ from ..fair_usage_peer_status_dto import build_fair_usage_peer_status_dto
 from ..models import Peer, Router as RouterModel, TelegramPeerBinding, TelegramUser
 from ..settings import settings
 from .fair_usage_image import render_fair_usage_peer_card_png
-from .formatters import format_next_reset_from_iso
-from .usage_chart_image import render_usage_chart_png, usage_points_for_tg_menu
+from .formatters import format_next_reset_from_iso, format_usage_total_summary, usage_point_totals
+from .usage_chart_image import (
+    render_usage_chart_png,
+    usage_points_for_selected_calendar_month,
+    usage_points_for_tg_menu,
+)
+from .usage_month_picker import (
+    YEARS_PER_PAGE,
+    distinct_calendar_months_with_usage,
+    format_picker_month_scope_label,
+)
+from ..calendar_utils import app_date_calendar
 from .i18n import t
 from .keyboards import (
+    empty_inline_keyboard,
     home_button,
     language_menu,
     main_menu,
     notifications_menu,
     settings_menu,
     usage_history_menu,
+    usagepick_months_for_year_keyboard,
+    usagepick_year_page_keyboard,
 )
 from .notifications import (
     USER_NOTIFICATION_EVENT_TYPES,
@@ -35,6 +48,12 @@ from .tokens import redeem_token
 
 logger = logging.getLogger("wgmik.telegram.handlers")
 router = Router()
+
+_USAGE_SCOPE_LABEL_KEYS = {
+    "today": "btn_today",
+    "month": "btn_this_month",
+    "alltime": "btn_all_time",
+}
 
 
 def _get_tg_user(tg_id: int) -> TelegramUser | None:
@@ -48,6 +67,28 @@ def _get_tg_user(tg_id: int) -> TelegramUser | None:
 def _get_lang(tg_id: int) -> str:
     user = _get_tg_user(tg_id)
     return user.language if user else "en"
+
+
+def _months_with_usage_for_requester(requester_id: int) -> list[tuple[int, int]]:
+    peers = _get_visible_peers(requester_id)
+    if not peers:
+        return []
+    ids = [p.id for p, _ in peers]
+    db = SessionLocal()
+    try:
+        return distinct_calendar_months_with_usage(db, ids, app_date_calendar())
+    finally:
+        db.close()
+
+
+def _usagepick_year_page_slice(
+    months: list[tuple[int, int]], page: int
+) -> tuple[list[int], int, int]:
+    years = sorted({y for y, _ in months}, reverse=True)
+    total_pages = max(1, (len(years) + YEARS_PER_PAGE - 1) // YEARS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * YEARS_PER_PAGE
+    return years[start : start + YEARS_PER_PAGE], page, total_pages
 
 
 def _get_visible_peers(tg_user_id: int) -> list[tuple[Peer, RouterModel | None]]:
@@ -137,31 +178,37 @@ async def deliver_usage_scope_charts(
         return
 
     scope_label = {
-        "today": t("btn_today", lang),
-        "week": t("btn_this_week", lang),
-        "month": t("btn_this_month", lang),
+        name: t(label_key, lang) for name, label_key in _USAGE_SCOPE_LABEL_KEYS.items()
     }.get(scope, scope)
 
     status_text = t("usage_sending", lang, scope=scope_label)
     if use_edit:
-        await _safe_edit_text(message, status_text, reply_markup=usage_history_menu(lang))
+        await _safe_edit_text(message, status_text, reply_markup=empty_inline_keyboard())
     else:
         await message.answer(status_text)
 
     now = datetime.now(timezone.utc)
     db = SessionLocal()
     try:
+        total_rx = 0
+        total_tx = 0
+        total_peers = 0
         for peer, _ in peers:
             db_peer = db.get(Peer, peer.id)
             if not db_peer:
                 continue
             points, mode = usage_points_for_tg_menu(db, db_peer.id, scope, now)
+            peer_rx, peer_tx = usage_point_totals(points)
+            total_rx += peer_rx
+            total_tx += peer_tx
+            total_peers += 1
             label = db_peer.name or db_peer.public_key[:12]
             payload = {
                 "peerName": label,
                 "scopeLabel": scope_label,
                 "mode": mode,
                 "timezone": settings.timezone,
+                "dateCalendar": app_date_calendar(),
                 "points": points,
             }
             try:
@@ -173,8 +220,127 @@ async def deliver_usage_scope_charts(
                 BufferedInputFile(png, filename="usage.png"),
                 caption=t("usage_chart_caption", lang, name=label, scope=scope_label),
             )
+        if total_peers > 1:
+            await message.answer(
+                format_usage_total_summary(scope_label, total_peers, total_rx, total_tx, lang)
+            )
     finally:
         db.close()
+
+
+async def deliver_picked_calendar_month_charts(
+    message: Message,
+    cal_y: int,
+    cal_m: int,
+    *,
+    use_edit: bool,
+    requester_id: int,
+) -> None:
+    """Send daily usage charts for one panel-calendar month (per peer, skip empty)."""
+    lang = _get_lang(requester_id)
+    peers = _get_visible_peers(requester_id)
+    if not peers:
+        if use_edit:
+            await _safe_edit_text(message, t("no_peers", lang), reply_markup=home_button(lang))
+        else:
+            await message.answer(t("no_peers", lang))
+        return
+
+    scope_label = format_picker_month_scope_label(cal_y, cal_m, app_date_calendar())
+    status_text = t("usage_sending", lang, scope=scope_label)
+    if use_edit:
+        await _safe_edit_text(message, status_text, reply_markup=empty_inline_keyboard())
+    else:
+        await message.answer(status_text)
+
+    now = datetime.now(timezone.utc)
+    db = SessionLocal()
+    sent_any = False
+    try:
+        total_rx = 0
+        total_tx = 0
+        total_peers = 0
+        for peer, _ in peers:
+            db_peer = db.get(Peer, peer.id)
+            if not db_peer:
+                continue
+            points, mode = usage_points_for_selected_calendar_month(
+                db, db_peer.id, cal_y, cal_m, now
+            )
+            if not points:
+                continue
+            peer_rx, peer_tx = usage_point_totals(points)
+            total_rx += peer_rx
+            total_tx += peer_tx
+            total_peers += 1
+            sent_any = True
+            label = db_peer.name or db_peer.public_key[:12]
+            payload = {
+                "peerName": label,
+                "scopeLabel": scope_label,
+                "mode": mode,
+                "timezone": settings.timezone,
+                "dateCalendar": app_date_calendar(),
+                "points": points,
+            }
+            try:
+                png = await render_usage_chart_png(payload)
+            except Exception:
+                logger.exception("Usage chart screenshot failed for peer %s", db_peer.id)
+                continue
+            await message.answer_photo(
+                BufferedInputFile(png, filename="usage.png"),
+                caption=t("usage_chart_caption", lang, name=label, scope=scope_label),
+            )
+        if total_peers > 1:
+            await message.answer(
+                format_usage_total_summary(scope_label, total_peers, total_rx, total_tx, lang)
+            )
+    finally:
+        db.close()
+
+    if not sent_any:
+        await message.answer(t("usagepick_no_data_month", lang))
+
+
+async def deliver_usage_month_picker_year_screen(
+    message: Message,
+    *,
+    requester_id: int,
+    use_edit: bool,
+) -> None:
+    """First step of month picker: years with data (same as callback ``usagepick:years``)."""
+    lang = _get_lang(requester_id)
+    peers = _get_visible_peers(requester_id)
+    if not peers:
+        if use_edit:
+            await _safe_edit_text(message, t("no_peers", lang), reply_markup=home_button(lang))
+        else:
+            await message.answer(t("no_peers", lang), reply_markup=home_button(lang))
+        return
+
+    months = _months_with_usage_for_requester(requester_id)
+    if not months:
+        if use_edit:
+            await _safe_edit_text(
+                message,
+                t("usagepick_no_months", lang),
+                reply_markup=usage_history_menu(lang),
+            )
+        else:
+            await message.answer(
+                t("usagepick_no_months", lang),
+                reply_markup=usage_history_menu(lang),
+            )
+        return
+
+    slice_years, page, total_pages = _usagepick_year_page_slice(months, 0)
+    kb = usagepick_year_page_keyboard(lang, slice_years, page, total_pages)
+    text = t("usagepick_choose_year", lang)
+    if use_edit:
+        await _safe_edit_text(message, text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
 
 
 async def deliver_status_cards(message: Message, *, use_edit: bool, requester_id: int) -> None:
@@ -349,8 +515,89 @@ async def cb_usage_menu(cb: CallbackQuery):
     await cb.answer()
 
 
+@router.callback_query(lambda c: c.data and c.data.startswith("usagepick:"))
+async def cb_usagepick(cb: CallbackQuery):
+    lang = _get_lang(cb.from_user.id)
+    peers = _get_visible_peers(cb.from_user.id)
+    if not peers:
+        await _safe_edit_text(cb.message, t("no_peers", lang), reply_markup=home_button(lang))
+        await cb.answer()
+        return
+
+    data = cb.data or ""
+    months = _months_with_usage_for_requester(cb.from_user.id)
+    cal = app_date_calendar()
+
+    if data == "usagepick:years":
+        await deliver_usage_month_picker_year_screen(
+            cb.message, requester_id=cb.from_user.id, use_edit=True
+        )
+        await cb.answer()
+        return
+
+    if data.startswith("usagepick:py:"):
+        try:
+            page = int(data.split(":")[-1])
+        except ValueError:
+            await cb.answer()
+            return
+        if not months:
+            await _safe_edit_text(
+                cb.message,
+                t("usagepick_no_months", lang),
+                reply_markup=usage_history_menu(lang),
+            )
+            await cb.answer()
+            return
+        slice_years, page, total_pages = _usagepick_year_page_slice(months, page)
+        kb = usagepick_year_page_keyboard(lang, slice_years, page, total_pages)
+        await _safe_edit_text(cb.message, t("usagepick_choose_year", lang), reply_markup=kb)
+        await cb.answer()
+        return
+
+    if data.startswith("usagepick:y:"):
+        try:
+            year = int(data.split(":")[-1])
+        except ValueError:
+            await cb.answer()
+            return
+        months_in_year = sorted({m for y, m in months if y == year})
+        if not months_in_year:
+            slice_years, page, total_pages = _usagepick_year_page_slice(months, 0)
+            kb = usagepick_year_page_keyboard(lang, slice_years, page, total_pages)
+            await _safe_edit_text(cb.message, t("usagepick_no_months", lang), reply_markup=kb)
+            await cb.answer()
+            return
+        kb = usagepick_months_for_year_keyboard(lang, year, months_in_year, cal)
+        await _safe_edit_text(
+            cb.message,
+            t("usagepick_choose_month", lang, year=str(year)),
+            reply_markup=kb,
+        )
+        await cb.answer()
+        return
+
+    if data.startswith("usagepick:m:"):
+        parts = data.split(":")
+        if len(parts) != 4:
+            await cb.answer()
+            return
+        try:
+            cy, cm = int(parts[2]), int(parts[3])
+        except ValueError:
+            await cb.answer()
+            return
+        await deliver_picked_calendar_month_charts(
+            cb.message, cy, cm, use_edit=True, requester_id=cb.from_user.id
+        )
+        await cb.answer()
+        return
+
+    await cb.answer()
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("usage:"))
-async def cb_usage_scope_legacy(cb: CallbackQuery):
+async def cb_usage_scope(cb: CallbackQuery):
     scope = cb.data.split(":")[1]
     await deliver_usage_scope_charts(cb.message, scope, use_edit=True, requester_id=cb.from_user.id)
     await cb.answer()
@@ -394,18 +641,27 @@ async def cmd_today(msg: types.Message):
     await deliver_usage_scope_charts(msg, "today", use_edit=False, requester_id=msg.from_user.id)
 
 
-@router.message(Command("weekly"))
-async def cmd_weekly(msg: types.Message):
-    if await _abort_if_not_registered_or_blocked(msg):
-        return
-    await deliver_usage_scope_charts(msg, "week", use_edit=False, requester_id=msg.from_user.id)
-
-
 @router.message(Command("monthly"))
 async def cmd_monthly(msg: types.Message):
     if await _abort_if_not_registered_or_blocked(msg):
         return
     await deliver_usage_scope_charts(msg, "month", use_edit=False, requester_id=msg.from_user.id)
+
+
+@router.message(Command("calendar"))
+async def cmd_calendar(msg: types.Message):
+    if await _abort_if_not_registered_or_blocked(msg):
+        return
+    await deliver_usage_month_picker_year_screen(
+        msg, requester_id=msg.from_user.id, use_edit=False
+    )
+
+
+@router.message(Command("alltime"))
+async def cmd_alltime(msg: types.Message):
+    if await _abort_if_not_registered_or_blocked(msg):
+        return
+    await deliver_usage_scope_charts(msg, "alltime", use_edit=False, requester_id=msg.from_user.id)
 
 
 @router.message(Command("settings"))

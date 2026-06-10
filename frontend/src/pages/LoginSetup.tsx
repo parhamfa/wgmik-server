@@ -1,24 +1,20 @@
 import React from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { useNavigate, useLocation } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import {
     createRouter,
     listRouters,
-    setActiveRouter,
     routerInterfaces,
     routerPeers,
     testRouter,
     importPeers,
-    deleteRouter,
     type Router,
     type RouterProto,
     type PeerView,
 } from "../api";
-import { useAuth } from "../auth";
 
-export default function LoginSetup() {
-    const { user, login } = useAuth();
-    const [step, setStep] = React.useState<1 | 2 | 3 | 4>(1); // 1=Login, 2=Connect, 3=Interface, 4=Peers
+export default function RouterSetupPage() {
+    const [step, setStep] = React.useState<1 | 2 | 3>(1); // 1=Connect, 2=Interface, 3=Peers
     const [router, setRouter] = React.useState<Router | null>(null);
     const [iface, setIface] = React.useState<string>("");
     const [pendingImport, setPendingImport] = React.useState<
@@ -27,14 +23,6 @@ export default function LoginSetup() {
     const [submitting, setSubmitting] = React.useState(false);
     const [submitErr, setSubmitErr] = React.useState("");
     const navigate = useNavigate();
-    const location = useLocation();
-
-    // If already logged in, skip to Step 2 (Connect) on mount
-    React.useEffect(() => {
-        if (user && step === 1) {
-            setStep(2);
-        }
-    }, [user, step]);
 
     // Directional slide transitions across steps
     const [direction, setDirection] = React.useState(1);
@@ -45,13 +33,10 @@ export default function LoginSetup() {
         prevStepRef.current = step;
     }, [step]);
 
-    const connected = !!router;
-    const isSetupSteps = step >= 2;
-
     return (
         <div className="mx-auto px-4 md:px-6 py-6">
             <div className="mt-10 md:mt-16 mb-6">
-                <StepHeader current={step} total={4} />
+                <StepHeader current={step} total={3} />
             </div>
             <div className="mx-auto my-12 md:my-16 w-full max-w-[760px] h-[700px] rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 md:p-6 overflow-y-auto overflow-x-hidden relative">
                 <AnimatePresence initial={false} custom={direction} mode="wait">
@@ -70,36 +55,28 @@ export default function LoginSetup() {
                         transition={{ type: "tween", ease: "easeOut", duration: 0.28 }}
                     >
                         {step === 1 && (
-                            <StepLogin
-                                onSuccess={() => {
-                                    setDirection(1);
-                                    setStep(2);
-                                }}
-                            />
-                        )}
-                        {step === 2 && (
                             <StepConnect
                                 onConnected={(r) => {
                                     setDirection(1);
                                     setRouter(r);
-                                    setStep(3);
+                                    setStep(2);
                                 }}
                                 onGoToDashboard={() => {
                                     navigate("/");
                                 }}
                             />
                         )}
-                        {step === 3 && (
+                        {step === 2 && (
                             <StepInterface
                                 router={router}
                                 onSelected={(i) => {
                                     setDirection(1);
                                     setIface(i);
-                                    setStep(4);
+                                    setStep(3);
                                 }}
                             />
                         )}
-                        {step === 4 && (
+                        {step === 3 && (
                             <StepPeers
                                 router={router}
                                 iface={iface}
@@ -110,51 +87,55 @@ export default function LoginSetup() {
                 </AnimatePresence>
             </div>
 
-            {/* Navigation Buttons (Only for Setup Steps) */}
-            {isSetupSteps && (
-                <div className="mx-auto w-full max-w-[760px] mt-3 flex items-center gap-3">
+            <div className="mx-auto w-full max-w-[760px] mt-3 flex items-center gap-3">
+                <button
+                    type="button"
+                    onClick={() => {
+                        setDirection(-1);
+                        setStep((s) => (s === 1 ? 1 : ((s - 1) as 1 | 2 | 3)));
+                    }}
+                    disabled={step === 1}
+                    className="inline-flex items-center gap-2 rounded-full bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 px-4 py-2 text-sm shadow hover:bg-black dark:hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    <svg
+                        viewBox="0 0 24 24"
+                        width="16"
+                        height="16"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                    >
+                        <path d="M15 18l-6-6 6-6" />
+                    </svg>
+                    Previous
+                </button>
+                {step === 3 && (
                     <button
                         type="button"
-                        onClick={() => {
-                            setDirection(-1);
-                            setStep((s) => (s === 2 ? 2 : ((s - 1) as 1 | 2 | 3 | 4))); // Don't go back to Login (1) from Connect (2) via button, logout instead
+                        onClick={async () => {
+                            setSubmitErr("");
+                            if (!router) {
+                                navigate("/");
+                                return;
+                            }
+                            try {
+                                setSubmitting(true);
+                                const items = pendingImport && pendingImport.length ? pendingImport : [];
+                                await importPeers(router.id, items);
+                                navigate("/");
+                            } catch (e: any) {
+                                setSubmitErr(e?.message || "Failed to import peers");
+                            } finally {
+                                setSubmitting(false);
+                            }
                         }}
-                        disabled={step === 2}
+                        disabled={submitting}
                         className="inline-flex items-center gap-2 rounded-full bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 px-4 py-2 text-sm shadow hover:bg-black dark:hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                        <svg
-                            viewBox="0 0 24 24"
-                            width="16"
-                            height="16"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="2"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                        >
-                            <path d="M15 18l-6-6 6-6" />
-                        </svg>
-                        Previous
-                    </button>
-                    {step < 4 ? (
-                        <button
-                            type="button"
-                            onClick={() => {
-                                setDirection(1);
-                                setStep((s) => (s === 4 ? 4 : ((s + 1) as 1 | 2 | 3 | 4)));
-                            }}
-                            // Only enable Next if we have router/iface selection state logic handled within components or simple nav
-                            // For now, StepConnect/StepInterface handle 'Next' via their own onSelected callbacks effectively?
-                            // Actually StepConnect sets Step 3 on connect.
-                            // StepInterface sets Step 4 on select.
-                            // This Next button is mostly redundant if the items themselves trigger next, BUT useful if we want manual control.
-                            // Consistent with Wizard.tsx, let's keep it but handle the click appropriately?
-                            // In Wizard.tsx, "Next" increases step.
-                            // Here, we only show it if applicable.
-                            // Let's hide Next for steps where selection is required to proceed?
-                            className="inline-flex items-center gap-2 rounded-full bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 px-4 py-2 text-sm shadow hover:bg-black dark:hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed hidden"
-                        >
-                            Next
+                        {submitting ? "Submitting…" : "Finish Import"}
+                        {!submitting && (
                             <svg
                                 viewBox="0 0 24 24"
                                 width="16"
@@ -167,50 +148,10 @@ export default function LoginSetup() {
                             >
                                 <path d="M9 6l6 6-6 6" />
                             </svg>
-                        </button>
-                    ) : (
-                        <button
-                            type="button"
-                            onClick={async () => {
-                                setSubmitErr("");
-                                if (!router) {
-                                    navigate("/");
-                                    return;
-                                }
-                                try {
-                                    setSubmitting(true);
-                                    const items =
-                                        pendingImport && pendingImport.length ? pendingImport : [];
-                                    await importPeers(router.id, items);
-                                    navigate("/");
-                                } catch (e: any) {
-                                    setSubmitErr(e?.message || "Failed to import peers");
-                                } finally {
-                                    setSubmitting(false);
-                                }
-                            }}
-                            disabled={submitting}
-                            className="inline-flex items-center gap-2 rounded-full bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 px-4 py-2 text-sm shadow hover:bg-black dark:hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                            {submitting ? "Submitting…" : "Finish Import"}
-                            {!submitting && (
-                                <svg
-                                    viewBox="0 0 24 24"
-                                    width="16"
-                                    height="16"
-                                    fill="none"
-                                    stroke="currentColor"
-                                    strokeWidth="2"
-                                    strokeLinecap="round"
-                                    strokeLinejoin="round"
-                                >
-                                    <path d="M9 6l6 6-6 6" />
-                                </svg>
-                            )}
-                        </button>
-                    )}
-                </div>
-            )}
+                        )}
+                    </button>
+                )}
+            </div>
             {submitErr && (
                 <div className="mx-auto w-full max-w-[760px] mt-2 text-sm text-red-600 dark:text-red-400">
                     {submitErr}
@@ -231,10 +172,9 @@ function Card(props: React.HTMLAttributes<HTMLDivElement>) {
 function StepHeader({ current, total }: { current: number; total: number }) {
     const items = Array.from({ length: total }, (_, i) => i + 1);
     const labels: Record<number, string> = {
-        1: "Login",
-        2: "Connect",
-        3: "Interface",
-        4: "Peers",
+        1: "Connect",
+        2: "Interface",
+        3: "Peers",
     };
     return (
         <div className="flex items-center justify-center mb-6 select-none">
@@ -265,83 +205,7 @@ function StepHeader({ current, total }: { current: number; total: number }) {
     );
 }
 
-// --- Step 1: Login ---
-function StepLogin({ onSuccess }: { onSuccess: () => void }) {
-    const { login } = useAuth();
-    const [username, setUsername] = React.useState("");
-    const [password, setPassword] = React.useState("");
-    const [error, setError] = React.useState("");
-    const [busy, setBusy] = React.useState(false);
-
-    const handleSubmit = async (e: React.FormEvent) => {
-        e.preventDefault();
-        setError("");
-        setBusy(true);
-        try {
-            await login({ username, password });
-            onSuccess();
-        } catch (err: any) {
-            console.error(err);
-            const message = String(err?.message || "").trim();
-            if (
-                message === "Incorrect username or password" ||
-                message === "Unauthorized"
-            ) {
-                setError("Invalid username or password");
-            } else {
-                setError(message || "Sign in failed");
-            }
-        } finally {
-            setBusy(false);
-        }
-    };
-
-    return (
-        <Card className="p-8 h-full flex flex-col items-center justify-center max-w-sm mx-auto shadow-none ring-0 hover:translate-y-0">
-            <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-2">Welcome Back</h2>
-            <p className="text-gray-500 dark:text-gray-400 mb-8 text-center text-sm">
-                Sign in to manage your WireGuard peers
-            </p>
-
-            <form className="w-full space-y-4" onSubmit={handleSubmit}>
-                <div>
-                    <label className="sr-only">Username</label>
-                    <input
-                        type="text"
-                        required
-                        className="block w-full rounded-xl border-gray-300 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-3 text-sm focus:border-indigo-500 focus:ring-indigo-500"
-                        placeholder="Username"
-                        value={username}
-                        onChange={(e) => setUsername(e.target.value)}
-                    />
-                </div>
-                <div>
-                    <label className="sr-only">Password</label>
-                    <input
-                        type="password"
-                        required
-                        className="block w-full rounded-xl border-gray-300 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-3 text-sm focus:border-indigo-500 focus:ring-indigo-500"
-                        placeholder="Password"
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                    />
-                </div>
-
-                {error && <div className="text-red-500 text-sm text-center">{error}</div>}
-
-                <button
-                    type="submit"
-                    disabled={busy}
-                    className="w-full flex justify-center py-3 px-4 border border-transparent rounded-full shadow-sm text-sm font-medium text-white bg-gray-900 hover:bg-black dark:bg-white dark:text-gray-900 dark:hover:bg-gray-100 disabled:opacity-50"
-                >
-                    {busy ? "Signing in..." : "Sign in"}
-                </button>
-            </form>
-        </Card>
-    );
-}
-
-// --- Step 2: Connect (Wizard StepConnect) ---
+// --- Step 1: Connect ---
 function StepConnect({
     onConnected,
     onGoToDashboard,
@@ -349,6 +213,7 @@ function StepConnect({
     onConnected: (r: Router) => void;
     onGoToDashboard: () => void;
 }) {
+    const navigate = useNavigate();
     const protoDefaults: Record<RouterProto, number> = {
         rest: 443,
         "rest-http": 80,
@@ -384,10 +249,6 @@ function StepConnect({
     const [form, setForm] = React.useState<RouterForm>(makeBlankForm());
     const [addErr, setAddErr] = React.useState("");
     const [addBusy, setAddBusy] = React.useState(false);
-    const [deleteBusyId, setDeleteBusyId] = React.useState<number | null>(null);
-    const [confirmDeleteRouter, setConfirmDeleteRouter] = React.useState<Router | null>(
-        null
-    );
 
     const loadRouters = React.useCallback(async () => {
         setLoadingRouters(true);
@@ -411,6 +272,7 @@ function StepConnect({
     }, [loadRouters]);
 
     const selectedRouter = routers.find((r) => r.id === selectedId) || null;
+    const hasProfiles = routers.length > 0;
 
     async function handleTest(routerId: number) {
         setTestBusyId(routerId);
@@ -434,11 +296,6 @@ function StepConnect({
         try {
             await testRouter(selectedRouter.id);
             setTestStatus((prev) => ({ ...prev, [selectedRouter.id]: "OK" }));
-            try {
-                await setActiveRouter(selectedRouter.id);
-            } catch {
-                // ignore
-            }
             onConnected(selectedRouter);
         } catch (e: any) {
             const msg =
@@ -549,17 +406,6 @@ function StepConnect({
                                             >
                                                 {testBusyId === r.id ? "Testing…" : "Test"}
                                             </button>
-                                            <button
-                                                type="button"
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    setConfirmDeleteRouter(r);
-                                                }}
-                                                className="rounded-full bg-rose-50 dark:bg-rose-900/20 text-rose-700 dark:text-rose-400 px-3 py-1 text-xs shadow hover:bg-rose-100 dark:hover:bg-rose-900/40"
-                                                disabled={deleteBusyId === r.id}
-                                            >
-                                                {deleteBusyId === r.id ? "Removing…" : "Remove"}
-                                            </button>
                                         </div>
                                     </div>
                                 );
@@ -568,82 +414,103 @@ function StepConnect({
                     </div>
                 </div>
                 <div className="flex flex-col">
-                    <div className="text-xs text-gray-500 mb-2">Add new profile</div>
-                    <div className="grid gap-3">
-                        <input
-                            className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm focus:ring-2 focus:ring-gray-300"
-                            placeholder="Profile name"
-                            value={form.name}
-                            onChange={(e) => setForm({ ...form, name: e.target.value })}
-                        />
-                        <input
-                            className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm focus:ring-2 focus:ring-gray-300"
-                            placeholder="Host / IP"
-                            value={form.host}
-                            onChange={(e) => setForm({ ...form, host: e.target.value })}
-                        />
-                        <div className="grid grid-cols-[1fr_auto] gap-3">
-                            <select
-                                className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm focus:ring-2 focus:ring-gray-300"
-                                value={form.proto}
-                                onChange={(e) => {
-                                    const next = e.target.value as RouterProto;
-                                    setForm((prev) => ({
-                                        ...prev,
-                                        proto: next,
-                                        port: prev.port || protoDefaults[next],
-                                    }));
-                                }}
-                            >
-                                <option value="rest">REST (HTTPS)</option>
-                                <option value="rest-http">REST (HTTP)</option>
-                                <option value="api">API (TLS)</option>
-                                <option value="api-plain">API (Plain)</option>
-                            </select>
-                            <input
-                                className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm w-24 md:w-28 focus:ring-2 focus:ring-gray-300"
-                                placeholder="Port"
-                                type="number"
-                                value={form.port}
-                                onChange={(e) =>
-                                    setForm({ ...form, port: Number(e.target.value) })
-                                }
-                            />
-                        </div>
-                        <input
-                            className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm focus:ring-2 focus:ring-gray-300"
-                            placeholder="Username"
-                            value={form.username}
-                            onChange={(e) => setForm({ ...form, username: e.target.value })}
-                        />
-                        <input
-                            className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm focus:ring-2 focus:ring-gray-300"
-                            placeholder="Password"
-                            type="password"
-                            value={form.password}
-                            onChange={(e) => setForm({ ...form, password: e.target.value })}
-                        />
-                        <label className="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
-                            <input
-                                type="checkbox"
-                                className="rounded border-gray-300 text-gray-900 focus:ring-gray-300"
-                                checked={form.tls_verify}
-                                onChange={(e) =>
-                                    setForm({ ...form, tls_verify: e.target.checked })
-                                }
-                            />
-                            Verify TLS certificates
-                        </label>
-                        {addErr && <div className="text-sm text-red-600">{addErr}</div>}
-                        <button
-                            type="button"
-                            onClick={handleAddProfile}
-                            disabled={addBusy}
-                            className="rounded-xl px-4 py-2.5 text-sm bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 hover:bg-black dark:hover:bg-white disabled:opacity-50"
-                        >
-                            {addBusy ? "Saving…" : "Save profile"}
-                        </button>
-                    </div>
+                    {hasProfiles ? (
+                        <>
+                            <div className="text-xs text-gray-500 mb-2">Profile administration</div>
+                            <div className="rounded-2xl border border-dashed border-gray-200 dark:border-gray-700 p-4 text-sm text-gray-600 dark:text-gray-300 grid gap-3">
+                                <div>
+                                    Connection profiles already exist. Use this setup flow to test one and import peers.
+                                </div>
+                                <div>
+                                    Adding, editing, pausing, or deleting router profiles belongs in Settings now. Mixing that into login/setup was the original design mistake.
+                                </div>
+                                <div className="pt-1">
+                                    <button
+                                        type="button"
+                                        onClick={() => navigate("/settings")}
+                                        className="rounded-full bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:hover:bg-gray-600"
+                                    >
+                                        Manage profiles in Settings
+                                    </button>
+                                </div>
+                            </div>
+                        </>
+                    ) : (
+                        <>
+                            <div className="text-xs text-gray-500 mb-2">Add your first profile</div>
+                            <div className="grid gap-3">
+                                <input
+                                    className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm focus:ring-2 focus:ring-gray-300"
+                                    placeholder="Profile name"
+                                    value={form.name}
+                                    onChange={(e) => setForm({ ...form, name: e.target.value })}
+                                />
+                                <input
+                                    className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm focus:ring-2 focus:ring-gray-300"
+                                    placeholder="Host / IP"
+                                    value={form.host}
+                                    onChange={(e) => setForm({ ...form, host: e.target.value })}
+                                />
+                                <div className="grid grid-cols-[1fr_auto] gap-3">
+                                    <select
+                                        className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm focus:ring-2 focus:ring-gray-300"
+                                        value={form.proto}
+                                        onChange={(e) => {
+                                            const next = e.target.value as RouterProto;
+                                            setForm((prev) => ({
+                                                ...prev,
+                                                proto: next,
+                                                port: prev.port || protoDefaults[next],
+                                            }));
+                                        }}
+                                    >
+                                        <option value="rest">REST (HTTPS)</option>
+                                        <option value="rest-http">REST (HTTP)</option>
+                                        <option value="api">API (TLS)</option>
+                                        <option value="api-plain">API (Plain)</option>
+                                    </select>
+                                    <input
+                                        className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm w-24 md:w-28 focus:ring-2 focus:ring-gray-300"
+                                        placeholder="Port"
+                                        type="number"
+                                        value={form.port}
+                                        onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
+                                    />
+                                </div>
+                                <input
+                                    className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm focus:ring-2 focus:ring-gray-300"
+                                    placeholder="Username"
+                                    value={form.username}
+                                    onChange={(e) => setForm({ ...form, username: e.target.value })}
+                                />
+                                <input
+                                    className="rounded-xl border border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:text-white px-4 py-2.5 text-sm focus:ring-2 focus:ring-gray-300"
+                                    placeholder="Password"
+                                    type="password"
+                                    value={form.password}
+                                    onChange={(e) => setForm({ ...form, password: e.target.value })}
+                                />
+                                <label className="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                                    <input
+                                        type="checkbox"
+                                        className="rounded border-gray-300 text-gray-900 focus:ring-gray-300"
+                                        checked={form.tls_verify}
+                                        onChange={(e) => setForm({ ...form, tls_verify: e.target.checked })}
+                                    />
+                                    Verify TLS certificates
+                                </label>
+                                {addErr && <div className="text-sm text-red-600">{addErr}</div>}
+                                <button
+                                    type="button"
+                                    onClick={handleAddProfile}
+                                    disabled={addBusy}
+                                    className="rounded-xl px-4 py-2.5 text-sm bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 hover:bg-black dark:hover:bg-white disabled:opacity-50"
+                                >
+                                    {addBusy ? "Saving…" : "Save profile"}
+                                </button>
+                            </div>
+                        </>
+                    )}
                 </div>
             </div>
             <div className="mt-6 flex flex-col gap-3 pb-8">
@@ -670,62 +537,11 @@ function StepConnect({
                     </button>
                 </div>
             </div>
-            {confirmDeleteRouter && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
-                    <div className="w-full max-w-sm rounded-2xl bg-white dark:bg-gray-800 ring-1 ring-gray-200 dark:ring-gray-700 shadow-lg p-6 grid gap-4">
-                        <div className="text-lg font-semibold text-gray-900 dark:text-white">
-                            Remove profile
-                        </div>
-                        <div className="text-sm text-gray-600 dark:text-gray-300">
-                            This removes{" "}
-                            <span className="font-medium text-gray-900 dark:text-white">
-                                {confirmDeleteRouter.name}
-                            </span>{" "}
-                            from this app. It does not touch the RouterOS device.
-                        </div>
-                        <div className="flex items-center justify-end gap-3">
-                            <button
-                                type="button"
-                                onClick={() => setConfirmDeleteRouter(null)}
-                                className="rounded-full bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:hover:bg-gray-600"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                type="button"
-                                disabled={deleteBusyId === confirmDeleteRouter.id}
-                                onClick={async () => {
-                                    try {
-                                        setDeleteBusyId(confirmDeleteRouter.id);
-                                        await deleteRouter(confirmDeleteRouter.id);
-                                        await loadRouters();
-                                        // Clear selection if we just deleted the selected router
-                                        setSelectedId((prev) =>
-                                            prev === confirmDeleteRouter.id ? null : prev
-                                        );
-                                        setConfirmDeleteRouter(null);
-                                    } catch (e: any) {
-                                        setConnectErr(e?.message || "Failed to delete profile");
-                                        setConfirmDeleteRouter(null);
-                                    } finally {
-                                        setDeleteBusyId(null);
-                                    }
-                                }}
-                                className="rounded-full bg-rose-600 text-white px-4 py-2 text-sm shadow hover:bg-rose-700 disabled:opacity-50"
-                            >
-                                {deleteBusyId === confirmDeleteRouter.id
-                                    ? "Removing…"
-                                    : "Delete profile"}
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
         </Card>
     );
 }
 
-// --- Step 3: Interface (Wizard StepInterface) ---
+// --- Step 2: Interface ---
 function StepInterface({
     router,
     onSelected,
@@ -768,7 +584,7 @@ function StepInterface({
     );
 }
 
-// --- Step 4: Peers (Wizard StepPeers) ---
+// --- Step 3: Peers ---
 function StepPeers({
     router,
     iface,

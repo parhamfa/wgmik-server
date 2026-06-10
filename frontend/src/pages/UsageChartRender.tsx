@@ -8,6 +8,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
+import { formatCalendarDateTime, formatCalendarDayLabel } from "../datetimeLocal";
 
 type Point = { day: string; rx: number; tx: number };
 
@@ -16,6 +17,7 @@ type Payload = {
   scopeLabel: string;
   mode: "days" | "raw";
   timezone: string;
+  dateCalendar?: string;
   points: Point[];
 };
 
@@ -47,6 +49,7 @@ export default function UsageChartRender() {
   if (!data) return null;
 
   const tz = data.timezone || "UTC";
+  const dateCalendar = data.dateCalendar || "gregorian";
   const usage = data.points || [];
 
   return (
@@ -77,12 +80,7 @@ export default function UsageChartRender() {
                 tickFormatter={(val: string) => {
                   try {
                     if (data.mode === "days") {
-                      const d = new Date(`${val}T00:00:00Z`);
-                      return new Intl.DateTimeFormat(undefined, {
-                        timeZone: tz,
-                        month: "numeric",
-                        day: "numeric",
-                      }).format(d);
+                      return formatCalendarDayLabel(val, { timeZone: tz, dateCalendar });
                     }
                     const d = new Date(val);
                     return new Intl.DateTimeFormat(undefined, {
@@ -104,18 +102,9 @@ export default function UsageChartRender() {
                 labelFormatter={(label) => {
                   try {
                     if (data.mode === "days") {
-                      const d = new Date(`${label}T00:00:00Z`);
-                      return new Intl.DateTimeFormat(undefined, {
-                        timeZone: tz,
-                        dateStyle: "full",
-                      }).format(d);
+                      return formatCalendarDayLabel(String(label), { timeZone: tz, dateCalendar, long: true });
                     }
-                    const d = new Date(label);
-                    return new Intl.DateTimeFormat(undefined, {
-                      timeZone: tz,
-                      dateStyle: "medium",
-                      timeStyle: "medium",
-                    }).format(d);
+                    return formatCalendarDateTime(new Date(label), { timeZone: tz, dateCalendar, includeTime: true });
                   } catch {
                     return label;
                   }

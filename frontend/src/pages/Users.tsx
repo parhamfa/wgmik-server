@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { fetchJson } from '../api';
+import { fetchJson, getSettings, type SettingsDTO } from '../api';
 import { Link } from 'react-router-dom';
+import { formatCalendarDateTime } from '../datetimeLocal';
 
 interface User {
     id: number;
@@ -15,6 +16,7 @@ export default function Users() {
     const [newPassword, setNewPassword] = useState('');
     const [error, setError] = useState('');
     const [success, setSuccess] = useState('');
+    const [settings, setSettings] = useState<SettingsDTO | null>(null);
 
     const loadUsers = async () => {
         try {
@@ -27,6 +29,7 @@ export default function Users() {
 
     useEffect(() => {
         loadUsers();
+        getSettings().then(setSettings).catch(() => {});
     }, []);
 
     const handleCreate = async (e: React.FormEvent) => {
@@ -110,7 +113,13 @@ export default function Users() {
                             <li key={u.id} className="px-6 py-4 flex items-center justify-between">
                                 <div>
                                     <p className="text-sm font-medium text-gray-900">{u.username}</p>
-                                    <p className="text-xs text-gray-500">Created: {new Date(u.created_at).toLocaleDateString()}</p>
+                                    <p className="text-xs text-gray-500">
+                                        Created: {formatCalendarDateTime(u.created_at, {
+                                            timeZone: settings?.timezone || 'UTC',
+                                            dateCalendar: settings?.date_calendar || 'gregorian',
+                                            includeTime: false,
+                                        })}
+                                    </p>
                                 </div>
                                 <div>
                                     <button

@@ -15,6 +15,7 @@ from sqlalchemy import func
 
 from .models import UsageMinute, SettingsKV
 from .settings import settings
+from .calendar_utils import app_date_calendar, selected_month_cycle_bounds_utc
 from .usage_bucketing import local_bucket_start_utc_naive
 from .usage_storage import floor_to_minute_utc
 
@@ -143,12 +144,14 @@ def peer_scope_usage_for_rule(
         start_naive = start_local.astimezone(timezone.utc).replace(tzinfo=None)
         return _sum_usage_minute_range(peer_id, db, start_naive, end_naive)
 
-    now_local = now_utc.astimezone(tz)
-    today = now_local.date()
-    first_this = today.replace(day=1)
-    start_date = add_calendar_months(first_this, -(cnt - 1))
-    start_local = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=tz)
-    start_naive = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    start_utc, _end_utc = selected_month_cycle_bounds_utc(
+        now_utc,
+        tz,
+        app_date_calendar(),
+        reset_day=settings.monthly_reset_day,
+        count=cnt,
+    )
+    start_naive = start_utc.replace(tzinfo=None)
     return _sum_usage_minute_range(peer_id, db, start_naive, end_naive)
 
 
@@ -193,13 +196,14 @@ def compute_next_reset_utc_for_rule(
         nxt = start_local + timedelta(weeks=cnt)
         return nxt.astimezone(timezone.utc)
 
-    now_local = now_utc.astimezone(tz)
-    today = now_local.date()
-    first_this = today.replace(day=1)
-    start_date = add_calendar_months(first_this, -(cnt - 1))
-    next_start_date = add_calendar_months(start_date, cnt)
-    nxt = datetime.combine(next_start_date, datetime.min.time()).replace(tzinfo=tz)
-    return nxt.astimezone(timezone.utc)
+    _start_utc, end_utc = selected_month_cycle_bounds_utc(
+        now_utc,
+        tz,
+        app_date_calendar(),
+        reset_day=settings.monthly_reset_day,
+        count=cnt,
+    )
+    return end_utc
 
 
 def peer_scope_usage_bytes(

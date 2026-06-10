@@ -6,7 +6,7 @@ import re
 
 
 class RouterOSApiClient(RouterOSClient):
-    def __init__(self, host: str, port: int, username: str, password: str, use_tls: bool = True, ssl_verify: bool = True):
+    def __init__(self, host: str, port: int, username: str, password: str, use_tls: bool = True, ssl_verify: bool = True, timeout: int = 10):
         # librouteros uses ssl=True/False and port
         self.host = host
         self.port = port
@@ -14,6 +14,7 @@ class RouterOSApiClient(RouterOSClient):
         self.password = password
         self.ssl = use_tls
         self.ssl_verify = ssl_verify
+        self.timeout = timeout
 
     def _conn(self):
         return connect(
@@ -23,7 +24,7 @@ class RouterOSApiClient(RouterOSClient):
             port=self.port,
             use_ssl=self.ssl,
             ssl_verify=self.ssl_verify,
-            timeout=10,
+            timeout=self.timeout,
         )
 
     def _parse_last_handshake(self, value):
@@ -66,6 +67,19 @@ class RouterOSApiClient(RouterOSClient):
                 return False
         return bool(value)
 
+    def get_system_version(self) -> str:
+        api = self._conn()
+        try:
+            rows = api(cmd="/system/resource/print")
+            if rows:
+                return str(rows[0].get("version") or "").strip()
+            return ""
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
     def list_wireguard_interfaces(self) -> List[str]:
         api = self._conn()
         try:
@@ -83,10 +97,24 @@ class RouterOSApiClient(RouterOSClient):
             rows = api(cmd="/interface/wireguard/print")
             for row in rows:
                 if row.get("name") == interface:
+                    addresses: List[str] = []
+                    try:
+                        address_rows = api(cmd="/ip/address/print")
+                        for addr_row in address_rows:
+                            if addr_row.get("interface") != interface:
+                                continue
+                            if self._parse_bool(addr_row.get("disabled", False)):
+                                continue
+                            addr = (addr_row.get("address") or "").strip()
+                            if addr:
+                                addresses.append(addr)
+                    except Exception:
+                        addresses = []
                     return WGInterfaceConfig(
                         name=row.get("name", interface),
                         public_key=row.get("public-key", ""),
                         listen_port=int(row.get("listen-port", 0) or 0),
+                        addresses=addresses,
                     )
             raise KeyError(f"wireguard interface '{interface}' not found")
         finally:
@@ -114,7 +142,6 @@ class RouterOSApiClient(RouterOSClient):
                         last_handshake=self._parse_last_handshake(row.get("last-handshake")),
                         endpoint=row.get("current-endpoint-address", ""),
                         client_endpoint=(row.get("client-endpoint") or "").strip(),
-                        comment=(row.get("comment") or "").strip(),
                     )
                 )
             return peers
@@ -150,10 +177,10 @@ class RouterOSApiClient(RouterOSClient):
             except Exception:
                 pass
 
-    def set_peer_comment(self, interface: str, ros_id: str, comment: str) -> None:
+    def set_peer_name(self, interface: str, ros_id: str, name: str) -> None:
         api = self._conn()
         try:
-            api(cmd="/interface/wireguard/peers/set", **{".id": ros_id, "comment": comment})
+            api(cmd="/interface/wireguard/peers/set", **{".id": ros_id, "name": name or ""})
         finally:
             try:
                 api.close()
@@ -211,9 +238,10 @@ class RouterOSApiClient(RouterOSClient):
         public_key: str,
         allowed_address: str,
         name: str = "",
-        comment: str = "",
         disabled: bool = False,
         private_key: Optional[str] = None,
+        preshared_key: Optional[str] = None,
+        client_endpoint: Optional[str] = None,
     ) -> str:
         api = self._conn()
         try:
@@ -224,10 +252,12 @@ class RouterOSApiClient(RouterOSClient):
             }
             if private_key:
                 params["private-key"] = private_key
+            if preshared_key:
+                params["preshared-key"] = preshared_key
+            if client_endpoint:
+                params["client-endpoint"] = client_endpoint
             if name:
                 params["name"] = name
-            if comment:
-                params["comment"] = comment
             if disabled:
                 params["disabled"] = "yes"
             res = api(cmd="/interface/wireguard/peers/add", **params)
@@ -304,6 +334,16 @@ class RouterOSApiClient(RouterOSClient):
         api = self._conn()
         try:
             api(cmd="/queue/simple/set", **{".id": ros_id, "max-limit": f"{max_limit_up}/{max_limit_down}"})
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+
+    def set_simple_queue_name(self, ros_id: str, name: str) -> None:
+        api = self._conn()
+        try:
+            api(cmd="/queue/simple/set", **{".id": ros_id, "name": name})
         finally:
             try:
                 api.close()

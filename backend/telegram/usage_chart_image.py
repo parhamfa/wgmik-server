@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from ..api.routes import compute_peer_usage_points
 from ..fair_usage_usage import app_zoneinfo
+from ..calendar_utils import app_date_calendar, selected_calendar_month_bounds_utc, selected_month_bounds_utc
 from .screenshot_config import SCREENSHOT_DEVICE_SCALE_FACTOR
 
 logger = logging.getLogger("wgmik.telegram.usage_chart")
@@ -35,7 +36,7 @@ def usage_points_for_tg_menu(
     now_utc: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], Literal["days", "raw"]]:
     """
-    Map bot scope (today / week / month) to the same usage series as the web chart.
+    Map bot scope (today / month / alltime) to the same usage series as the web chart.
 
     ``today`` is midnight → now in the app timezone (not rolling last 24 hours).
     """
@@ -51,21 +52,36 @@ def usage_points_for_tg_menu(
             interval=3600,
         )
         return ([{"day": p.day, "rx": p.rx, "tx": p.tx} for p in pts], "raw")
-    if scope == "week":
-        end = now_utc
-        start = end - timedelta(days=7)
+    if scope == "month":
+        start, end = selected_month_bounds_utc(now_utc, app_zoneinfo(), app_date_calendar())
+        end = min(end, now_utc)
         pts = compute_peer_usage_points(
             db, peer_id, "daily", start=start, end=end, all_time=False
         )
         return ([{"day": p.day, "rx": p.rx, "tx": p.tx} for p in pts], "days")
-    if scope == "month":
-        end = now_utc
-        start = end - timedelta(days=31)
-        pts = compute_peer_usage_points(
-            db, peer_id, "daily", start=start, end=end, all_time=False
-        )
+    if scope == "alltime":
+        pts = compute_peer_usage_points(db, peer_id, "daily", all_time=True)
         return ([{"day": p.day, "rx": p.rx, "tx": p.tx} for p in pts], "days")
     return ([], "days")
+
+
+def usage_points_for_selected_calendar_month(
+    db: Session,
+    peer_id: int,
+    cal_year: int,
+    cal_month: int,
+    now_utc: datetime | None = None,
+) -> tuple[list[dict[str, Any]], Literal["days"]]:
+    """Daily usage points for one panel-calendar month (Gregorian or Persian), capped at now."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    start_utc, end_utc = selected_calendar_month_bounds_utc(
+        cal_year, cal_month, app_zoneinfo(), app_date_calendar()
+    )
+    end = min(end_utc, now_utc)
+    pts = compute_peer_usage_points(
+        db, peer_id, "daily", start=start_utc, end=end, all_time=False
+    )
+    return ([{"day": p.day, "rx": p.rx, "tx": p.tx} for p in pts], "days")
 
 
 async def render_usage_chart_png(payload: dict[str, Any]) -> bytes:

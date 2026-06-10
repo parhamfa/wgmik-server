@@ -44,3 +44,8 @@ check_rows.py
 # Agent/development notes
 agent-guide.md
 .cursorignore
+
+# Remotion (local only — intro video tooling, regenerable)
+/frontend/src/remotion/
+/frontend/remotion.config.ts
+/frontend/out/

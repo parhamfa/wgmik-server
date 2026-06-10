@@ -1,7 +1,9 @@
 import React from "react";
 import { Link } from "react-router-dom";
-import { getSettings, putSettings, listRouters, getActiveRouter, setActiveRouter, createRouter, updateRouter, deleteRouter, testRouter, syncRouter, purgeUsage, purgePeers, getUsageMaintenanceStatus, runUsageMaintenance, fetchJson, type Router, type RouterProto, type UsageMaintenanceStatusDTO } from "../api";
+import { getSettings, putSettings, listRouters, createRouter, updateRouter, deleteRouter, getRouterDeleteImpact, testRouter, setRouterEnabled, purgeUsage, purgePeers, getUsageMaintenanceStatus, runUsageMaintenance, cancelUsageMaintenance, listUsers, createUser, updateUserAccount, resetUserPassword, deleteUserAccount, changePassword, type LocalUserDTO, type Router, type RouterDeleteImpactDTO, type RouterProto, type UsageMaintenanceStatusDTO } from "../api";
+import { useAuth } from "../auth";
 import { useLooseNumberInput } from "../hooks/useLooseNumberInput";
+import { formatCalendarDateTime } from "../datetimeLocal";
 
 function getUtcOffsetMinutes(timeZone: string, date: Date) {
   // Robust cross-browser offset calc without relying on timeZoneName formatting.
@@ -52,30 +54,62 @@ function formatBytes(bytes?: number | null) {
   return `${value >= 10 || idx === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[idx]}`;
 }
 
+function formatCount(value?: number | null) {
+  return Number(value || 0).toLocaleString();
+}
+
+function formatDuration(seconds?: number | null) {
+  if (seconds === null || typeof seconds === "undefined" || !Number.isFinite(seconds) || seconds < 0) return "Estimating";
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m > 0) return `${m}m ${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+
+function isAccountLocked(lockedUntil?: string | null) {
+  return !!lockedUntil && new Date(lockedUntil).getTime() > Date.now();
+}
+
 export default function SettingsPage() {
+  const { user, logout } = useAuth();
   const [form, setForm] = React.useState({
     poll_interval_seconds: 30,
     online_threshold_seconds: 15,
     monthly_reset_day: 1,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    date_calendar: "gregorian" as "gregorian" | "persian",
     week_start_day: 0,
     show_kind_pills: true,
     show_hw_stats: true,
-    dashboard_refresh_seconds: 30,
-    peer_default_scope_unit: "days",
-    peer_default_scope_value: 14,
-    dashboard_scope_unit: "days",
-    dashboard_scope_value: 14,
-    dashboard_router_scope: "all" as "all" | "active" | "selected",
+    dashboard_peer_preview_count: 6,
+    peer_default_scope_unit: "minutes",
+    peer_default_scope_value: 60,
+    dashboard_scope_unit: "hours",
+    dashboard_scope_value: 24,
+    dashboard_router_scope: "all" as "all" | "selected",
     dashboard_selected_router_ids: [] as number[],
     dashboard_filter_status: "all",
     dashboard_sort_by: "created",
+    dashboard_time_mode: "rolling" as "today" | "this_month" | "all_time" | "rolling" | "custom",
+    dashboard_custom_start: "",
+    dashboard_custom_end: "",
     dashboard_time_frame_today: false,
+    peer_time_mode: "rolling" as "today" | "this_month" | "all_time" | "rolling" | "custom",
+    peer_custom_start: "",
+    peer_custom_end: "",
     peer_time_frame_today: false,
-    peer_refresh_seconds: 30,
     raw_sample_retention_hours: 24,
     minute_rollup_retention_days: 90,
     daily_rollup_retention_days: 0,
+    usage_maintenance_auto_enabled: false,
+    usage_maintenance_auto_frequency: "daily" as "daily" | "every_n_days" | "weekly",
+    usage_maintenance_auto_interval_days: 2,
+    usage_maintenance_auto_weekday: 6,
+    usage_maintenance_auto_time: "04:30",
+    usage_maintenance_backup_keep: 3,
   });
   const [err, setErr] = React.useState("");
   const [saveState, setSaveState] = React.useState<"idle" | "dirty" | "saving" | "saved" | "error">("idle");
@@ -84,14 +118,13 @@ export default function SettingsPage() {
   const pendingRef = React.useRef(false);
   const lastSavedRef = React.useRef<any | null>(null);
   const [routers, setRouters] = React.useState<Router[]>([]);
-  const [activeRouterId, setActiveRouterId] = React.useState<number | null>(null);
+  const [routersLoaded, setRoutersLoaded] = React.useState(false);
   const [routerMsg, setRouterMsg] = React.useState("");
   const [routerErr, setRouterErr] = React.useState("");
   const [routerBusy, setRouterBusy] = React.useState(false);
   const [testBusyId, setTestBusyId] = React.useState<number | null>(null);
   const [testStatus, setTestStatus] = React.useState<Record<number, string>>({});
-  const [syncBusyId, setSyncBusyId] = React.useState<number | null>(null);
-  const [syncStatus, setSyncStatus] = React.useState<Record<number, string>>({});
+  const [pauseBusyId, setPauseBusyId] = React.useState<number | null>(null);
   const [showRouterModal, setShowRouterModal] = React.useState(false);
   const [editingRouter, setEditingRouter] = React.useState<Router | null>(null);
   const defaultProtoPort: Record<RouterProto, number> = { rest: 443, "rest-http": 80, api: 8729, "api-plain": 8728 };
@@ -109,16 +142,32 @@ export default function SettingsPage() {
   const [maintErr, setMaintErr] = React.useState("");
   const [confirmAction, setConfirmAction] = React.useState<"usage" | "peers" | null>(null);
   const [confirmDeleteRouter, setConfirmDeleteRouter] = React.useState<Router | null>(null);
+  const [routerDeleteImpact, setRouterDeleteImpact] = React.useState<RouterDeleteImpactDTO | null>(null);
+  const [routerDeleteImpactBusy, setRouterDeleteImpactBusy] = React.useState(false);
+  const [routerDeleteImpactErr, setRouterDeleteImpactErr] = React.useState("");
+  const [routerDeleteBusy, setRouterDeleteBusy] = React.useState(false);
+  const [routerDeleteConfirmName, setRouterDeleteConfirmName] = React.useState("");
   const [usageMaintenance, setUsageMaintenance] = React.useState<UsageMaintenanceStatusDTO | null>(null);
+  const [showMaintenanceModal, setShowMaintenanceModal] = React.useState(false);
+  const [maintenanceCancelBusy, setMaintenanceCancelBusy] = React.useState(false);
 
   // User management state
-  interface User { id: number; username: string; is_admin: boolean; created_at: string; }
-  const [users, setUsers] = React.useState<User[]>([]);
+  const [users, setUsers] = React.useState<LocalUserDTO[]>([]);
   const [newUsername, setNewUsername] = React.useState("");
   const [newPassword, setNewPassword] = React.useState("");
   const [userErr, setUserErr] = React.useState("");
   const [userMsg, setUserMsg] = React.useState("");
   const [userBusy, setUserBusy] = React.useState(false);
+  const [resetPasswordUser, setResetPasswordUser] = React.useState<LocalUserDTO | null>(null);
+  const [resetPasswordValue, setResetPasswordValue] = React.useState("");
+  const [resetPasswordBusy, setResetPasswordBusy] = React.useState(false);
+  const [myPasswordCurrent, setMyPasswordCurrent] = React.useState("");
+  const [myPasswordNext, setMyPasswordNext] = React.useState("");
+  const [myPasswordConfirm, setMyPasswordConfirm] = React.useState("");
+  const [showMyPasswordModal, setShowMyPasswordModal] = React.useState(false);
+  const [myPasswordBusy, setMyPasswordBusy] = React.useState(false);
+  const [myPasswordErr, setMyPasswordErr] = React.useState("");
+  const [myPasswordMsg, setMyPasswordMsg] = React.useState("");
 
   const pollIntervalInput = useLooseNumberInput(
     form.poll_interval_seconds,
@@ -133,27 +182,7 @@ export default function SettingsPage() {
   const monthlyResetInput = useLooseNumberInput(
     form.monthly_reset_day,
     (n) => setForm((f) => ({ ...f, monthly_reset_day: n })),
-    { min: 1, max: 28, emptyFallback: 1 },
-  );
-  const dashboardRefreshInput = useLooseNumberInput(
-    form.dashboard_refresh_seconds,
-    (n) => setForm((f) => ({ ...f, dashboard_refresh_seconds: n })),
-    { min: 5, emptyFallback: 5 },
-  );
-  const dashboardScopeValInput = useLooseNumberInput(
-    form.dashboard_scope_value,
-    (n) => setForm((f) => ({ ...f, dashboard_scope_value: n })),
-    { min: 1, emptyFallback: 1 },
-  );
-  const peerDefaultScopeValInput = useLooseNumberInput(
-    form.peer_default_scope_value,
-    (n) => setForm((f) => ({ ...f, peer_default_scope_value: n })),
-    { min: 1, emptyFallback: 1 },
-  );
-  const peerRefreshInput = useLooseNumberInput(
-    form.peer_refresh_seconds,
-    (n) => setForm((f) => ({ ...f, peer_refresh_seconds: n })),
-    { min: 5, emptyFallback: 5 },
+    { min: 1, max: 31, emptyFallback: 1 },
   );
   const rawRetentionInput = useLooseNumberInput(
     form.raw_sample_retention_hours,
@@ -170,6 +199,21 @@ export default function SettingsPage() {
     (n) => setForm((f) => ({ ...f, daily_rollup_retention_days: n })),
     { min: 0, max: 36500, emptyFallback: 0 },
   );
+  const autoIntervalInput = useLooseNumberInput(
+    form.usage_maintenance_auto_interval_days,
+    (n) => setForm((f) => ({ ...f, usage_maintenance_auto_interval_days: n })),
+    { min: 2, max: 30, emptyFallback: 2 },
+  );
+  const backupKeepInput = useLooseNumberInput(
+    form.usage_maintenance_backup_keep,
+    (n) => setForm((f) => ({ ...f, usage_maintenance_backup_keep: n })),
+    { min: 1, max: 50, emptyFallback: 3 },
+  );
+
+  const maintenanceProgress = Math.max(0, Math.min(100, Number(usageMaintenance?.progress_percent ?? 0)));
+  const maintenancePhaseProgress = Math.max(0, Math.min(100, Number(usageMaintenance?.phase_progress_percent ?? 0)));
+  const maintenanceIsTerminal = !!usageMaintenance && !usageMaintenance.running && ["complete", "failed", "cancelled"].includes(usageMaintenance.phase);
+  const maintenanceStatusLabel = usageMaintenance?.phase_label || usageMaintenance?.phase || "Idle";
 
   const timezoneOptions = React.useMemo(() => {
     const supportedValuesOf = (Intl as any)?.supportedValuesOf as undefined | ((key: string) => string[]);
@@ -260,10 +304,14 @@ export default function SettingsPage() {
 
   const loadRouters = React.useCallback(async () => {
     try {
+      setRoutersLoaded(false);
       const rows = await listRouters();
       setRouters(rows);
-    } catch {
-      setRouters([]);
+      setRouterErr("");
+    } catch (e: any) {
+      setRouterErr(e?.message || "Failed to load connection profiles");
+    } finally {
+      setRoutersLoaded(true);
     }
   }, []);
 
@@ -285,55 +333,138 @@ export default function SettingsPage() {
     }, 3000);
     return () => window.clearInterval(timer);
   }, [usageMaintenance?.running, loadUsageMaintenance]);
+  // Refresh next-scheduled-run info after settings (schedule) saves.
   React.useEffect(() => {
+    if (saveState === "saved") loadUsageMaintenance();
+  }, [saveState, loadUsageMaintenance]);
+  React.useEffect(() => {
+    if (!confirmDeleteRouter) return;
+    let cancelled = false;
+    setRouterDeleteImpact(null);
+    setRouterDeleteImpactErr("");
+    setRouterDeleteImpactBusy(true);
+    setRouterDeleteBusy(false);
+    setRouterDeleteConfirmName("");
     (async () => {
       try {
-        const ar = await getActiveRouter();
-        setActiveRouterId(ar?.router_id ?? null);
-      } catch {
-        setActiveRouterId(null);
+        const impact = await getRouterDeleteImpact(confirmDeleteRouter.id);
+        if (!cancelled) setRouterDeleteImpact(impact);
+      } catch (e: any) {
+        if (!cancelled) setRouterDeleteImpactErr(e?.message || "Failed to load delete impact");
+      } finally {
+        if (!cancelled) setRouterDeleteImpactBusy(false);
       }
     })();
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [confirmDeleteRouter]);
 
   // User management
   const loadUsers = React.useCallback(async () => {
     try {
-      const data = await fetchJson("/api/users");
+      const data = await listUsers();
       setUsers(data);
-    } catch { setUsers([]); }
+    } catch {
+      setUsers([]);
+    }
   }, []);
 
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
-    setUserErr(""); setUserMsg("");
+    setUserErr("");
+    setUserMsg("");
     try {
       setUserBusy(true);
-      await fetchJson("/api/users", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: newUsername, password: newPassword }),
-      });
+      await createUser({ username: newUsername, password: newPassword });
       setUserMsg(`User ${newUsername} created.`);
-      setNewUsername(""); setNewPassword("");
-      loadUsers();
+      setNewUsername("");
+      setNewPassword("");
+      await loadUsers();
     } catch (err: any) {
       setUserErr(err.message || "Failed to create user");
-    } finally { setUserBusy(false); }
+    } finally {
+      setUserBusy(false);
+    }
   };
 
-  const handleDeleteUser = async (id: number) => {
-    if (!confirm("Are you sure you want to delete this user?")) return;
+  const handleUpdateUser = async (id: number, payload: { is_active?: boolean; unlock?: boolean }, successMessage: string) => {
     try {
-      await fetchJson(`/api/users/${id}`, { method: "DELETE" });
-      loadUsers();
+      setUserBusy(true);
+      await updateUserAccount(id, payload);
+      setUserMsg(successMessage);
+      setUserErr("");
+      await loadUsers();
     } catch (err: any) {
-      alert(err.message || "Failed to delete user");
+      setUserErr(err.message || "Failed to update user");
+    } finally {
+      setUserBusy(false);
+    }
+  };
+
+  const handleDeleteUser = async (row: LocalUserDTO) => {
+    if (!confirm(`Delete inactive account ${row.username}? This is permanent.`)) return;
+    try {
+      setUserBusy(true);
+      await deleteUserAccount(row.id);
+      setUserMsg(`Deleted ${row.username}.`);
+      setUserErr("");
+      await loadUsers();
+    } catch (err: any) {
+      setUserErr(err.message || "Failed to delete user");
+    } finally {
+      setUserBusy(false);
+    }
+  };
+
+  const handleResetPassword = async () => {
+    if (!resetPasswordUser) return;
+    try {
+      setResetPasswordBusy(true);
+      await resetUserPassword(resetPasswordUser.id, { new_password: resetPasswordValue });
+      setUserMsg(`Temporary password set for ${resetPasswordUser.username}. They must change it on next login.`);
+      setUserErr("");
+      setResetPasswordUser(null);
+      setResetPasswordValue("");
+      await loadUsers();
+    } catch (err: any) {
+      setUserErr(err.message || "Failed to reset password");
+    } finally {
+      setResetPasswordBusy(false);
+    }
+  };
+
+  const handleMyPasswordChange = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMyPasswordErr("");
+    setMyPasswordMsg("");
+    if (myPasswordNext !== myPasswordConfirm) {
+      setMyPasswordErr("New password confirmation does not match");
+      return;
+    }
+    try {
+      setMyPasswordBusy(true);
+      await changePassword({ current_password: myPasswordCurrent, new_password: myPasswordNext });
+      setMyPasswordMsg("Password changed. Sign in again with the new password.");
+      setMyPasswordCurrent("");
+      setMyPasswordNext("");
+      setMyPasswordConfirm("");
+      await logout();
+    } catch (err: any) {
+      setMyPasswordErr(err.message || "Failed to change password");
+    } finally {
+      setMyPasswordBusy(false);
     }
   };
 
   React.useEffect(() => { loadUsers(); }, [loadUsers]);
   const retentionLocked = !!usageMaintenance?.running;
+  const blockingPasswordChange = !!user?.must_change_password;
+  React.useEffect(() => {
+    if (blockingPasswordChange) {
+      setShowMyPasswordModal(true);
+    }
+  }, [blockingPasswordChange]);
 
   function openRouterModal(row?: Router) {
     if (row) {
@@ -362,6 +493,24 @@ export default function SettingsPage() {
     setRouterErr("");
     setRouterMsg("");
     setShowRouterModal(true);
+  }
+
+  async function runRouterTest(row: Router) {
+    try {
+      setTestBusyId(row.id);
+      const res = await testRouter(row.id);
+      setTestStatus(prev => ({ ...prev, [row.id]: "OK" }));
+      setRouters(prev => prev.map(x => x.id === row.id ? {
+        ...x,
+        ros_version: res.ros_version ?? x.ros_version,
+        ros_version_checked_at: res.ros_version_checked_at ?? x.ros_version_checked_at,
+        ros_supported: res.ros_supported ?? x.ros_supported,
+      } : x));
+    } catch (e: any) {
+      setTestStatus(prev => ({ ...prev, [row.id]: e?.message || "Failed" }));
+    } finally {
+      setTestBusyId(null);
+    }
   }
 
   async function handleSaveRouter() {
@@ -407,6 +556,26 @@ export default function SettingsPage() {
     }
   }
 
+  const routerDeleteNameMatches = !!confirmDeleteRouter && routerDeleteConfirmName.trim() === confirmDeleteRouter.name;
+  const routerDeleteSummaryItems = routerDeleteImpact ? [
+    { label: "Peers", value: formatCount(routerDeleteImpact.peer_count) },
+    { label: "Selected peers", value: formatCount(routerDeleteImpact.selected_peer_count) },
+    { label: "Raw samples", value: formatCount(routerDeleteImpact.usage_sample_rows) },
+    { label: "Minute rollups", value: formatCount(routerDeleteImpact.usage_minute_rows) },
+    { label: "Daily rollups", value: formatCount(routerDeleteImpact.usage_daily_rows) },
+    { label: "Monthly rollups", value: formatCount(routerDeleteImpact.usage_monthly_rows) },
+    { label: "Actions", value: formatCount(routerDeleteImpact.action_count) },
+    { label: "Quotas", value: formatCount(routerDeleteImpact.quota_count) },
+    { label: "Telegram bindings", value: formatCount(routerDeleteImpact.telegram_binding_count) },
+    { label: "Telegram logs", value: formatCount(routerDeleteImpact.telegram_log_count) },
+    { label: "Signup tokens touched", value: formatCount(routerDeleteImpact.signup_token_count) },
+    { label: "Fair-usage assignments", value: formatCount(routerDeleteImpact.fair_usage_assignment_count) },
+    { label: "Fair-usage state rows", value: formatCount(routerDeleteImpact.fair_usage_state_count) },
+    { label: "Router rules", value: formatCount(routerDeleteImpact.router_rule_count) },
+    { label: "Merge ledger rows", value: formatCount(routerDeleteImpact.merge_ledger_count) },
+    { label: "Stored peer settings", value: formatCount(routerDeleteImpact.peer_setting_count) },
+  ] : [];
+
   return (
     <div className="max-w-4xl mx-auto px-4 md:px-6 py-6">
       <div className="flex items-center justify-between mb-4">
@@ -415,6 +584,27 @@ export default function SettingsPage() {
           ← Dashboard
         </Link>
       </div>
+      {blockingPasswordChange && (
+        <div className="rounded-3xl ring-1 ring-amber-200 bg-amber-50 dark:bg-amber-500/10 dark:ring-amber-400/20 p-5 mb-6">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-amber-900 dark:text-amber-100">Password change required</div>
+              <div className="mt-1 text-sm text-amber-800 dark:text-amber-200">
+                Another admin reset this account. Change the temporary password before using the rest of the application.
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowMyPasswordModal(true)}
+              className="shrink-0 rounded-full bg-amber-900 text-white px-4 py-2 text-sm shadow hover:bg-amber-950 dark:bg-amber-200 dark:text-amber-950 dark:hover:bg-amber-100"
+            >
+              Change password
+            </button>
+          </div>
+        </div>
+      )}
+      {!blockingPasswordChange && (
+        <>
       <div className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 mb-6">
         <div className="flex items-center justify-between gap-3 mb-4">
           <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">App settings</div>
@@ -457,8 +647,8 @@ export default function SettingsPage() {
             <input type="number" min={5} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...onlineThresholdInput} />
           </div>
           <div>
-            <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Monthly reset day (1–28)</label>
-            <input type="number" min={1} max={28} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...monthlyResetInput} />
+            <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Monthly reset day (selected calendar)</label>
+            <input type="number" min={1} max={31} className="w-40 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700" {...monthlyResetInput} />
           </div>
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Timezone</label>
@@ -481,6 +671,17 @@ export default function SettingsPage() {
                 onChange={(e) => setForm({ ...form, timezone: e.target.value })}
               />
             )}
+          </div>
+          <div>
+            <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Calendar</label>
+            <select
+              className="w-full md:w-80 rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
+              value={form.date_calendar}
+              onChange={(e) => setForm({ ...form, date_calendar: e.target.value as "gregorian" | "persian" })}
+            >
+              <option value="gregorian">Gregorian</option>
+              <option value="persian">Persian / Jalali</option>
+            </select>
           </div>
           <div>
             <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Week starts on</label>
@@ -517,207 +718,102 @@ export default function SettingsPage() {
               />
               Show hardware stats bar on dashboard
             </label>
-            <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
-              <span className="text-gray-500 dark:text-gray-400">Dashboard auto refresh default</span>
-              <input
-                type="number"
-                min={5}
-                className="w-20 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                {...dashboardRefreshInput}
-              />
-              <span className="text-gray-500 dark:text-gray-400">seconds</span>
-            </div>
-            <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
-              <span className="text-gray-500 dark:text-gray-400">Dashboard default scope</span>
-              <input
-                type="number"
-                min={1}
-                className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                {...dashboardScopeValInput}
-              />
-              <select
-                className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
-                value={form.dashboard_scope_unit}
-                onChange={(e) =>
-                  setForm({
-                    ...form,
-                    dashboard_scope_unit: e.target.value as "minutes" | "hours" | "days",
-                  })
-                }
-              >
-                <option value="minutes">minutes</option>
-                <option value="hours">hours</option>
-                <option value="days">days</option>
-              </select>
-            </div>
-            <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
-              <span className="text-gray-500 dark:text-gray-400">Peer detail default scope</span>
-              <input
-                type="number"
-                min={1}
-                className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                {...peerDefaultScopeValInput}
-              />
-              <select
-                className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
-                value={form.peer_default_scope_unit}
-                onChange={(e) =>
-                  setForm({
-                    ...form,
-                    peer_default_scope_unit: e.target.value as "minutes" | "hours" | "days",
-                  })
-                }
-              >
-                <option value="minutes">minutes</option>
-                <option value="hours">hours</option>
-                <option value="days">days</option>
-              </select>
-              <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
-                <span className="text-gray-500 dark:text-gray-400">Peer detail auto refresh default</span>
-                <input
-                  type="number"
-                  min={5}
-                  className="w-20 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                  {...peerRefreshInput}
-                />
-                <span className="text-gray-500 dark:text-gray-400">seconds</span>
-              </div>
-            </div>
-            <div className="grid gap-3 pt-4 border-t border-gray-100 dark:border-gray-800">
-              <div>
-                <div className="text-xs font-semibold text-gray-900 dark:text-gray-100">Usage retention and rollups</div>
-                <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                  Recommended defaults for a 5-second polling setup. Raw samples should stay short-lived, minute buckets should cover charting, and daily totals can remain long-term. These values now drive the usage maintenance job.
-                </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
-                <span className="text-gray-500 dark:text-gray-400">Keep raw samples for</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={8760}
-                  className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                  disabled={retentionLocked}
-                  {...rawRetentionInput}
-                />
-                <span className="text-gray-500 dark:text-gray-400">hours</span>
-              </div>
-              <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
-                <span className="text-gray-500 dark:text-gray-400">Keep minute rollups for</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={3650}
-                  className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                  disabled={retentionLocked}
-                  {...minuteRetentionInput}
-                />
-                <span className="text-gray-500 dark:text-gray-400">days</span>
-              </div>
-              <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
-                <span className="text-gray-500 dark:text-gray-400">Keep daily rollups for</span>
-                <input
-                  type="number"
-                  min={0}
-                  max={36500}
-                  className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                  disabled={retentionLocked}
-                  {...dailyRetentionInput}
-                />
-                <span className="text-gray-500 dark:text-gray-400">days</span>
-                <span className="text-[11px] text-gray-400 dark:text-gray-500">0 means keep forever</span>
-              </div>
-              {retentionLocked && (
-                <div className="text-[11px] text-amber-700 dark:text-amber-300">
-                  Retention values are locked while usage maintenance is running.
-                </div>
-              )}
-            </div>
           </div>
           {err && <div className="text-sm text-red-600">{err}</div>}
         </div>
       </div>
       <div className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 mb-6">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
           <div>
             <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">Connection profiles</div>
             <div className="text-xs text-gray-500 dark:text-gray-400">Manage RouterOS endpoints used by the wizard and dashboard.</div>
           </div>
-          <button onClick={() => openRouterModal()} className="inline-flex items-center gap-2 rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white">
+          <button onClick={() => openRouterModal()} className="inline-flex shrink-0 items-center gap-2 self-start whitespace-nowrap rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white sm:self-auto">
             Add profile
           </button>
         </div>
         {routerMsg && <div className="text-sm text-green-700 mb-3">{routerMsg}</div>}
         {routerErr && <div className="text-sm text-red-600 mb-3">{routerErr}</div>}
         <div className="grid gap-4">
-          {routers.length === 0 ? (
+          {!routersLoaded ? (
+            <div className="rounded-2xl border border-dashed border-gray-200 dark:border-gray-800 p-4 text-sm text-gray-500 dark:text-gray-400">Loading connection profiles...</div>
+          ) : routers.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-gray-200 dark:border-gray-800 p-4 text-sm text-gray-500 dark:text-gray-400">No routers yet. Add your first connection profile.</div>
           ) : (
             routers.map(r => (
-              <div key={r.id} className="rounded-2xl ring-1 ring-gray-200 dark:ring-gray-800 bg-white dark:bg-gray-950 p-4 flex flex-col gap-3">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <div className="text-sm font-medium text-gray-900 dark:text-gray-100">{r.name}</div>
-                    <div className="text-xs text-gray-500 dark:text-gray-400">{r.proto.toUpperCase()} · {r.host}:{r.port} · {r.username}</div>
+              <div
+                key={r.id}
+                className={`rounded-2xl ring-1 ring-gray-200 dark:ring-gray-800 bg-white dark:bg-gray-950 p-4 flex flex-col gap-3 ${r.enabled === false ? "opacity-70" : ""}`}
+              >
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+	                  <div className="min-w-0">
+	                    <div className="text-sm font-medium text-gray-900 dark:text-gray-100">{r.name}</div>
+	                    <div className="text-xs text-gray-500 dark:text-gray-400">{r.proto.toUpperCase()} · {r.host}:{r.port} · {r.username}</div>
+	                    <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
+	                      {r.ros_version ? (
+	                        <span className={`whitespace-nowrap rounded-full px-2.5 py-1 ${r.ros_supported ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300" : "bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300"}`}>
+	                          RouterOS {r.ros_version}
+	                        </span>
+	                      ) : (
+	                        <>
+	                          <span className="whitespace-nowrap rounded-full bg-gray-100 text-gray-600 px-2.5 py-1 dark:bg-gray-800 dark:text-gray-300">
+	                            Version not checked
+	                          </span>
+	                          <span className="whitespace-nowrap rounded-full bg-amber-50 text-amber-700 px-2.5 py-1 dark:bg-amber-500/10 dark:text-amber-300">
+	                            Polling paused until checked
+	                          </span>
+	                        </>
+	                      )}
+	                      {r.ros_version && !r.ros_supported && (
+	                        <span className="whitespace-nowrap rounded-full bg-rose-50 text-rose-700 px-2.5 py-1 dark:bg-rose-500/10 dark:text-rose-300">
+	                          Unsupported: requires RouterOS 7.15+
+	                        </span>
+	                      )}
+	                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    {activeRouterId === r.id && (
-                      <span className="rounded-full bg-indigo-100 text-indigo-800 px-2.5 py-1 text-[11px] dark:bg-indigo-500/10 dark:text-indigo-300">
-                        Active
+                  <div className="flex shrink-0 flex-wrap items-center gap-2 self-start sm:self-auto">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={r.enabled !== false}
+                      onClick={async () => {
+                        const next = !(r.enabled !== false);
+                        try {
+                          setPauseBusyId(r.id);
+                          await setRouterEnabled(r.id, next);
+                          setRouters(prev => prev.map(x => x.id === r.id ? { ...x, enabled: next } : x));
+                          setRouterMsg(next ? `Set active: ${r.name}` : `Set paused: ${r.name}`);
+                          setRouterErr("");
+                        } catch (e: any) {
+                          setRouterErr(e?.message || "Failed to update router");
+                        } finally {
+                          setPauseBusyId(null);
+                        }
+                      }}
+                      title={r.enabled === false ? `Set active: ${r.name}` : `Set paused: ${r.name}`}
+                      aria-label={r.enabled === false ? `Set active: ${r.name}` : `Set paused: ${r.name}`}
+                      className="inline-flex items-center gap-2 text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700"
+                    >
+                      <span className={`font-medium ${r.enabled === false ? "text-amber-700 dark:text-amber-300" : "text-emerald-700 dark:text-emerald-300"}`}>
+                        {pauseBusyId === r.id ? "..." : r.enabled === false ? "Paused" : "Active"}
                       </span>
-                    )}
-                    <button
-                      onClick={async () => {
-                        try {
-                          setTestBusyId(r.id);
-                          await testRouter(r.id);
-                          setTestStatus(prev => ({ ...prev, [r.id]: "OK" }));
-                        } catch (e: any) {
-                          setTestStatus(prev => ({ ...prev, [r.id]: e?.message || "Failed" }));
-                        } finally {
-                          setTestBusyId(null);
-                        }
-                      }}
-                      className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
-                    >
-                      {testBusyId === r.id ? "Testing..." : "Test"}
+                      <span
+                        className={`relative h-6 w-11 rounded-full transition-colors ${
+                          r.enabled === false ? "bg-gray-300 dark:bg-gray-700" : "bg-emerald-500 dark:bg-emerald-400"
+                        }`}
+                      >
+                        <span
+                          className={`absolute top-[2px] block h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                            r.enabled === false ? "translate-x-[2px]" : "translate-x-[22px]"
+                          }`}
+                        />
+                      </span>
                     </button>
+	                    <button onClick={() => openRouterModal(r)} className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700">Edit</button>
                     <button
                       onClick={async () => {
-                        try {
-                          await setActiveRouter(r.id);
-                          setActiveRouterId(r.id);
-                          setRouterMsg(`Active router set: ${r.name}`);
-                        } catch (e: any) {
-                          setRouterErr(e?.message || "Failed to set active router");
-                        }
-                      }}
-                      className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
-                    >
-                      Set active
-                    </button>
-                    <button
-                      onClick={async () => {
-                        try {
-                          setSyncBusyId(r.id);
-                          const res = await syncRouter(r.id);
-                          setSyncStatus((prev) => ({
-                            ...prev,
-                            [r.id]: `OK · updated ${res.updated}, created ${res.created}, missing ${res.missing}`,
-                          }));
-                        } catch (e: any) {
-                          setSyncStatus((prev) => ({ ...prev, [r.id]: e?.message || "Failed" }));
-                        } finally {
-                          setSyncBusyId(null);
-                        }
-                      }}
-                      className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
-                    >
-                      {syncBusyId === r.id ? "Syncing..." : "Sync"}
-                    </button>
-                    <button onClick={() => openRouterModal(r)} className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700">Edit</button>
-                    <button
-                      onClick={async () => {
+                        setRouterErr("");
+                        setRouterMsg("");
                         setConfirmDeleteRouter(r);
                       }}
                       className="rounded-full bg-rose-50 text-rose-700 px-3 py-1 text-xs shadow hover:bg-rose-100 dark:bg-rose-500/10 dark:text-rose-300 dark:hover:bg-rose-500/20"
@@ -731,18 +827,13 @@ export default function SettingsPage() {
                     Status: {testStatus[r.id]}
                   </div>
                 )}
-                {typeof syncStatus[r.id] !== "undefined" && (
-                  <div className={`text-xs ${syncStatus[r.id].startsWith("OK") ? "text-green-700 dark:text-green-300" : "text-rose-600 dark:text-rose-300"}`}>
-                    Sync: {syncStatus[r.id]}
-                  </div>
-                )}
-              </div>
+	              </div>
             ))
           )}
         </div>
       </div>
       <div className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-5 mb-6">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-3">
           <div>
             <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">Data maintenance</div>
             <div className="text-xs text-gray-500 dark:text-gray-400">Run controlled cleanup or use the destructive purge actions below.</div>
@@ -753,6 +844,7 @@ export default function SettingsPage() {
             onClick={async () => {
               setMaintErr("");
               setMaintMsg("");
+              setShowMaintenanceModal(true);
               try {
                 setMaintBusy("run_usage_maintenance");
                 const status = await runUsageMaintenance();
@@ -765,20 +857,178 @@ export default function SettingsPage() {
                 setMaintBusy(null);
               }
             }}
-            className="rounded-full bg-gray-900 text-white px-4 py-1.5 text-xs shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+            className="inline-flex shrink-0 items-center gap-2 self-start whitespace-nowrap rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white sm:self-auto"
           >
-            {usageMaintenance?.running ? "Maintenance running" : maintBusy === "run_usage_maintenance" ? "Starting..." : "Run maintenance now"}
+            {usageMaintenance?.running ? "Maintenance running" : maintBusy === "run_usage_maintenance" ? "Starting..." : "Run maintenance"}
           </button>
         </div>
         {maintMsg && <div className="text-sm text-green-700 mb-3">{maintMsg}</div>}
         {maintErr && <div className="text-sm text-red-600 mb-3">{maintErr}</div>}
+        <div className="grid gap-3 pt-1 pb-4 mb-4 border-b border-gray-100 dark:border-gray-800">
+          <div>
+            <div className="text-xs font-semibold text-gray-900 dark:text-gray-100">Usage retention and rollups</div>
+            <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              Recommended defaults for a 5-second polling setup. Raw samples should stay short-lived, minute buckets should cover charting, and daily totals can remain long-term. These values now drive the usage maintenance job.
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
+            <span className="text-gray-500 dark:text-gray-400">Keep raw samples for</span>
+            <input
+              type="number"
+              min={1}
+              max={8760}
+              className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+              disabled={retentionLocked}
+              {...rawRetentionInput}
+            />
+            <span className="text-gray-500 dark:text-gray-400">hours</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
+            <span className="text-gray-500 dark:text-gray-400">Keep minute rollups for</span>
+            <input
+              type="number"
+              min={1}
+              max={3650}
+              className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+              disabled={retentionLocked}
+              {...minuteRetentionInput}
+            />
+            <span className="text-gray-500 dark:text-gray-400">days</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
+            <span className="text-gray-500 dark:text-gray-400">Keep daily rollups for</span>
+            <input
+              type="number"
+              min={0}
+              max={36500}
+              className="w-24 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+              disabled={retentionLocked}
+              {...dailyRetentionInput}
+            />
+            <span className="text-gray-500 dark:text-gray-400">days</span>
+            <span className="text-[11px] text-gray-400 dark:text-gray-500">0 means keep forever</span>
+          </div>
+          {retentionLocked && (
+            <div className="text-[11px] text-amber-700 dark:text-amber-300">
+              Retention values are locked while usage maintenance is running.
+            </div>
+          )}
+        </div>
+        <div className="grid gap-3 pt-1 pb-4 mb-4 border-b border-gray-100 dark:border-gray-800">
+          <div>
+            <div className="text-xs font-semibold text-gray-900 dark:text-gray-100">Automatic maintenance</div>
+            <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              Run the maintenance job on a schedule. A pre-compaction backup is kept for each run; old backups are rotated automatically.
+            </div>
+          </div>
+          <label className="inline-flex items-center gap-2 text-xs text-gray-700 dark:text-gray-200">
+            <input
+              type="checkbox"
+              className="rounded border-gray-300 text-gray-900 focus:ring-gray-300 dark:border-gray-700 dark:text-gray-100 dark:focus:ring-gray-700"
+              checked={form.usage_maintenance_auto_enabled}
+              onChange={(e) => setForm((f) => ({ ...f, usage_maintenance_auto_enabled: e.target.checked }))}
+            />
+            Enable scheduled maintenance
+          </label>
+          {form.usage_maintenance_auto_enabled && (
+            <>
+              <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
+                <span className="text-gray-500 dark:text-gray-400">Run</span>
+                <select
+                  className="rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                  value={form.usage_maintenance_auto_frequency}
+                  onChange={(e) => setForm((f) => ({ ...f, usage_maintenance_auto_frequency: e.target.value as "daily" | "every_n_days" | "weekly" }))}
+                >
+                  <option value="daily">every day</option>
+                  <option value="every_n_days">every N days</option>
+                  <option value="weekly">weekly</option>
+                </select>
+                {form.usage_maintenance_auto_frequency === "every_n_days" && (
+                  <>
+                    <span className="text-gray-500 dark:text-gray-400">N =</span>
+                    <input
+                      type="number"
+                      min={2}
+                      max={30}
+                      className="w-20 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                      {...autoIntervalInput}
+                    />
+                    <span className="text-gray-500 dark:text-gray-400">days</span>
+                  </>
+                )}
+                {form.usage_maintenance_auto_frequency === "weekly" && (
+                  <>
+                    <span className="text-gray-500 dark:text-gray-400">on</span>
+                    <select
+                      className="rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                      value={form.usage_maintenance_auto_weekday}
+                      onChange={(e) => setForm((f) => ({ ...f, usage_maintenance_auto_weekday: Number(e.target.value) }))}
+                    >
+                      {["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].map((day, idx) => (
+                        <option key={day} value={idx}>{day}</option>
+                      ))}
+                    </select>
+                  </>
+                )}
+                <span className="text-gray-500 dark:text-gray-400">at</span>
+                <input
+                  type="time"
+                  className="rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                  value={form.usage_maintenance_auto_time}
+                  onChange={(e) => setForm((f) => ({ ...f, usage_maintenance_auto_time: e.target.value || "04:30" }))}
+                />
+                <span className="text-gray-500 dark:text-gray-400">({form.timezone || "UTC"})</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700 dark:text-gray-200">
+                <span className="text-gray-500 dark:text-gray-400">Keep last</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  className="w-20 rounded-full border border-gray-900 bg-gray-900 text-white px-3 py-1.5 text-xs focus:ring-2 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
+                  {...backupKeepInput}
+                />
+                <span className="text-gray-500 dark:text-gray-400">maintenance backups</span>
+              </div>
+            </>
+          )}
+          {(usageMaintenance?.next_scheduled_run || usageMaintenance?.last_auto_run) && (
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-500 dark:text-gray-400">
+              {form.usage_maintenance_auto_enabled && usageMaintenance?.next_scheduled_run && (
+                <span>Next scheduled check: {formatCalendarDateTime(usageMaintenance.next_scheduled_run, { timeZone: form.timezone, dateCalendar: form.date_calendar })}</span>
+              )}
+              {usageMaintenance?.last_auto_run && (
+                <span>Last automatic run: {formatCalendarDateTime(usageMaintenance.last_auto_run, { timeZone: form.timezone, dateCalendar: form.date_calendar })}</span>
+              )}
+            </div>
+          )}
+        </div>
         <div className="rounded-2xl ring-1 ring-gray-200 dark:ring-gray-800 bg-gray-50 dark:bg-gray-950 p-4 mb-4 grid gap-2">
           <div className="flex flex-wrap items-center gap-2 text-xs">
             <span className="font-medium text-gray-900 dark:text-gray-100">Usage maintenance status:</span>
             <span className={`rounded-full px-2.5 py-1 ${usageMaintenance?.running ? "bg-amber-100 text-amber-800 dark:bg-amber-500/10 dark:text-amber-300" : "bg-gray-200 text-gray-800 dark:bg-gray-800 dark:text-gray-200"}`}>
-              {usageMaintenance?.running ? `Running · ${usageMaintenance.phase}` : `Idle · ${usageMaintenance?.last_completed_phase || "never run"}`}
+              {usageMaintenance?.running
+                ? `Running · ${usageMaintenance.phase}${usageMaintenance.trigger === "scheduled" ? " · scheduled" : ""}`
+                : `Idle · ${usageMaintenance?.last_completed_phase || "never run"}`}
             </span>
+            {usageMaintenance && (
+              <button
+                type="button"
+                onClick={() => setShowMaintenanceModal(true)}
+                className="rounded-full bg-white text-gray-700 px-2.5 py-1 shadow ring-1 ring-gray-200 hover:bg-gray-100 dark:bg-gray-900 dark:text-gray-200 dark:ring-gray-800 dark:hover:bg-gray-800"
+              >
+                View progress
+              </button>
+            )}
           </div>
+          {usageMaintenance?.running && (
+            <div className="h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-800">
+              <div
+                className="h-full rounded-full bg-gray-900 transition-all dark:bg-gray-100"
+                style={{ width: `${maintenanceProgress}%` }}
+              />
+            </div>
+          )}
           <div className="text-xs text-gray-600 dark:text-gray-300">
             {usageMaintenance?.detail || "This backfills minute rollups, prunes old data by policy, and compacts the SQLite database file."}
           </div>
@@ -792,32 +1042,32 @@ export default function SettingsPage() {
           </div>
           {(usageMaintenance?.started_at || usageMaintenance?.finished_at || usageMaintenance?.last_error || usageMaintenance?.backup_path) && (
             <div className="grid gap-1 text-[11px] text-gray-500 dark:text-gray-400">
-              {usageMaintenance?.started_at && <div>Started: {new Date(usageMaintenance.started_at).toLocaleString()}</div>}
-              {usageMaintenance?.finished_at && <div>Finished: {new Date(usageMaintenance.finished_at).toLocaleString()}</div>}
+              {usageMaintenance?.started_at && <div>Started: {formatCalendarDateTime(usageMaintenance.started_at, { timeZone: form.timezone, dateCalendar: form.date_calendar })}</div>}
+              {usageMaintenance?.finished_at && <div>Finished: {formatCalendarDateTime(usageMaintenance.finished_at, { timeZone: form.timezone, dateCalendar: form.date_calendar })}</div>}
               {usageMaintenance?.backup_path && <div>Backup: {usageMaintenance.backup_path}</div>}
               {usageMaintenance?.last_error && <div className="text-rose-600 dark:text-rose-300">Last error: {usageMaintenance.last_error}</div>}
             </div>
           )}
         </div>
         <div className="grid gap-3 text-sm">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
             <div className="text-xs text-gray-600 dark:text-gray-300">Purge all usage data (raw samples, minute, daily and monthly rollups). Peers and routers stay.</div>
             <button
               type="button"
               disabled={maintBusy !== null || !!usageMaintenance?.running}
               onClick={() => { setMaintErr(""); setMaintMsg(""); setConfirmAction("usage"); }}
-              className="rounded-full bg-rose-50 text-rose-700 px-4 py-1.5 text-xs shadow hover:bg-rose-100 disabled:opacity-50"
+              className="shrink-0 self-start whitespace-nowrap rounded-full bg-rose-50 text-rose-700 px-4 py-1.5 text-xs shadow hover:bg-rose-100 disabled:opacity-50 sm:self-auto"
             >
               Purge usage
             </button>
           </div>
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
             <div className="text-xs text-gray-600 dark:text-gray-300">Delete all peers (and their quotas/usages). Routers remain configured.</div>
             <button
               type="button"
               disabled={maintBusy !== null || !!usageMaintenance?.running}
               onClick={() => { setMaintErr(""); setMaintMsg(""); setConfirmAction("peers"); }}
-              className="rounded-full bg-rose-600 text-white px-4 py-1.5 text-xs shadow hover:bg-rose-700 disabled:opacity-50"
+              className="shrink-0 self-start whitespace-nowrap rounded-full bg-rose-600 text-white px-4 py-1.5 text-xs shadow hover:bg-rose-700 disabled:opacity-50 sm:self-auto"
             >
               Purge peers
             </button>
@@ -829,7 +1079,7 @@ export default function SettingsPage() {
         <div className="flex items-center justify-between mb-4">
           <div>
             <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">User Management</div>
-            <div className="text-xs text-gray-500 dark:text-gray-400">Manage admin accounts for this application.</div>
+            <div className="text-xs text-gray-500 dark:text-gray-400">Manage admin accounts without drifting into full RBAC.</div>
           </div>
         </div>
         {userMsg && <div className="text-sm text-green-700 dark:text-green-300 mb-3">{userMsg}</div>}
@@ -859,19 +1109,102 @@ export default function SettingsPage() {
             {userBusy ? "Adding..." : "Add User"}
           </button>
         </form>
+        <div className="text-xs text-gray-500 dark:text-gray-400 mb-4">New local users are full admins. Passwords must be at least 12 characters.</div>
         <div className="grid gap-2">
           {users.map((u) => (
-            <div key={u.id} className="rounded-2xl ring-1 ring-gray-200 dark:ring-gray-800 bg-white dark:bg-gray-950 p-3 flex items-center justify-between">
-              <div>
-                <div className="text-sm font-medium text-gray-900 dark:text-gray-100">{u.username}</div>
-                <div className="text-xs text-gray-500 dark:text-gray-400">Created: {new Date(u.created_at).toLocaleDateString()}</div>
+            <div key={u.id} className="rounded-2xl ring-1 ring-gray-200 dark:ring-gray-800 bg-white dark:bg-gray-950 p-4 grid gap-3">
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <div className="text-sm font-medium text-gray-900 dark:text-gray-100">{u.username}</div>
+                    {u.id === user?.id && (
+                      <span className="rounded-full bg-gray-100 text-gray-700 px-2.5 py-1 text-[11px] dark:bg-gray-800 dark:text-gray-300">You</span>
+                    )}
+                    <span className={`rounded-full px-2.5 py-1 text-[11px] ${u.is_active ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300" : "bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300"}`}>
+                      {u.is_active ? "Active" : "Inactive"}
+                    </span>
+                    {isAccountLocked(u.locked_until) && (
+                      <span className="rounded-full bg-amber-50 text-amber-700 px-2.5 py-1 text-[11px] dark:bg-amber-500/10 dark:text-amber-300">Locked</span>
+                    )}
+                    {u.must_change_password && (
+                      <span className="rounded-full bg-indigo-50 text-indigo-700 px-2.5 py-1 text-[11px] dark:bg-indigo-500/10 dark:text-indigo-300">Must change password</span>
+                    )}
+                  </div>
+                  <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                    Created: {formatCalendarDateTime(u.created_at, { timeZone: form.timezone, dateCalendar: form.date_calendar, includeTime: false })}
+                  </div>
+                  <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                    Last login: {u.last_login_at ? formatCalendarDateTime(u.last_login_at, { timeZone: form.timezone, dateCalendar: form.date_calendar }) : "Never"}
+                  </div>
+                  {isAccountLocked(u.locked_until) && (
+                    <div className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                      Locked until {formatCalendarDateTime(u.locked_until || "", { timeZone: form.timezone, dateCalendar: form.date_calendar })}
+                    </div>
+                  )}
+                </div>
+                <div className={`flex gap-2 ${u.id === user?.id ? "flex-col items-end" : "flex-wrap"}`}>
+                  {u.id !== user?.id && (
+                    <button
+                      type="button"
+                      disabled={userBusy}
+                      onClick={() => setResetPasswordUser(u)}
+                      className="rounded-full bg-gray-100 text-gray-800 px-3 py-1.5 text-xs shadow hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                    >
+                      Reset password
+                    </button>
+                  )}
+                  {isAccountLocked(u.locked_until) && (
+                    <button
+                      type="button"
+                      disabled={userBusy}
+                      onClick={() => handleUpdateUser(u.id, { unlock: true }, `Unlocked ${u.username}.`)}
+                      className="rounded-full bg-amber-50 text-amber-700 px-3 py-1.5 text-xs shadow hover:bg-amber-100 disabled:opacity-50 dark:bg-amber-500/10 dark:text-amber-300 dark:hover:bg-amber-500/20"
+                    >
+                      Unlock
+                    </button>
+                  )}
+                  {u.is_active ? (
+                    <>
+                      <button
+                        type="button"
+                        disabled={userBusy || u.id === user?.id}
+                        onClick={() => handleUpdateUser(u.id, { is_active: false }, `Deactivated ${u.username}.`)}
+                        className="rounded-full bg-rose-50 text-rose-700 px-3 py-1.5 text-xs shadow hover:bg-rose-100 disabled:opacity-50 dark:bg-rose-500/10 dark:text-rose-300 dark:hover:bg-rose-500/20"
+                      >
+                        Deactivate
+                      </button>
+                      {u.id === user?.id && (
+                        <button
+                          type="button"
+                          onClick={() => setShowMyPasswordModal(true)}
+                          className="rounded-full bg-gray-100 text-gray-800 px-3 py-1.5 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                        >
+                          Change my password
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        disabled={userBusy}
+                        onClick={() => handleUpdateUser(u.id, { is_active: true }, `Reactivated ${u.username}.`)}
+                        className="rounded-full bg-emerald-50 text-emerald-700 px-3 py-1.5 text-xs shadow hover:bg-emerald-100 disabled:opacity-50 dark:bg-emerald-500/10 dark:text-emerald-300 dark:hover:bg-emerald-500/20"
+                      >
+                        Reactivate
+                      </button>
+                      <button
+                        type="button"
+                        disabled={userBusy}
+                        onClick={() => handleDeleteUser(u)}
+                        className="rounded-full bg-rose-600 text-white px-3 py-1.5 text-xs shadow hover:bg-rose-700 disabled:opacity-50"
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
-              <button
-                onClick={() => handleDeleteUser(u.id)}
-                className="rounded-full bg-rose-50 text-rose-700 px-3 py-1 text-xs shadow hover:bg-rose-100 dark:bg-rose-500/10 dark:text-rose-300 dark:hover:bg-rose-500/20"
-              >
-                Delete
-              </button>
             </div>
           ))}
           {users.length === 0 && (
@@ -879,6 +1212,272 @@ export default function SettingsPage() {
           )}
         </div>
       </div>
+        </>
+      )}
+      {resetPasswordUser && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-4">
+            <div>
+              <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">Reset password</div>
+              <div className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                Set a temporary password for <span className="font-medium text-gray-900 dark:text-gray-100">{resetPasswordUser.username}</span>. They will be forced to change it on next login.
+              </div>
+            </div>
+            <input
+              type="password"
+              placeholder="Temporary password"
+              className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+              value={resetPasswordValue}
+              onChange={(e) => setResetPasswordValue(e.target.value)}
+            />
+            <div className="text-xs text-gray-500 dark:text-gray-400">Minimum 12 characters.</div>
+            <div className="flex items-center justify-end gap-3">
+              <button
+                type="button"
+                disabled={resetPasswordBusy}
+                onClick={() => {
+                  setResetPasswordUser(null);
+                  setResetPasswordValue("");
+                }}
+                className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={resetPasswordBusy || !resetPasswordValue}
+                onClick={handleResetPassword}
+                className="rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+              >
+                {resetPasswordBusy ? "Resetting..." : "Reset password"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showMyPasswordModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-4">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">Change password</div>
+                <div className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                  Update your password here instead of keeping a permanent form in Settings.
+                </div>
+              </div>
+              {!blockingPasswordChange && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowMyPasswordModal(false);
+                    setMyPasswordErr("");
+                    setMyPasswordMsg("");
+                  }}
+                  className="rounded-full bg-gray-100 text-gray-800 h-8 w-8 flex items-center justify-center hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                  aria-label="Close password dialog"
+                >
+                  x
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <span className={`rounded-full px-3 py-1 text-xs ${user?.is_active ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300" : "bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300"}`}>
+                {user?.is_active ? "Active" : "Inactive"}
+              </span>
+              {isAccountLocked(user?.locked_until) && (
+                <span className="rounded-full bg-amber-50 text-amber-700 px-3 py-1 text-xs dark:bg-amber-500/10 dark:text-amber-300">
+                  Locked until {formatCalendarDateTime(user?.locked_until || "", { timeZone: form.timezone, dateCalendar: form.date_calendar })}
+                </span>
+              )}
+              {user?.must_change_password && (
+                <span className="rounded-full bg-rose-50 text-rose-700 px-3 py-1 text-xs dark:bg-rose-500/10 dark:text-rose-300">
+                  Must change password
+                </span>
+              )}
+            </div>
+            {myPasswordMsg && <div className="text-sm text-green-700 dark:text-green-300">{myPasswordMsg}</div>}
+            {myPasswordErr && <div className="text-sm text-red-600 dark:text-red-300">{myPasswordErr}</div>}
+            <form onSubmit={handleMyPasswordChange} className="grid gap-3">
+              <input
+                type="password"
+                placeholder="Current password"
+                className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                value={myPasswordCurrent}
+                onChange={(e) => setMyPasswordCurrent(e.target.value)}
+                required
+              />
+              <input
+                type="password"
+                placeholder="New password"
+                className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                value={myPasswordNext}
+                onChange={(e) => setMyPasswordNext(e.target.value)}
+                required
+              />
+              <input
+                type="password"
+                placeholder="Confirm new password"
+                className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                value={myPasswordConfirm}
+                onChange={(e) => setMyPasswordConfirm(e.target.value)}
+                required
+              />
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-xs text-gray-500 dark:text-gray-400">Minimum 12 characters.</div>
+                <div className="flex items-center gap-3">
+                  {!blockingPasswordChange && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowMyPasswordModal(false);
+                        setMyPasswordErr("");
+                        setMyPasswordMsg("");
+                      }}
+                      className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                    >
+                      Cancel
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={myPasswordBusy}
+                    className="rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+                  >
+                    {myPasswordBusy ? "Updating..." : "Change password"}
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {showMaintenanceModal && usageMaintenance && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-xl rounded-2xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-5">
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">Usage maintenance</div>
+                <div className="text-sm text-gray-600 dark:text-gray-300">
+                  {maintenanceStatusLabel}
+                  {usageMaintenance.running ? ` · ${maintenanceProgress.toFixed(1)}%` : maintenanceIsTerminal ? ` · ${usageMaintenance.phase}` : ""}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowMaintenanceModal(false)}
+                disabled={usageMaintenance.running}
+                className="rounded-full bg-gray-100 text-gray-800 h-8 w-8 flex items-center justify-center hover:bg-gray-200 disabled:opacity-40 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                aria-label="Close maintenance dialog"
+              >
+                x
+              </button>
+            </div>
+
+            <div className="grid gap-3">
+              <div className="grid gap-2">
+                <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+                  <span>Overall progress</span>
+                  <span>{maintenanceProgress.toFixed(1)}%</span>
+                </div>
+                <div className="h-3 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-800">
+                  <div
+                    className={`h-full rounded-full transition-all ${usageMaintenance.phase === "failed" ? "bg-rose-600" : usageMaintenance.phase === "cancelled" ? "bg-amber-500" : "bg-gray-900 dark:bg-gray-100"}`}
+                    style={{ width: `${maintenanceProgress}%` }}
+                  />
+                </div>
+              </div>
+              <div className="grid gap-2">
+                <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+                  <span>Current phase</span>
+                  <span>{maintenancePhaseProgress.toFixed(1)}%</span>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-800">
+                  <div className="h-full rounded-full bg-indigo-600 transition-all dark:bg-indigo-300" style={{ width: `${maintenancePhaseProgress}%` }} />
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-2xl bg-gray-50 dark:bg-gray-950 ring-1 ring-gray-200 dark:ring-gray-800 p-4 grid gap-3">
+              <div className="text-sm text-gray-700 dark:text-gray-200">
+                {usageMaintenance.detail || "Preparing usage maintenance."}
+              </div>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
+                <div>
+                  <div className="text-gray-500 dark:text-gray-400">Elapsed</div>
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{formatDuration(usageMaintenance.elapsed_seconds)}</div>
+                </div>
+                <div>
+                  <div className="text-gray-500 dark:text-gray-400">Remaining</div>
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{formatDuration(usageMaintenance.estimated_remaining_seconds)}</div>
+                </div>
+                <div>
+                  <div className="text-gray-500 dark:text-gray-400">Processed units</div>
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{formatCount(usageMaintenance.processed_units)} / {formatCount(usageMaintenance.total_units)}</div>
+                </div>
+                <div>
+                  <div className="text-gray-500 dark:text-gray-400">Backfilled minutes</div>
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{formatCount(usageMaintenance.backfilled_minutes)}</div>
+                </div>
+                <div>
+                  <div className="text-gray-500 dark:text-gray-400">Deleted raw samples</div>
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{formatCount(usageMaintenance.deleted_samples)}</div>
+                </div>
+                <div>
+                  <div className="text-gray-500 dark:text-gray-400">Deleted minute rollups</div>
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{formatCount(usageMaintenance.deleted_minutes)}</div>
+                </div>
+                <div>
+                  <div className="text-gray-500 dark:text-gray-400">DB size before</div>
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{formatBytes(usageMaintenance.file_size_before ?? null)}</div>
+                </div>
+                <div>
+                  <div className="text-gray-500 dark:text-gray-400">DB size after</div>
+                  <div className="font-medium text-gray-900 dark:text-gray-100">{formatBytes(usageMaintenance.file_size_after ?? null)}</div>
+                </div>
+              </div>
+              {usageMaintenance.backup_path && (
+                <div className="break-all text-[11px] text-gray-500 dark:text-gray-400">Backup: {usageMaintenance.backup_path}</div>
+              )}
+              {usageMaintenance.last_error && (
+                <div className="text-sm text-rose-600 dark:text-rose-300">{usageMaintenance.last_error}</div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-3">
+              {!usageMaintenance.running && (
+                <button
+                  type="button"
+                  onClick={() => setShowMaintenanceModal(false)}
+                  className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                >
+                  Close
+                </button>
+              )}
+              {usageMaintenance.running && (
+                <button
+                  type="button"
+                  disabled={!usageMaintenance.can_cancel || maintenanceCancelBusy}
+                  onClick={async () => {
+                    try {
+                      setMaintenanceCancelBusy(true);
+                      const status = await cancelUsageMaintenance();
+                      setUsageMaintenance(status);
+                    } catch (e: any) {
+                      setMaintErr(e?.message || "Failed to cancel usage maintenance");
+                      await loadUsageMaintenance();
+                    } finally {
+                      setMaintenanceCancelBusy(false);
+                    }
+                  }}
+                  className="rounded-full bg-rose-50 text-rose-700 px-4 py-2 text-sm shadow hover:bg-rose-100 disabled:opacity-50 dark:bg-rose-500/10 dark:text-rose-300 dark:hover:bg-rose-500/20"
+                >
+                  {maintenanceCancelBusy || usageMaintenance.cancel_requested ? "Cancelling..." : "Cancel maintenance"}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
       {showRouterModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
           <div className="w-full max-w-lg rounded-3xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-4">
@@ -936,8 +1535,23 @@ export default function SettingsPage() {
               </label>
             </div>
             {routerErr && <div className="text-sm text-red-600">{routerErr}</div>}
+            {editingRouter && typeof testStatus[editingRouter.id] !== "undefined" && (
+              <div className={`text-sm ${testStatus[editingRouter.id] === "OK" ? "text-green-700" : "text-rose-600"}`}>
+                Status: {testStatus[editingRouter.id]}
+              </div>
+            )}
             <div className="flex items-center justify-end gap-3 pt-2">
               <button onClick={() => setShowRouterModal(false)} className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700">Cancel</button>
+              {editingRouter && (
+                <button
+                  type="button"
+                  disabled={routerBusy || testBusyId === editingRouter.id}
+                  onClick={() => void runRouterTest(editingRouter)}
+                  className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                >
+                  {testBusyId === editingRouter.id ? "Testing..." : "Test connection"}
+                </button>
+              )}
               <button disabled={routerBusy} onClick={handleSaveRouter} className="rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white">{editingRouter ? "Save changes" : "Add profile"}</button>
             </div>
           </div>
@@ -945,40 +1559,98 @@ export default function SettingsPage() {
       )}
       {confirmDeleteRouter && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
-          <div className="w-full max-w-sm rounded-2xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-4">
-            <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">Remove profile</div>
-            <div className="text-sm text-gray-600 dark:text-gray-300">
-              Remove <span className="font-medium text-gray-900 dark:text-gray-100">{confirmDeleteRouter.name}</span> from this app? This also deletes its peers from the DB. It does not delete peers on the router.
+          <div className="w-full max-w-lg rounded-2xl bg-white dark:bg-gray-900 ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 grid gap-4">
+            <div className="grid gap-1">
+              <div className="text-lg font-semibold text-gray-900 dark:text-gray-100">Delete profile and local data</div>
+              <div className="text-sm text-gray-600 dark:text-gray-300">
+                This permanently removes <span className="font-medium text-gray-900 dark:text-gray-100">{confirmDeleteRouter.name}</span> from this app and deletes the local DB rows linked to it. It does not delete peers on the actual router device.
+              </div>
+              <div className="text-xs text-gray-500 dark:text-gray-400">
+                Large routers can take a while. While this runs, dashboard polling is paused and other API screens may briefly show a retry message.
+              </div>
             </div>
+            {routerDeleteImpactBusy && (
+              <div className="rounded-2xl bg-gray-50 dark:bg-gray-950 ring-1 ring-gray-200 dark:ring-gray-800 px-4 py-3 text-sm text-gray-600 dark:text-gray-300">
+                Calculating delete impact...
+              </div>
+            )}
+            {routerDeleteImpactErr && (
+              <div className="rounded-2xl bg-rose-50 dark:bg-rose-500/10 ring-1 ring-rose-200 dark:ring-rose-500/20 px-4 py-3 grid gap-2">
+                <div className="text-sm text-rose-700 dark:text-rose-300">{routerDeleteImpactErr}</div>
+                <div className="text-xs text-rose-700/80 dark:text-rose-300/80">
+                  The impact preview must load before deletion is allowed.
+                </div>
+              </div>
+            )}
+            {routerDeleteImpact && (
+              <>
+                <div className="rounded-2xl bg-rose-50 dark:bg-rose-500/10 ring-1 ring-rose-200 dark:ring-rose-500/20 px-4 py-3 grid gap-2 text-sm text-rose-800 dark:text-rose-200">
+                  <div>This action is irreversible.</div>
+                  {routerDeleteImpact.dashboard_selected && <div>The router will be removed from dashboard selected-router defaults.</div>}
+                  {routerDeleteImpact.signup_token_count > 0 && <div>Telegram signup tokens referencing these peers will be rewritten or removed.</div>}
+                </div>
+                <div className="rounded-2xl bg-gray-50 dark:bg-gray-950 ring-1 ring-gray-200 dark:ring-gray-800 p-4 grid gap-3">
+                  <div className="text-sm font-medium text-gray-900 dark:text-gray-100">Records that will be removed locally</div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-3">
+                    {routerDeleteSummaryItems.map((item) => (
+                      <div key={item.label} className="min-w-0">
+                        <div className="text-[11px] uppercase tracking-wide text-gray-500 dark:text-gray-400">{item.label}</div>
+                        <div className="text-sm font-medium text-gray-900 dark:text-gray-100">{item.value}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="grid gap-1">
+                  <label className="text-xs text-gray-500 dark:text-gray-400">
+                    Type <span className="font-medium text-gray-900 dark:text-gray-100">{confirmDeleteRouter.name}</span> to confirm deletion
+                  </label>
+                  <input
+                    value={routerDeleteConfirmName}
+                    onChange={(e) => setRouterDeleteConfirmName(e.target.value)}
+                    className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-rose-200 dark:focus:ring-rose-500/30 dark:bg-gray-950 dark:text-gray-100"
+                    placeholder={confirmDeleteRouter.name}
+                  />
+                </div>
+              </>
+            )}
             <div className="flex items-center justify-end gap-3">
               <button
                 type="button"
-                onClick={() => setConfirmDeleteRouter(null)}
+                onClick={() => {
+                  setConfirmDeleteRouter(null);
+                  setRouterDeleteImpact(null);
+                  setRouterDeleteImpactErr("");
+                  setRouterDeleteConfirmName("");
+                }}
                 className="rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
               >
                 Cancel
               </button>
               <button
                 type="button"
+                disabled={!routerDeleteImpact || !routerDeleteNameMatches || routerDeleteImpactBusy || !!routerDeleteImpactErr || routerDeleteBusy}
                 onClick={async () => {
                   try {
-                    await deleteRouter(confirmDeleteRouter.id);
-                    await loadRouters();
-                    try {
-                      const ar = await getActiveRouter();
-                      setActiveRouterId(ar?.router_id ?? null);
-                    } catch {
-                      setActiveRouterId(null);
-                    }
+                    setRouterDeleteBusy(true);
+                    const result = await deleteRouter(confirmDeleteRouter.id);
+                    await Promise.all([loadRouters(), loadSettings()]);
+                    const backupNote = result.backup_path ? ` Backup: ${result.backup_path}` : "";
+                    setRouterMsg(
+                      `Deleted ${result.router_name} with ${formatCount(result.peer_count)} peer(s) and ${formatCount(result.usage_sample_rows + result.usage_minute_rows + result.usage_daily_rows + result.usage_monthly_rows)} usage row(s).${backupNote}`
+                    );
+                    setRouterDeleteImpact(null);
+                    setRouterDeleteImpactErr("");
+                    setRouterDeleteConfirmName("");
                     setConfirmDeleteRouter(null);
                   } catch (e: any) {
                     setRouterErr(e?.message || "Failed to delete router");
-                    setConfirmDeleteRouter(null);
+                  } finally {
+                    setRouterDeleteBusy(false);
                   }
                 }}
-                className="rounded-full bg-rose-600 text-white px-4 py-2 text-sm shadow hover:bg-rose-700"
+                className="rounded-full bg-rose-600 text-white px-4 py-2 text-sm shadow hover:bg-rose-700 disabled:opacity-50"
               >
-                Delete
+                {routerDeleteBusy ? "Deleting..." : "Delete permanently"}
               </button>
             </div>
           </div>

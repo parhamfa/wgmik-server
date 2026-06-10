@@ -377,7 +377,6 @@ def apply_fair_usage_policy(
     if not state:
         state = FairUsageState(peer_id=peer.id, rule_id=winning_rule.id, throttled=False, ros_queue_id="")
         db.add(state)
-        db.flush()
 
     state.rule_id = winning_rule.id
     state.tier_id = winning_tier.id if winning_tier else None

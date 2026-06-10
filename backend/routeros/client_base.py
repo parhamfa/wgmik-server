@@ -16,7 +16,6 @@ class WGPeer:
     endpoint: str
     # RouterOS 7.x+ /server WG: hostname or host:port for generated client configs (REST: client-endpoint)
     client_endpoint: str = ""
-    comment: str = ""
 
 
 @dataclass
@@ -24,9 +23,13 @@ class WGInterfaceConfig:
     name: str
     public_key: str
     listen_port: int
+    addresses: Optional[List[str]] = None
 
 
 class RouterOSClient:
+    def get_system_version(self) -> str:
+        raise NotImplementedError
+
     def list_wireguard_interfaces(self) -> List[str]:
         raise NotImplementedError
 
@@ -49,9 +52,10 @@ class RouterOSClient:
         public_key: str,
         allowed_address: str,
         name: str = "",
-        comment: str = "",
         disabled: bool = False,
         private_key: Optional[str] = None,
+        preshared_key: Optional[str] = None,
+        client_endpoint: Optional[str] = None,
     ) -> str:
         """Create a WireGuard peer and return its RouterOS internal .id."""
         raise NotImplementedError
@@ -68,8 +72,8 @@ class RouterOSClient:
         """Best-effort read of a peer's preshared-key from RouterOS (may be blank/unavailable)."""
         raise NotImplementedError
 
-    def set_peer_comment(self, interface: str, ros_id: str, comment: str) -> None:
-        """Set RouterOS peer comment."""
+    def set_peer_name(self, interface: str, ros_id: str, name: str) -> None:
+        """Set RouterOS WireGuard peer display name. Empty clears the label."""
         raise NotImplementedError
 
     def set_peer_client_endpoint(self, interface: str, ros_id: str, client_endpoint: Optional[str]) -> None:
@@ -98,6 +102,10 @@ class RouterOSClient:
 
     def update_simple_queue(self, ros_id: str, max_limit_up: str, max_limit_down: str) -> None:
         """Update the speed limits of an existing simple queue."""
+        raise NotImplementedError
+
+    def set_simple_queue_name(self, ros_id: str, name: str) -> None:
+        """Rename a simple queue by RouterOS internal .id."""
         raise NotImplementedError
 
     def remove_simple_queue(self, ros_id: str) -> None:

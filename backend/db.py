@@ -43,6 +43,7 @@ if db_url.startswith("sqlite:"):
     def _set_sqlite_pragmas(dbapi_connection, _connection_record):
         cursor = dbapi_connection.cursor()
         try:
+            cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA busy_timeout=30000")
             cursor.execute("PRAGMA temp_store=MEMORY")
         finally:
@@ -91,6 +92,90 @@ def ensure_fair_usage_scope_columns() -> None:
         db.close()
 
 
+def ensure_router_enabled_column() -> None:
+    """Add `routers.enabled` (default 1) when running on legacy SQLite databases."""
+    if not db_url.startswith("sqlite:"):
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(routers)")).fetchall()
+        col_names = {r[1] for r in rows}
+        if "enabled" not in col_names:
+            conn.execute(text("ALTER TABLE routers ADD COLUMN enabled BOOLEAN DEFAULT 1 NOT NULL"))
+
+
+def ensure_router_version_columns() -> None:
+    """Add RouterOS compatibility fields for legacy SQLite databases."""
+    if not db_url.startswith("sqlite:"):
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(routers)")).fetchall()
+        col_names = {r[1] for r in rows}
+        if "ros_version" not in col_names:
+            conn.execute(text("ALTER TABLE routers ADD COLUMN ros_version VARCHAR(64) DEFAULT '' NOT NULL"))
+        if "ros_version_checked_at" not in col_names:
+            conn.execute(text("ALTER TABLE routers ADD COLUMN ros_version_checked_at DATETIME"))
+        if "ros_supported" not in col_names:
+            conn.execute(text("ALTER TABLE routers ADD COLUMN ros_supported BOOLEAN DEFAULT 0 NOT NULL"))
+
+
+def ensure_peer_router_sync_columns() -> None:
+    """Add peer drift state fields for legacy SQLite databases."""
+    if not db_url.startswith("sqlite:"):
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(peers)")).fetchall()
+        col_names = {r[1] for r in rows}
+        if "router_sync_status" not in col_names:
+            conn.execute(text("ALTER TABLE peers ADD COLUMN router_sync_status VARCHAR(16) DEFAULT 'synced' NOT NULL"))
+        if "router_sync_first_seen_at" not in col_names:
+            conn.execute(text("ALTER TABLE peers ADD COLUMN router_sync_first_seen_at DATETIME"))
+        if "router_sync_last_seen_at" not in col_names:
+            conn.execute(text("ALTER TABLE peers ADD COLUMN router_sync_last_seen_at DATETIME"))
+
+
+def ensure_user_auth_schema() -> None:
+    """Add user-account hardening columns and audit table for legacy SQLite databases."""
+    if not db_url.startswith("sqlite:"):
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(users)")).fetchall()
+        col_names = {r[1] for r in rows}
+        if "is_active" not in col_names:
+            conn.execute(text("ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT 1 NOT NULL"))
+        if "session_version" not in col_names:
+            conn.execute(text("ALTER TABLE users ADD COLUMN session_version INTEGER DEFAULT 1 NOT NULL"))
+        if "password_changed_at" not in col_names:
+            conn.execute(text("ALTER TABLE users ADD COLUMN password_changed_at DATETIME"))
+        if "last_login_at" not in col_names:
+            conn.execute(text("ALTER TABLE users ADD COLUMN last_login_at DATETIME"))
+        if "failed_login_attempts" not in col_names:
+            conn.execute(text("ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0 NOT NULL"))
+        if "locked_until" not in col_names:
+            conn.execute(text("ALTER TABLE users ADD COLUMN locked_until DATETIME"))
+        if "must_change_password" not in col_names:
+            conn.execute(text("ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT 0 NOT NULL"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS user_security_events (
+                    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                    actor_user_id INTEGER,
+                    target_user_id INTEGER,
+                    event_type VARCHAR(64) NOT NULL,
+                    detail VARCHAR DEFAULT '' NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(actor_user_id) REFERENCES users (id) ON DELETE SET NULL,
+                    FOREIGN KEY(target_user_id) REFERENCES users (id) ON DELETE SET NULL
+                )
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_user_security_events_actor_user_id ON user_security_events (actor_user_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_user_security_events_target_user_id ON user_security_events (target_user_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_user_security_events_event_type ON user_security_events (event_type)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_user_security_events_created_at ON user_security_events (created_at)"))
+
+
 def ensure_fair_usage_tier_schema() -> None:
     """Add tier/ordering columns used by fair-usage rules (SQLite migrations)."""
     if not db_url.startswith("sqlite:"):
@@ -124,7 +209,7 @@ def ensure_fair_usage_tier_schema() -> None:
         rows_s = conn.execute(text("PRAGMA table_info(fair_usage_state)")).fetchall()
         col_names_s = {r[1] for r in rows_s}
         if "tier_id" not in col_names_s:
-            conn.execute(text("ALTER TABLE fair_usage_state ADD COLUMN tier_id INTEGER REFERENCES fair_usage_tiers (id)"))
+            conn.execute(text("ALTER TABLE fair_usage_state ADD COLUMN tier_id INTEGER REFERENCES fair_usage_tiers (id) ON DELETE SET NULL"))
         conn.execute(
             text(
                 """
@@ -152,6 +237,7 @@ def prepare_sqlite_database():
         conn.exec_driver_sql("PRAGMA journal_mode=DELETE")
         conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
         conn.exec_driver_sql("PRAGMA busy_timeout=30000")
+        conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
 
 def sqlite_database_path() -> Optional[str]:

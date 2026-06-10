@@ -1,11 +1,13 @@
 from .rest_client import RouterOSRestClient
+from typing import Optional
+
 from .api_client import RouterOSApiClient
 from ..security import SecretBox
 from ..settings import settings
 from ..models import Router
 
 
-def make_client(router: Router):
+def make_client(router: Router, timeout: Optional[float] = None):
     box = SecretBox(settings.secret_key)
     password = box.decrypt(router.secret_enc) or ""
     if router.proto in ("rest", "rest-http"):
@@ -19,6 +21,7 @@ def make_client(router: Router):
             tls_verify=router.tls_verify,
             https=https,
             allow_scheme_fallback=(router.proto == "rest"),
+            timeout=10.0 if timeout is None else float(timeout),
         )
     else:
         # api-plain forces no TLS; api uses TLS
@@ -30,6 +33,7 @@ def make_client(router: Router):
             password=password,
             use_tls=use_tls,
             ssl_verify=router.tls_verify if use_tls else False,
+            timeout=10 if timeout is None else max(1, int(timeout)),
         )
 
 

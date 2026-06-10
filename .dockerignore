@@ -1,16 +1,45 @@
+# VCS / editor / OS
 .git
 .gitignore
-.env
+.DS_Store
+.cursor
+.claude
+.idea
+.vscode
+
+# Local Python
 .venv
 __pycache__
 **/__pycache__
 **/*.pyc
 **/*.pyo
 **/*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
 
+# Local secrets
+.env
+
+# Frontend artifacts (web image uses frontend/Dockerfile and copies what it needs)
 frontend/node_modules
 frontend/dist
 
+# Persisted runtime data — never ship this into a build context
+data
+output
+test-results
+backups
+
+# Loose DB files anywhere in the tree
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 wgmik.db
 
-
+# Logs
+*.log
+logs

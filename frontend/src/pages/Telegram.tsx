@@ -18,6 +18,7 @@ import {
   testTelegramNotifyEvent,
   listRouters,
   listSavedPeers,
+  getSettings,
   type TelegramConfigDTO,
   type TelegramStatusDTO,
   type TelegramTokenDTO,
@@ -25,7 +26,9 @@ import {
   type TelegramNotifConfigDTO,
   type PeerListDTO,
   type Router,
+  type SettingsDTO,
 } from "../api";
+import { formatCalendarDateTime } from "../datetimeLocal";
 
 function Card({ className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) {
   const base =
@@ -41,6 +44,73 @@ const EVENT_LABELS: Record<string, string> = {
   daily_summary: "Daily Summary",
   weekly_summary: "Weekly Summary",
 };
+
+function filterPeers(peers: PeerListDTO[], search: string, routerById: Record<number, Router>) {
+  if (!search.trim()) return peers;
+  const q = search.toLowerCase();
+  return peers.filter(p =>
+    p.name.toLowerCase().includes(q) ||
+    p.allowed_address.toLowerCase().includes(q) ||
+    (routerById[p.router_id]?.name || "").toLowerCase().includes(q)
+  );
+}
+
+function PeerSelectField({
+  label,
+  search,
+  onSearchChange,
+  peers,
+  selectedIds,
+  onToggle,
+  routerById,
+}: {
+  label: string;
+  search: string;
+  onSearchChange: (value: string) => void;
+  peers: PeerListDTO[];
+  selectedIds: number[];
+  onToggle: (peerId: number, checked: boolean) => void;
+  routerById: Record<number, Router>;
+}) {
+  const filtered = React.useMemo(() => {
+    const matched = filterPeers(peers, search, routerById);
+    const selected = new Set(selectedIds);
+    return [...matched].sort((a, b) => {
+      const aSelected = selected.has(a.id);
+      const bSelected = selected.has(b.id);
+      if (aSelected !== bSelected) return aSelected ? -1 : 1;
+      return (a.name || a.public_key).localeCompare(b.name || b.public_key, undefined, { sensitivity: "base" });
+    });
+  }, [peers, search, routerById, selectedIds]);
+
+  return (
+    <div className="grid gap-1">
+      <label className="text-xs text-gray-500 dark:text-gray-400">{label}</label>
+      <input
+        value={search}
+        onChange={e => onSearchChange(e.target.value)}
+        placeholder="Search peers..."
+        className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+      />
+      <div className="max-h-48 overflow-y-auto rounded-xl border border-gray-100 dark:border-gray-800 mt-1">
+        {filtered.map(p => (
+          <label key={p.id} className="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={selectedIds.includes(p.id)}
+              onChange={e => onToggle(p.id, e.target.checked)}
+              className="rounded"
+            />
+            <span className="text-gray-700 dark:text-gray-300">{p.name || p.public_key.slice(0, 16)}</span>
+            <span className="text-xs text-gray-400 ml-auto">
+              {routerById[p.router_id]?.name || `R#${p.router_id}`} / {p.interface}
+            </span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export default function TelegramPage() {
   const [loading, setLoading] = React.useState(true);
@@ -71,14 +141,16 @@ export default function TelegramPage() {
 
   // Users
   const [users, setUsers] = React.useState<TelegramUserDTO[]>([]);
-  const [expandedUser, setExpandedUser] = React.useState<number | null>(null);
   const [userSearch, setUserSearch] = React.useState("");
+  const [userPeersModalUser, setUserPeersModalUser] = React.useState<TelegramUserDTO | null>(null);
+  const [userPeerSearch, setUserPeerSearch] = React.useState("");
   const [userPeerDraft, setUserPeerDraft] = React.useState<Record<number, number[]>>({});
   const [savingUserPeers, setSavingUserPeers] = React.useState<number | null>(null);
 
   // Peers + Routers for token creation
   const [peers, setPeers] = React.useState<PeerListDTO[]>([]);
   const [routers, setRouters] = React.useState<Router[]>([]);
+  const [settings, setSettings] = React.useState<SettingsDTO | null>(null);
 
   const routerById = React.useMemo(() => {
     const m: Record<number, Router> = {};
@@ -88,7 +160,7 @@ export default function TelegramPage() {
 
   const load = React.useCallback(async () => {
     try {
-      const [cfg, st, toks, usrs, nc, rts, prs] = await Promise.all([
+      const [cfg, st, toks, usrs, nc, rts, prs, appSettings] = await Promise.all([
         getTelegramConfig(),
         getTelegramStatus(),
         listTelegramTokens(),
@@ -96,6 +168,7 @@ export default function TelegramPage() {
         getTelegramNotifConfig(),
         listRouters(),
         listSavedPeers(),
+        getSettings(),
       ]);
       setConfig(cfg);
       setBotStatus(st);
@@ -104,6 +177,7 @@ export default function TelegramPage() {
       setNotifConfigs(nc);
       setRouters(rts);
       setPeers(prs);
+      setSettings(appSettings);
       setChatIdInput(cfg.tg_admin_chat_id || "");
       setLangInput(cfg.tg_bot_language || "both");
       setEnabledInput(cfg.tg_bot_enabled === "true" || cfg.tg_bot_enabled === "1");
@@ -198,16 +272,6 @@ export default function TelegramPage() {
     }
   };
 
-  const filteredPeers = React.useMemo(() => {
-    if (!tokenSearch.trim()) return peers;
-    const q = tokenSearch.toLowerCase();
-    return peers.filter(p =>
-      p.name.toLowerCase().includes(q) ||
-      p.allowed_address.toLowerCase().includes(q) ||
-      (routerById[p.router_id]?.name || "").toLowerCase().includes(q)
-    );
-  }, [peers, tokenSearch, routerById]);
-
   const filteredUsers = React.useMemo(() => {
     if (!userSearch.trim()) return users;
     const q = userSearch.toLowerCase();
@@ -230,14 +294,13 @@ export default function TelegramPage() {
     });
   };
 
-  const openUserPeers = (u: TelegramUserDTO) => {
-    const willExpand = expandedUser !== u.id;
-    setExpandedUser(willExpand ? u.id : null);
-    if (!willExpand) return;
-    setUserPeerDraft(prev => {
-      if (prev[u.id]) return prev;
-      return { ...prev, [u.id]: u.peers.map(p => p.peer_id) };
-    });
+  const openUserPeersModal = (u: TelegramUserDTO) => {
+    setUserPeerSearch("");
+    setUserPeersModalUser(u);
+    setUserPeerDraft(prev => ({
+      ...prev,
+      [u.id]: prev[u.id] ?? u.peers.map(p => p.peer_id),
+    }));
   };
 
   const applyUserPeers = async (u: TelegramUserDTO) => {
@@ -247,6 +310,7 @@ export default function TelegramPage() {
       const peer_ids = userPeerDraft[u.id] || [];
       await setTelegramUserPeers(u.id, peer_ids);
       await load();
+      setUserPeersModalUser(null);
       flash("Peer bindings updated");
     } catch (e: any) {
       setErr(e?.message || "Failed to update peer bindings");
@@ -384,30 +448,37 @@ export default function TelegramPage() {
         <Card className="p-5 md:p-6 !hover:shadow-md !hover:-translate-y-0">
           <div className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-4">Notification Settings</div>
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="w-full table-fixed text-sm">
+              <colgroup>
+                <col />
+                <col className="w-11 md:w-16" />
+                <col className="w-11 md:w-16" />
+                <col className="w-11 md:w-16" />
+                <col className="w-[4.25rem] md:w-20" />
+              </colgroup>
               <thead>
                 <tr className="text-left text-xs text-gray-500 dark:text-gray-400 border-b border-gray-100 dark:border-gray-800">
-                  <th className="py-2 pr-4">Event</th>
-                  <th className="py-2 px-4 text-center">Clients</th>
-                  <th className="py-2 px-4 text-center">Admin</th>
-                  <th className="py-2 px-4 text-center">Active</th>
-                  <th className="py-2 px-4 text-center">Test</th>
+                  <th className="py-2 pr-2 md:pr-4">Event</th>
+                  <th className="py-2 px-1 md:px-4 text-center">Clients</th>
+                  <th className="py-2 px-1 md:px-4 text-center">Admin</th>
+                  <th className="py-2 px-1 md:px-4 text-center">Active</th>
+                  <th className="py-2 px-1 md:px-4 text-center">Test</th>
                 </tr>
               </thead>
               <tbody>
                 {notifConfigs.map(c => (
                   <tr key={c.event_type} className="border-b border-gray-50 dark:border-gray-800/50">
-                    <td className="py-2.5 pr-4 text-gray-700 dark:text-gray-300">{EVENT_LABELS[c.event_type] || c.event_type}</td>
-                    <td className="py-2.5 px-4 text-center">
+                    <td className="py-2.5 pr-2 md:pr-4 text-gray-700 dark:text-gray-300">{EVENT_LABELS[c.event_type] || c.event_type}</td>
+                    <td className="py-2.5 px-1 md:px-4 text-center">
                       <input type="checkbox" checked={c.notify_clients} onChange={e => handleNotifToggle(c.event_type, "notify_clients", e.target.checked)} className="rounded" />
                     </td>
-                    <td className="py-2.5 px-4 text-center">
+                    <td className="py-2.5 px-1 md:px-4 text-center">
                       <input type="checkbox" checked={c.notify_admin} onChange={e => handleNotifToggle(c.event_type, "notify_admin", e.target.checked)} className="rounded" />
                     </td>
-                    <td className="py-2.5 px-4 text-center">
+                    <td className="py-2.5 px-1 md:px-4 text-center">
                       <input type="checkbox" checked={c.enabled} onChange={e => handleNotifToggle(c.event_type, "enabled", e.target.checked)} className="rounded" />
                     </td>
-                    <td className="py-2.5 px-4 text-center">
+                    <td className="py-2.5 px-1 md:px-4 text-center">
                       <button
                         type="button"
                         disabled={testingNotifEvent === c.event_type}
@@ -469,7 +540,11 @@ export default function TelegramPage() {
                     <div className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">
                       Peers: {tok.peer_ids.length} &middot;
                       {tok.used_by ? ` Used by @${tok.used_by.telegram_username || tok.used_by.first_name}` : " Unused"}
-                      {tok.expires_at && ` · Expires ${new Date(tok.expires_at).toLocaleDateString()}`}
+                      {tok.expires_at && ` · Expires ${formatCalendarDateTime(tok.expires_at, {
+                        timeZone: settings?.timezone || "UTC",
+                        dateCalendar: settings?.date_calendar || "gregorian",
+                        includeTime: false,
+                      })}`}
                     </div>
                   </div>
                   <button
@@ -497,6 +572,9 @@ export default function TelegramPage() {
               />
             )}
           </div>
+          <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
+            People who signed up through the bot. Use Peers to choose which VPN connections each user can view and manage.
+          </p>
 
           {filteredUsers.length === 0 && (
             <div className="text-sm text-gray-500 dark:text-gray-400">No users registered via the bot yet.</div>
@@ -507,118 +585,64 @@ export default function TelegramPage() {
               const subscribedNotifications = u.subscribed_notifications.map(eventType => EVENT_LABELS[eventType] || eventType);
               return (
                 <div key={u.id} className="rounded-xl bg-gray-50 dark:bg-gray-800/50 px-3 py-2">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3 min-w-0">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0 flex-1">
                       <div className="h-8 w-8 rounded-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-xs font-medium text-gray-600 dark:text-gray-300 shrink-0">
                         {(u.first_name?.[0] || u.telegram_username?.[0] || "?").toUpperCase()}
                       </div>
                       <div className="min-w-0">
                         <div className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">
                           {u.first_name} {u.last_name}
-                          {u.telegram_username && <span className="text-gray-400 dark:text-gray-500 ml-1">@{u.telegram_username}</span>}
+                          {u.telegram_username && (
+                            <span className="text-gray-400 dark:text-gray-500 ml-1">@{u.telegram_username}</span>
+                          )}
                         </div>
                         <div className="text-xs text-gray-400 dark:text-gray-500">
                           {u.peers.length} peer(s) · {u.language.toUpperCase()}
                           {u.is_blocked && <span className="text-red-500 ml-1">[Blocked]</span>}
                         </div>
-                        <div className="mt-1 flex flex-wrap items-center gap-1">
-                          <span className="text-[11px] text-gray-400 dark:text-gray-500 mr-1">Subscribed:</span>
-                          {subscribedNotifications.length > 0 ? (
-                            subscribedNotifications.map(label => (
-                              <span
-                                key={label}
-                                className="rounded-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 px-2 py-0.5 text-[11px] text-gray-600 dark:text-gray-300"
-                              >
-                                {label}
-                              </span>
-                            ))
-                          ) : (
-                            <span className="text-[11px] text-gray-400 dark:text-gray-500">None</span>
-                          )}
-                        </div>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
                       <button
-                        onClick={() => openUserPeers(u)}
-                        className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+                        onClick={() => openUserPeersModal(u)}
+                        className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
                       >
-                        {expandedUser === u.id ? "Collapse" : "Peers"}
+                        Peers
                       </button>
                       <button
                         onClick={async () => { await patchTelegramUser(u.id, { is_blocked: !u.is_blocked }); await load(); }}
-                        className={`text-xs ${u.is_blocked ? "text-green-600 hover:text-green-700" : "text-orange-500 hover:text-orange-700"}`}
+                        className={`rounded-full px-3 py-1 text-xs shadow ${
+                          u.is_blocked
+                            ? "bg-green-50 text-green-700 hover:bg-green-100 dark:bg-green-500/10 dark:text-green-300 dark:hover:bg-green-500/20"
+                            : "bg-orange-50 text-orange-700 hover:bg-orange-100 dark:bg-orange-500/10 dark:text-orange-300 dark:hover:bg-orange-500/20"
+                        }`}
                       >
                         {u.is_blocked ? "Unblock" : "Block"}
                       </button>
                       <button
                         onClick={async () => { if (confirm("Delete this user and all bindings?")) { await deleteTelegramUser(u.id); await load(); } }}
-                        className="text-xs text-red-500 hover:text-red-700"
+                        className="rounded-full bg-rose-50 text-rose-700 px-3 py-1 text-xs shadow hover:bg-rose-100 dark:bg-rose-500/10 dark:text-rose-300 dark:hover:bg-rose-500/20"
                       >
                         Delete
                       </button>
                     </div>
                   </div>
-
-                  {expandedUser === u.id && (
-                    <div className="mt-3 ml-11 rounded-xl border border-gray-200 dark:border-gray-700/60 bg-white dark:bg-gray-900/40 p-3">
-                      <div className="flex items-center justify-between gap-2 mb-2">
-                        <div className="text-xs text-gray-500 dark:text-gray-400">
-                          Select peers to assign to this user ({(userPeerDraft[u.id] || []).length} selected)
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setUserPeerDraft(prev => ({ ...prev, [u.id]: peers.map(p => p.id) }))}
-                            className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
-                          >
-                            All
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setUserPeerDraft(prev => ({ ...prev, [u.id]: [] }))}
-                            className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
-                          >
-                            None
-                          </button>
-                        </div>
-                      </div>
-                      <div className="max-h-56 overflow-y-auto rounded-lg border border-gray-100 dark:border-gray-800">
-                        {peers.map(p => {
-                          const selected = (userPeerDraft[u.id] || []).includes(p.id);
-                          return (
-                            <label
-                              key={p.id}
-                              className="flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer"
-                            >
-                              <input
-                                type="checkbox"
-                                checked={selected}
-                                onChange={e => toggleUserPeerDraft(u.id, p.id, e.target.checked)}
-                                className="rounded"
-                              />
-                              <span className="text-gray-700 dark:text-gray-300">
-                                {p.name || p.public_key.slice(0, 16)}
-                              </span>
-                              <span className="text-gray-400 ml-auto">
-                                {routerById[p.router_id]?.name || `R#${p.router_id}`} / {p.interface}
-                              </span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                      <div className="mt-2 flex justify-end">
-                        <button
-                          type="button"
-                          disabled={savingUserPeers === u.id}
-                          onClick={() => applyUserPeers(u)}
-                          className="rounded-full bg-gray-900 text-white px-4 py-1.5 text-xs shadow hover:bg-gray-800 disabled:opacity-60 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200"
+                  <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 border-t border-gray-200/70 pt-2 dark:border-gray-700/50 sm:ml-11 sm:border-0 sm:pt-1">
+                    <span className="text-[11px] text-gray-400 dark:text-gray-500 shrink-0">Subscribed:</span>
+                    {subscribedNotifications.length > 0 ? (
+                      subscribedNotifications.map(label => (
+                        <span
+                          key={label}
+                          className="whitespace-nowrap rounded-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 px-2 py-0.5 text-[11px] text-gray-600 dark:text-gray-300"
                         >
-                          {savingUserPeers === u.id ? "Saving..." : "Apply changes"}
-                        </button>
-                      </div>
-                    </div>
-                  )}
+                          {label}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="text-[11px] text-gray-400 dark:text-gray-500">None</span>
+                    )}
+                  </div>
                 </div>
               );
             })}
@@ -627,6 +651,53 @@ export default function TelegramPage() {
       </div>
 
       {/* ── Generate Token Modal ── */}
+      {userPeersModalUser && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4">
+          <div className="w-full max-w-lg bg-white dark:bg-gray-900 rounded-3xl ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 relative">
+            <button
+              onClick={() => setUserPeersModalUser(null)}
+              className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+            >
+              &times;
+            </button>
+            <div className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-4">
+              Assign Peers
+              {userPeersModalUser.telegram_username ? (
+                <span className="ml-1 font-normal text-gray-400 dark:text-gray-500">@{userPeersModalUser.telegram_username}</span>
+              ) : null}
+            </div>
+
+            <div className="grid gap-4">
+              <PeerSelectField
+                label={`Select Peers (${(userPeerDraft[userPeersModalUser.id] || []).length} selected)`}
+                search={userPeerSearch}
+                onSearchChange={setUserPeerSearch}
+                peers={peers}
+                selectedIds={userPeerDraft[userPeersModalUser.id] || []}
+                onToggle={(peerId, checked) => toggleUserPeerDraft(userPeersModalUser.id, peerId, checked)}
+                routerById={routerById}
+              />
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  onClick={() => setUserPeersModalUser(null)}
+                  className="rounded-full bg-white text-gray-900 px-4 py-1.5 text-sm ring-1 ring-gray-200 shadow-sm hover:ring-gray-300 dark:bg-gray-800 dark:text-gray-100 dark:ring-gray-700"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={savingUserPeers === userPeersModalUser.id}
+                  onClick={() => applyUserPeers(userPeersModalUser)}
+                  className="rounded-full bg-gray-900 text-white px-5 py-1.5 text-sm shadow hover:bg-gray-800 disabled:opacity-60 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200"
+                >
+                  {savingUserPeers === userPeersModalUser.id ? "Saving..." : "Apply changes"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showTokenForm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4">
           <div className="w-full max-w-lg bg-white dark:bg-gray-900 rounded-3xl ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 relative">
@@ -639,58 +710,40 @@ export default function TelegramPage() {
             <div className="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-4">Generate Signup Token</div>
 
             <div className="grid gap-4">
-              <div className="grid gap-1">
-                <label className="text-xs text-gray-500 dark:text-gray-400">Select Peers to Bind</label>
-                <input
-                  value={tokenSearch}
-                  onChange={e => setTokenSearch(e.target.value)}
-                  placeholder="Search peers..."
-                  className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
-                />
-                <div className="max-h-48 overflow-y-auto rounded-xl border border-gray-100 dark:border-gray-800 mt-1">
-                  {filteredPeers.map(p => (
-                    <label key={p.id} className="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer text-sm">
-                      <input
-                        type="checkbox"
-                        checked={tokenPeerIds.includes(p.id)}
-                        onChange={e => {
-                          setTokenPeerIds(prev =>
-                            e.target.checked ? [...prev, p.id] : prev.filter(id => id !== p.id)
-                          );
-                        }}
-                        className="rounded"
-                      />
-                      <span className="text-gray-700 dark:text-gray-300">{p.name || p.public_key.slice(0, 16)}</span>
-                      <span className="text-xs text-gray-400 ml-auto">
-                        {routerById[p.router_id]?.name || `R#${p.router_id}`} / {p.interface}
-                      </span>
-                    </label>
-                  ))}
-                </div>
-              </div>
+              <PeerSelectField
+                label="Select Peers to Bind"
+                search={tokenSearch}
+                onSearchChange={setTokenSearch}
+                peers={peers}
+                selectedIds={tokenPeerIds}
+                onToggle={(peerId, checked) => {
+                  setTokenPeerIds(prev =>
+                    checked ? [...prev, peerId] : prev.filter(id => id !== peerId)
+                  );
+                }}
+                routerById={routerById}
+              />
 
-              <div className="grid gap-4 grid-cols-2">
-                <div className="grid gap-1">
+              <div className="grid gap-4 grid-cols-1 sm:grid-cols-2">
+                <div className="grid gap-1 min-w-0">
                   <label className="text-xs text-gray-500 dark:text-gray-400">Expires in (hours)</label>
                   <input
                     type="number"
                     value={tokenExpiry}
                     onChange={e => setTokenExpiry(Number(e.target.value))}
                     min={0}
-                    className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                    className="w-full rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
                   />
                 </div>
-                <div className="flex items-end pb-1">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={tokenSingleUse}
-                      onChange={e => setTokenSingleUse(e.target.checked)}
-                      className="rounded"
-                    />
-                    <span className="text-sm text-gray-700 dark:text-gray-300">Single use</span>
-                  </label>
-                </div>
+                <label className="flex items-center gap-2 cursor-pointer sm:self-end sm:pb-2.5">
+                  <input
+                    type="checkbox"
+                    checked={tokenSingleUse}
+                    onChange={e => setTokenSingleUse(e.target.checked)}
+                    className="rounded"
+                  />
+                  <span className="text-sm text-gray-700 dark:text-gray-300">Single use</span>
+                </label>
               </div>
 
               <div className="flex justify-end gap-2 pt-2">

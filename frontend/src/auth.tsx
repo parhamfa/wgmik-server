@@ -1,15 +1,8 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { fetchJson } from './api';
-
-interface User {
-    id: number;
-    username: string;
-    is_admin: boolean;
-    created_at: string;
-}
+import { fetchJson, type LocalUserDTO } from './api';
 
 interface AuthContextType {
-    user: User | null;
+    user: LocalUserDTO | null;
     loading: boolean;
     login: (creds: any) => Promise<void>;
     logout: () => Promise<void>;
@@ -18,7 +11,7 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType>(null!);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-    const [user, setUser] = useState<User | null>(null);
+    const [user, setUser] = useState<LocalUserDTO | null>(null);
     const [loading, setLoading] = useState(true);
 
     const refreshUser = async (opts?: { throwOnError?: boolean }) => {

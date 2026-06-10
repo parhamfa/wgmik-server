@@ -6,6 +6,7 @@ import backend.api.routes as routes_module
 import backend.scheduler as scheduler_module
 from backend.db import SessionLocal
 from backend.models import Action, Peer, Router, SettingsKV, UsageDaily, UsageMinute, UsageSample
+from backend.routeros.client_base import WGInterfaceConfig
 from backend.security import SecretBox
 from backend.settings import settings
 
@@ -21,6 +22,8 @@ def seed_router_data():
             username="admin",
             secret_enc="secret-a",
             tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
         )
         router2 = Router(
             name="Router B",
@@ -30,6 +33,8 @@ def seed_router_data():
             username="admin",
             secret_enc="secret-b",
             tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
         )
         db.add_all([router1, router2])
         db.flush()
@@ -163,6 +168,8 @@ def seed_peer_for_key_renewal(old_private_key=None):
             username="admin",
             secret_enc="secret-renew",
             tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
         )
         db.add(router)
         db.flush()
@@ -202,6 +209,144 @@ def seed_peer_for_key_renewal(old_private_key=None):
         db.close()
 
 
+def test_create_router_peer_stores_export_prefs_and_passes_router_keys(client, monkeypatch):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Router Add",
+            host="10.0.0.10",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret-add",
+            tls_verify=True,
+        )
+        db.add(router)
+        db.commit()
+        router_id = router.id
+    finally:
+        db.close()
+
+    private_key = base64.b64encode(b"a" * 32).decode("utf-8")
+    preshared_key = base64.b64encode(b"b" * 32).decode("utf-8")
+    public_key = base64.b64encode(b"c" * 32).decode("utf-8")
+    calls = {}
+
+    class StubClient:
+        def list_wireguard_peers(self, iface):
+            calls["list_iface"] = iface
+            return []
+
+        def add_wireguard_peer(
+            self,
+            interface,
+            public_key,
+            allowed_address,
+            name="",
+            disabled=False,
+            private_key=None,
+            preshared_key=None,
+            client_endpoint=None,
+        ):
+            calls["add"] = {
+                "interface": interface,
+                "public_key": public_key,
+                "allowed_address": allowed_address,
+                "name": name,
+                "disabled": disabled,
+                "private_key": private_key,
+                "preshared_key": preshared_key,
+                "client_endpoint": client_endpoint,
+            }
+            return "*77"
+
+    monkeypatch.setattr(routes_module, "make_client", lambda router: StubClient())
+
+    response = client.post(
+        f"/api/routers/{router_id}/peers/add",
+        json={
+            "interface": "wg0",
+            "name": "alice",
+            "public_key": public_key,
+            "allowed_address": "10.65.74.100/32",
+            "private_key": private_key,
+            "preshared_key": preshared_key,
+            "config_name": "alice-phone",
+            "custom_endpoint": "vpn.example.com:1443",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "alice"
+    assert body["public_key"] == public_key
+    assert calls["list_iface"] == "wg0"
+    assert calls["add"] == {
+        "interface": "wg0",
+        "public_key": public_key,
+        "allowed_address": "10.65.74.100/32",
+        "name": "alice",
+        "disabled": False,
+        "private_key": private_key,
+        "preshared_key": preshared_key,
+        "client_endpoint": "vpn.example.com:1443",
+    }
+
+    db = SessionLocal()
+    try:
+        peer_id = body["id"]
+        assert SecretBox(settings.secret_key).decrypt(db.get(SettingsKV, f"peer_private_key:{peer_id}").value) == private_key
+        assert SecretBox(settings.secret_key).decrypt(db.get(SettingsKV, f"peer_preshared_key:{peer_id}").value) == preshared_key
+        assert db.get(SettingsKV, f"peer_export_config_name:{peer_id}").value == "alice-phone"
+        assert db.get(SettingsKV, f"peer_export_endpoint:{peer_id}").value == "vpn.example.com:1443"
+    finally:
+        db.close()
+
+
+def test_router_interface_detail_includes_interface_addresses(client, monkeypatch):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Router Interface",
+            host="10.0.0.10",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret-interface",
+            tls_verify=True,
+        )
+        db.add(router)
+        db.commit()
+        router_id = router.id
+    finally:
+        db.close()
+
+    class StubClient:
+        def get_wireguard_interface(self, interface):
+            assert interface == "wg0"
+            return WGInterfaceConfig(
+                name="wg0",
+                public_key="server-public",
+                listen_port=51820,
+                addresses=["10.65.74.1/24"],
+            )
+
+        def get_primary_ipv4(self):
+            return "203.0.113.10"
+
+    monkeypatch.setattr(routes_module, "make_client", lambda router: StubClient())
+
+    response = client.get(f"/api/routers/{router_id}/interfaces/wg0")
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "name": "wg0",
+        "public_key": "server-public",
+        "listen_port": 51820,
+        "public_host": "203.0.113.10",
+        "addresses": ["10.65.74.1/24"],
+    }
+
+
 def test_settings_round_trip_dashboard_scope(client):
     payload = client.get("/api/settings").json()
     payload["dashboard_router_scope"] = "selected"
@@ -232,6 +377,19 @@ def test_settings_invalid_selected_router_json_sanitized(client):
     response = client.get("/api/settings")
     assert response.status_code == 200
     assert response.json()["dashboard_selected_router_ids"] == []
+
+
+def test_settings_legacy_active_scope_sanitized_to_all(client):
+    db = SessionLocal()
+    try:
+        db.add(SettingsKV(key="dashboard_router_scope", value="active"))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+    assert response.json()["dashboard_router_scope"] == "all"
 
 
 def test_peers_router_ids_take_precedence_over_router_id(client):
@@ -324,7 +482,7 @@ def test_dashboard_live_status_fetches_router_scope_once(client, monkeypatch):
                 )
             ]
 
-    monkeypatch.setattr("backend.api.routes.make_client", lambda router: StubClient(router.id))
+    monkeypatch.setattr("backend.api.routes.make_client", lambda router, **_: StubClient(router.id))
 
     response = client.get(
         f"/api/dashboard/live_status?router_ids={seeded['router1_id']}&router_ids={seeded['router2_id']}"
@@ -348,6 +506,559 @@ def test_dashboard_live_status_fetches_router_scope_once(client, monkeypatch):
     ]
 
 
+def test_dashboard_live_status_returns_reachable_router_when_other_fails(client, monkeypatch):
+    """Unreachable routers must not prevent live status for routers that respond."""
+    seeded = seed_router_data()
+
+    class StubClient:
+        def __init__(self, router_id: int):
+            self.router_id = router_id
+
+        def list_all_wireguard_peers(self):
+            if self.router_id == seeded["router2_id"]:
+                raise OSError("unreachable")
+            return [
+                SimpleNamespace(
+                    interface="wg0",
+                    public_key="pub-a",
+                    disabled=False,
+                    last_handshake=12,
+                )
+            ]
+
+    monkeypatch.setattr("backend.api.routes.make_client", lambda router, **_: StubClient(router.id))
+
+    response = client.get(
+        f"/api/dashboard/live_status?router_ids={seeded['router1_id']}&router_ids={seeded['router2_id']}"
+    )
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert rows == [
+        {
+            "peer_id": seeded["peer1_id"],
+            "online": True,
+            "raw_last_handshake": 12,
+        }
+    ]
+
+
+def test_dashboard_live_status_skips_disabled_router(client, monkeypatch):
+    """Paused (enabled=False) routers must not be polled and must not appear in live status."""
+    seeded = seed_router_data()
+    db = SessionLocal()
+    try:
+        r2 = db.get(Router, seeded["router2_id"])
+        r2.enabled = False
+        db.commit()
+    finally:
+        db.close()
+
+    seen_router_ids: list[int] = []
+
+    class StubClient:
+        def __init__(self, router_id: int):
+            self.router_id = router_id
+
+        def list_all_wireguard_peers(self):
+            seen_router_ids.append(self.router_id)
+            return [
+                SimpleNamespace(
+                    interface="wg0",
+                    public_key="pub-a",
+                    disabled=False,
+                    last_handshake=4,
+                )
+            ]
+
+    monkeypatch.setattr("backend.api.routes.make_client", lambda router, **_: StubClient(router.id))
+
+    response = client.get(
+        f"/api/dashboard/live_status?router_ids={seeded['router1_id']}&router_ids={seeded['router2_id']}"
+    )
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert seeded["router2_id"] not in seen_router_ids
+    assert rows == [
+        {
+            "peer_id": seeded["peer1_id"],
+            "online": True,
+            "raw_last_handshake": 4,
+        }
+    ]
+
+
+def test_router_create_and_update_enabled_field(client, monkeypatch):
+    class StubClient:
+        def get_system_version(self):
+            return "7.15"
+
+    monkeypatch.setattr(routes_module, "make_client", lambda router: StubClient())
+
+    create_resp = client.post(
+        "/api/routers",
+        json={
+            "name": "Toggle",
+            "host": "10.0.0.99",
+            "proto": "rest",
+            "port": 443,
+            "username": "admin",
+            "password": "pw",
+            "tls_verify": True,
+        },
+    )
+    assert create_resp.status_code == 200, create_resp.text
+    body = create_resp.json()
+    assert body["enabled"] is True
+    router_id = body["id"]
+
+    pause = client.put(f"/api/routers/{router_id}", json={"enabled": False})
+    assert pause.status_code == 200, pause.text
+    assert pause.json()["enabled"] is False
+
+    listing = client.get("/api/routers").json()
+    matched = next(r for r in listing if r["id"] == router_id)
+    assert matched["enabled"] is False
+
+    resume = client.put(f"/api/routers/{router_id}", json={"enabled": True})
+    assert resume.status_code == 200, resume.text
+    assert resume.json()["enabled"] is True
+
+
+def test_router_create_rejects_unsupported_routeros(client, monkeypatch):
+    class StubClient:
+        def get_system_version(self):
+            return "7.14.3"
+
+    monkeypatch.setattr(routes_module, "make_client", lambda router: StubClient())
+
+    response = client.post(
+        "/api/routers",
+        json={
+            "name": "Old ROS",
+            "host": "10.0.0.14",
+            "proto": "rest",
+            "port": 443,
+            "username": "admin",
+            "password": "pw",
+            "tls_verify": True,
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "RouterOS 7.15+ is required" in response.json()["detail"]
+
+
+def test_scheduler_skips_disabled_router(client, monkeypatch):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Paused",
+            host="10.0.0.50",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret-paused",
+            tls_verify=True,
+            enabled=False,
+        )
+        db.add(router)
+        db.flush()
+        peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="peer-paused",
+            public_key="pub-paused",
+            allowed_address="10.0.0.50/32",
+            disabled=False,
+            selected=True,
+        )
+        db.add(peer)
+        db.commit()
+        peer_id = peer.id
+    finally:
+        db.close()
+
+    called: list[int] = []
+
+    class StubClient:
+        def list_wireguard_peers(self, iface):
+            called.append(1)
+            return []
+
+        def set_peer_disabled(self, iface, ros_id, disabled):
+            return None
+
+    monkeypatch.setattr("backend.scheduler.make_client", lambda router: StubClient())
+    scheduler_module._poll_once()
+    assert called == [], "scheduler must not connect to a paused router"
+
+    db = SessionLocal()
+    try:
+        samples = db.query(UsageSample).filter(UsageSample.peer_id == peer_id).all()
+        assert samples == []
+    finally:
+        db.close()
+
+
+def test_scheduler_marks_selected_peer_missing_without_hiding(client, monkeypatch):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Drift Router",
+            host="10.0.0.70",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret",
+            tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
+        )
+        db.add(router)
+        db.flush()
+        peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="missing-peer",
+            public_key="pub-missing",
+            allowed_address="10.0.0.70/32",
+            disabled=False,
+            selected=True,
+        )
+        db.add(peer)
+        db.commit()
+        peer_id = peer.id
+    finally:
+        db.close()
+
+    class StubClient:
+        def list_all_wireguard_peers(self):
+            return []
+
+    monkeypatch.setattr("backend.scheduler.make_client", lambda router: StubClient())
+    scheduler_module._poll_once()
+
+    db = SessionLocal()
+    try:
+        peer = db.get(Peer, peer_id)
+        assert peer is not None
+        assert peer.selected is True
+        assert peer.router_sync_status == "missing"
+        assert db.query(Action).filter(Action.peer_id == peer_id, Action.action == "router_missing").count() == 1
+    finally:
+        db.close()
+
+
+def test_scheduler_creates_and_removes_pending_new_peer(client, monkeypatch):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="New Peer Router",
+            host="10.0.0.71",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret",
+            tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
+        )
+        db.add(router)
+        db.commit()
+        router_id = router.id
+    finally:
+        db.close()
+
+    live_rows = [
+        SimpleNamespace(
+            interface="wg0",
+            public_key="pub-new",
+            ros_id="*7",
+            name="new-peer",
+            allowed_address="10.0.0.71/32",
+            disabled=False,
+            rx_bytes=0,
+            tx_bytes=0,
+            endpoint="",
+            client_endpoint="",
+            last_handshake=None,
+        )
+    ]
+
+    class StubClient:
+        def list_all_wireguard_peers(self):
+            return list(live_rows)
+
+    monkeypatch.setattr("backend.scheduler.make_client", lambda router: StubClient())
+    scheduler_module._poll_once()
+
+    db = SessionLocal()
+    try:
+        peer = db.query(Peer).filter(Peer.router_id == router_id, Peer.public_key == "pub-new").one()
+        assert peer.selected is False
+        assert peer.router_sync_status == "new"
+        peer_id = peer.id
+    finally:
+        db.close()
+
+    live_rows.clear()
+    scheduler_module._poll_once()
+
+    db = SessionLocal()
+    try:
+        assert db.get(Peer, peer_id) is None
+    finally:
+        db.close()
+
+
+def test_scheduler_keeps_pending_new_peer_flagged_while_present(client, monkeypatch):
+    """A RouterOS-discovered peer must stay 'new'/unselected across polls until an admin
+    accepts or hides it; it must not silently auto-resolve to 'synced' and drop into the
+    hidden list while still present on the router."""
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Sticky New Peer Router",
+            host="10.0.0.74",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret",
+            tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
+        )
+        db.add(router)
+        db.commit()
+        router_id = router.id
+    finally:
+        db.close()
+
+    live_rows = [
+        SimpleNamespace(
+            interface="wg0",
+            public_key="pub-sticky-new",
+            ros_id="*9",
+            name="sticky-new",
+            allowed_address="10.0.0.74/32",
+            disabled=False,
+            rx_bytes=0,
+            tx_bytes=0,
+            endpoint="",
+            client_endpoint="",
+            last_handshake=None,
+        )
+    ]
+
+    class StubClient:
+        def list_all_wireguard_peers(self):
+            return list(live_rows)
+
+    monkeypatch.setattr("backend.scheduler.make_client", lambda router: StubClient())
+    monkeypatch.setattr(scheduler_module, "_enforce_fair_usage", lambda db, peer, client, now_utc: None)
+
+    scheduler_module._poll_once()
+    scheduler_module._poll_once()
+
+    db = SessionLocal()
+    try:
+        peer = db.query(Peer).filter(Peer.router_id == router_id, Peer.public_key == "pub-sticky-new").one()
+        assert peer.selected is False
+        assert peer.router_sync_status == "new"
+    finally:
+        db.close()
+
+
+def test_scheduler_clears_missing_when_peer_reappears(client, monkeypatch):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Reappear Router",
+            host="10.0.0.72",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret",
+            tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
+        )
+        db.add(router)
+        db.flush()
+        peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="old-name",
+            public_key="pub-return",
+            allowed_address="10.0.0.72/32",
+            disabled=False,
+            selected=True,
+            router_sync_status="missing",
+        )
+        db.add(peer)
+        db.commit()
+        peer_id = peer.id
+    finally:
+        db.close()
+
+    class StubClient:
+        def list_all_wireguard_peers(self):
+            return [
+                SimpleNamespace(
+                    interface="wg0",
+                    public_key="pub-return",
+                    ros_id="*2",
+                    name="returned",
+                    allowed_address="10.0.0.73/32",
+                    disabled=False,
+                    rx_bytes=10,
+                    tx_bytes=5,
+                    endpoint="",
+                    client_endpoint="",
+                    last_handshake=None,
+                )
+            ]
+
+    monkeypatch.setattr("backend.scheduler.make_client", lambda router: StubClient())
+    monkeypatch.setattr(scheduler_module, "_enforce_fair_usage", lambda db, peer, client, now_utc: None)
+    scheduler_module._poll_once()
+
+    db = SessionLocal()
+    try:
+        peer = db.get(Peer, peer_id)
+        assert peer is not None
+        assert peer.router_sync_status == "synced"
+        assert peer.ros_id == "*2"
+        assert peer.name == "returned"
+        assert db.query(UsageSample).filter(UsageSample.peer_id == peer_id).count() == 1
+    finally:
+        db.close()
+
+
+def test_resolve_missing_peer_hide_and_delete_are_local(client, monkeypatch):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Resolve Missing",
+            host="10.0.0.74",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret",
+            tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
+        )
+        db.add(router)
+        db.flush()
+        hide_peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="hide",
+            public_key="pub-hide-missing",
+            allowed_address="10.0.0.74/32",
+            disabled=False,
+            selected=True,
+            router_sync_status="missing",
+        )
+        delete_peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*2",
+            name="delete",
+            public_key="pub-delete-missing",
+            allowed_address="10.0.0.75/32",
+            disabled=False,
+            selected=True,
+            router_sync_status="missing",
+        )
+        db.add_all([hide_peer, delete_peer])
+        db.commit()
+        hide_id = hide_peer.id
+        delete_id = delete_peer.id
+    finally:
+        db.close()
+
+    def fail_make_client(router):
+        raise AssertionError("resolve must not touch RouterOS")
+
+    monkeypatch.setattr(routes_module, "make_client", fail_make_client)
+
+    hide_resp = client.post(f"/api/peers/{hide_id}/router-sync/resolve", json={"action": "hide"})
+    assert hide_resp.status_code == 200, hide_resp.text
+    assert hide_resp.json()["selected"] is False
+    assert hide_resp.json()["router_sync_status"] == "synced"
+
+    delete_resp = client.post(f"/api/peers/{delete_id}/router-sync/resolve", json={"action": "delete"})
+    assert delete_resp.status_code == 200, delete_resp.text
+    assert delete_resp.json()["router_deleted"] is False
+
+    db = SessionLocal()
+    try:
+        assert db.get(Peer, delete_id) is None
+    finally:
+        db.close()
+
+
+def test_resolve_new_peer_accept_or_hide(client):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Resolve New",
+            host="10.0.0.76",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret",
+            tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
+        )
+        db.add(router)
+        db.flush()
+        accept_peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="accept",
+            public_key="pub-accept-new",
+            allowed_address="10.0.0.76/32",
+            disabled=False,
+            selected=False,
+            router_sync_status="new",
+        )
+        hide_peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*2",
+            name="hide",
+            public_key="pub-hide-new",
+            allowed_address="10.0.0.77/32",
+            disabled=False,
+            selected=False,
+            router_sync_status="new",
+        )
+        db.add_all([accept_peer, hide_peer])
+        db.commit()
+        accept_id = accept_peer.id
+        hide_id = hide_peer.id
+    finally:
+        db.close()
+
+    accept_resp = client.post(f"/api/peers/{accept_id}/router-sync/resolve", json={"action": "accept"})
+    assert accept_resp.status_code == 200, accept_resp.text
+    assert accept_resp.json()["selected"] is True
+    assert accept_resp.json()["router_sync_status"] == "synced"
+
+    hide_resp = client.post(f"/api/peers/{hide_id}/router-sync/resolve", json={"action": "hide"})
+    assert hide_resp.status_code == 200, hide_resp.text
+    assert hide_resp.json()["selected"] is False
+    assert hide_resp.json()["router_sync_status"] == "synced"
+
+
 def test_scheduler_upserts_usage_minute_with_counter_resets(client, monkeypatch):
     db = SessionLocal()
     try:
@@ -359,6 +1070,8 @@ def test_scheduler_upserts_usage_minute_with_counter_resets(client, monkeypatch)
             username="admin",
             secret_enc="secret-a",
             tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
         )
         db.add(router)
         db.flush()
@@ -393,10 +1106,11 @@ def test_scheduler_upserts_usage_minute_with_counter_resets(client, monkeypatch)
             return cls.current.astimezone(tz)
 
     class StubClient:
-        def list_wireguard_peers(self, iface):
+        def list_all_wireguard_peers(self):
             rx, tx = next(live_values)
             return [
                 SimpleNamespace(
+                    interface="wg0",
                     public_key="pub-a",
                     ros_id="*1",
                     name="peer-a",
@@ -559,6 +1273,7 @@ def test_renew_peer_keys_updates_router_db_and_scheduler_match(client, monkeypat
         def list_wireguard_peers(self, iface):
             return [
                 SimpleNamespace(
+                    interface=iface,
                     public_key=new_public,
                     ros_id="*9",
                     name="peer-renew",
@@ -569,6 +1284,9 @@ def test_renew_peer_keys_updates_router_db_and_scheduler_match(client, monkeypat
                     endpoint="198.51.100.10:51820",
                 )
             ]
+
+        def list_all_wireguard_peers(self):
+            return self.list_wireguard_peers("wg0")
 
     stub_client = StubClient()
     monkeypatch.setattr(routes_module, "_generate_wg_keypair_b64", lambda: (new_private, new_public))

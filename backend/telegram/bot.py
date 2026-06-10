@@ -16,6 +16,7 @@ from ..db import SessionLocal
 from ..models import SettingsKV
 from ..security import SecretBox
 from ..settings import settings
+from .i18n import t
 
 logger = logging.getLogger("wgmik.telegram")
 
@@ -24,6 +25,26 @@ _bot_loop: Optional[asyncio.AbstractEventLoop] = None
 _bot_stop_event: Optional[asyncio.Event] = None
 _bot_started_at: Optional[datetime] = None
 _bot_running: bool = False
+
+
+def _bot_commands_for_language(lang: str):
+    from aiogram.types import BotCommand
+
+    return [
+        BotCommand(command="start", description=t("cmd_desc_start", lang)),
+        BotCommand(command="home", description=t("cmd_desc_home", lang)),
+        BotCommand(command="today", description=t("cmd_desc_today", lang)),
+        BotCommand(command="monthly", description=t("cmd_desc_monthly", lang)),
+        BotCommand(command="alltime", description=t("cmd_desc_alltime", lang)),
+        BotCommand(command="calendar", description=t("cmd_desc_calendar", lang)),
+        BotCommand(command="fair", description=t("cmd_desc_fair", lang)),
+        BotCommand(command="settings", description=t("cmd_desc_settings", lang)),
+    ]
+
+
+async def _sync_bot_commands(bot) -> None:
+    await bot.set_my_commands(_bot_commands_for_language("en"))
+    await bot.set_my_commands(_bot_commands_for_language("fa"), language_code="fa")
 
 
 def _get_tg_settings() -> dict:
@@ -68,6 +89,10 @@ def _run_bot(token: str) -> None:
         from .handlers import register_handlers
 
         bot = Bot(token=token)
+        try:
+            await _sync_bot_commands(bot)
+        except Exception:
+            logger.exception("Telegram bot command sync failed")
         dp = Dispatcher()
         register_handlers(dp)
 

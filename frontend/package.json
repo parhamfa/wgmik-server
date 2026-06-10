@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "remotion:studio": "remotion studio src/remotion/index.ts",
+    "remotion:render": "remotion render src/remotion/index.ts WgmikIntro out/wgmik-intro.mp4",
+    "remotion:render:gif": "remotion render src/remotion/index.ts WgmikIntro out/wgmik-intro.gif"
   },
   "dependencies": {
     "framer-motion": "^12.23.24",
@@ -18,11 +21,14 @@
     "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
+    "@remotion/cli": "^4.0.475",
+    "@remotion/tailwind": "^4.0.475",
     "@types/react": "^18.2.56",
     "@types/react-dom": "^18.2.19",
     "@vitejs/plugin-react": "^4.3.2",
     "autoprefixer": "^10.4.19",
     "postcss": "^8.4.38",
+    "remotion": "^4.0.475",
     "tailwindcss": "^3.4.10",
     "typescript": "^5.6.2",
     "vite": "^5.4.2"

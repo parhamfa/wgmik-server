@@ -1,5 +1,6 @@
 import React from "react";
 import type { FairUsagePeerStatusDTO, FairUsageRuleStatusItemDTO } from "../api";
+import { formatCalendarDateTime } from "../datetimeLocal";
 
 function fmtBytes(n: number) {
   if (!n || n <= 0) return "0 B";
@@ -19,7 +20,7 @@ function effectiveThrottleForRule(fr: FairUsageRuleStatusItemDTO): { dl: number;
 }
 
 export default function FairUsageRender() {
-  const [data, setData] = React.useState<{ status: FairUsagePeerStatusDTO; peerName: string } | null>(null);
+  const [data, setData] = React.useState<{ status: FairUsagePeerStatusDTO; peerName: string; timezone?: string; dateCalendar?: string } | null>(null);
   const [error, setError] = React.useState("");
 
   React.useEffect(() => {
@@ -39,6 +40,8 @@ export default function FairUsageRender() {
   const fuStatus = data.status;
   const fuRules = fuStatus.rules || [];
   const peerName = data.peerName || "Peer";
+  const timezone = data.timezone || "UTC";
+  const dateCalendar = data.dateCalendar || "gregorian";
   const effectiveFuRule = fuRules.find((r) => r.is_effective) ?? (fuStatus.rule_id ? fuRules.find((r) => r.rule_id === fuStatus.rule_id) : undefined);
 
   return (
@@ -182,18 +185,8 @@ export default function FairUsageRender() {
                 <div className="text-xs text-gray-500 dark:text-gray-400">
                   Resets:{" "}
                   {fr.scope_period_unit === "hour"
-                    ? new Date(fr.next_reset).toLocaleString(undefined, {
-                        month: "short",
-                        day: "numeric",
-                        year: "numeric",
-                        hour: "numeric",
-                        minute: "2-digit",
-                      })
-                    : new Date(fr.next_reset).toLocaleDateString(undefined, {
-                        month: "short",
-                        day: "numeric",
-                        year: "numeric",
-                      })}
+                    ? formatCalendarDateTime(fr.next_reset, { timeZone: timezone, dateCalendar, includeTime: true })
+                    : formatCalendarDateTime(fr.next_reset, { timeZone: timezone, dateCalendar, includeTime: false })}
                 </div>
               )}
             </div>

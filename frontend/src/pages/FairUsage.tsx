@@ -8,7 +8,7 @@ import {
   assignPeersToRule,
   unassignPeerFromRule,
   listRouters,
-  listSavedPeers,
+  listSavedPeersSelected,
   type FairUsageRuleDTO,
   type FairUsageRuleCreateDTO,
   type FairUsageTierInputDTO,
@@ -73,7 +73,8 @@ const EMPTY_FORM = {
 };
 
 function toBytes(value: number, unit: "gb" | "mb") {
-  return unit === "gb" ? value * 1024 * 1024 * 1024 : value * 1024 * 1024;
+  const multiplier = unit === "gb" ? 1024 * 1024 * 1024 : 1024 * 1024;
+  return Math.round(value * multiplier);
 }
 
 function fromBytes(bytes: number): { value: number; unit: "gb" | "mb" } {
@@ -129,7 +130,7 @@ export default function FairUsagePage() {
 
   const load = React.useCallback(async () => {
     try {
-      const [r, rt, p] = await Promise.all([listFairUsageRules(), listRouters(), listSavedPeers()]);
+      const [r, rt, p] = await Promise.all([listFairUsageRules(), listRouters(), listSavedPeersSelected()]);
       setRules(r);
       setRouters(rt);
       setPeers(p);
@@ -679,7 +680,7 @@ export default function FairUsagePage() {
                 )}
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
+              <div className="grid grid-cols-2 gap-4">
                 <div className="grid gap-1">
                   <label className="text-xs text-gray-500 dark:text-gray-400">Throttle download (kbps)</label>
                   <input
@@ -803,8 +804,8 @@ export default function FairUsagePage() {
           <div className="grid gap-4">
             {rules.map(rule => (
               <Card key={rule.id} className="p-5 !hover:shadow-md !hover:-translate-y-0">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="text-sm font-medium text-gray-900 dark:text-gray-100">{rule.name}</span>
                       <span className="rounded-full bg-gray-100 text-gray-700 px-2 py-0.5 text-[11px] dark:bg-gray-800 dark:text-gray-300">
@@ -842,7 +843,7 @@ export default function FairUsagePage() {
                       )}
                     </div>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
+                  <div className="flex shrink-0 flex-wrap items-center gap-2">
                     <button
                       onClick={() => moveRule(rule.id, -1)}
                       className="rounded-full bg-gray-100 text-gray-800 px-2.5 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"

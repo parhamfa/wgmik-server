@@ -17,6 +17,10 @@ class Router(Base):
     username: Mapped[str] = mapped_column(String(255))
     secret_enc: Mapped[str] = mapped_column(String)
     tls_verify: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    ros_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    ros_version_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    ros_supported: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
 
     peers: Mapped[list[Peer]] = relationship("Peer", back_populates="router", cascade="all, delete-orphan")
 
@@ -34,6 +38,9 @@ class Peer(Base):
     comment: Mapped[str] = mapped_column(String(255), default="")
     disabled: Mapped[bool] = mapped_column(Boolean, default=False)
     selected: Mapped[bool] = mapped_column(Boolean, default=True)
+    router_sync_status: Mapped[str] = mapped_column(String(16), default="synced", server_default="synced")
+    router_sync_first_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    router_sync_last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     router: Mapped[Router] = relationship("Router", back_populates="peers")
 
@@ -91,6 +98,22 @@ class UsageMonthly(Base):
     __table_args__ = (
         UniqueConstraint("peer_id", "month_key", name="uq_month_peer"),
     )
+
+
+class PeerTotalsMerge(Base):
+    __tablename__ = "peer_totals_merge"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_peer_id: Mapped[int] = mapped_column(ForeignKey("peers.id", ondelete="CASCADE"), unique=True, index=True)
+    target_peer_id: Mapped[int] = mapped_column(ForeignKey("peers.id", ondelete="CASCADE"), index=True)
+    source_router_id: Mapped[int] = mapped_column(ForeignKey("routers.id", ondelete="CASCADE"))
+    target_router_id: Mapped[int] = mapped_column(ForeignKey("routers.id", ondelete="CASCADE"))
+    merge_mode: Mapped[str] = mapped_column(String(32), default="totals_only")
+    match_type: Mapped[str] = mapped_column(String(64), default="")
+    usage_minute_rows: Mapped[int] = mapped_column(Integer, default=0)
+    usage_daily_rows: Mapped[int] = mapped_column(Integer, default=0)
+    usage_monthly_rows: Mapped[int] = mapped_column(Integer, default=0)
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Quota(Base):
@@ -198,7 +221,25 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     hashed_password: Mapped[str] = mapped_column(String)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    session_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    password_changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class UserSecurityEvent(Base):
+    __tablename__ = "user_security_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    actor_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    target_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    detail: Mapped[str] = mapped_column(String, default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 # ── Telegram bot tables ──────────────────────────────────────────────

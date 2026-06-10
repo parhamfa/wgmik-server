@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Mapping, Optional, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -17,12 +17,12 @@ from ..models import (
 from ..fair_usage_sync import evaluate_fair_usage_chain, get_applicable_fair_usage_rules, is_rule_over_quota
 from ..fair_usage_tiers import active_tier_for_combined_usage, ordered_tiers_for_rule
 from ..fair_usage_usage import (
-    app_zoneinfo,
     compute_next_reset_utc_for_rule,
     format_scope_label,
     normalize_scope_period,
     peer_scope_usage_for_rule,
 )
+from ..calendar_utils import format_app_datetime
 from .i18n import t
 
 
@@ -36,12 +36,42 @@ def _fmt_bytes(b: int) -> str:
     return f"{mb:.1f} MB" if mb != int(mb) else f"{int(mb)} MB"
 
 
+def usage_point_totals(points: Sequence[Mapping[str, object]]) -> tuple[int, int]:
+    """Sum chart point rows into RX/TX totals."""
+    total_rx = 0
+    total_tx = 0
+    for point in points:
+        total_rx += int(point.get("rx", 0) or 0)
+        total_tx += int(point.get("tx", 0) or 0)
+    return total_rx, total_tx
+
+
+def format_usage_total_summary(
+    scope_label: str,
+    peer_count: int,
+    rx_bytes: int,
+    tx_bytes: int,
+    lang: str = "en",
+) -> str:
+    """
+    Text summary appended after multi-peer usage charts.
+
+    Keep download/upload labels aligned with the chart renderer, where TX is shown as
+    download and RX is shown as upload.
+    """
+    return "\n".join(
+        [
+            t("usage_total_header", lang, count=str(peer_count), scope=scope_label),
+            f"\u2b07 {t('usage_total_download', lang, value=_fmt_bytes(tx_bytes))}",
+            f"\u2b06 {t('usage_total_upload', lang, value=_fmt_bytes(rx_bytes))}",
+            f"\u2211 {t('usage_total_sum', lang, value=_fmt_bytes(rx_bytes + tx_bytes))}",
+        ]
+    )
+
+
 def _format_next_reset_wall_clock(next_reset_utc: datetime) -> str:
     """Next reset instant formatted in the app timezone (Settings / global timezone)."""
-    if next_reset_utc.tzinfo is None:
-        next_reset_utc = next_reset_utc.replace(tzinfo=timezone.utc)
-    local = next_reset_utc.astimezone(app_zoneinfo())
-    return local.strftime("%Y-%m-%d %H:%M")
+    return format_app_datetime(next_reset_utc, include_time=True)
 
 
 def format_next_reset_from_iso(iso_str: str | None, lang: str = "en") -> str:

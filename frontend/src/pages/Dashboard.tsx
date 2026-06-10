@@ -4,12 +4,17 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import QRCode from "react-qr-code";
 import nacl from "tweetnacl";
 import { useAutoSaveSettings } from "../useAutoSaveSettings";
-import { useLooseNumberInput } from "../hooks/useLooseNumberInput";
-import { formatDatetimeLocalValue } from "../datetimeLocal";
+import UsageTimeControls, { normalizeUsageTimeMode } from "../UsageTimeControls";
+import {
+  formatCalendarDateTime,
+  formatCalendarDayLabel,
+  startOfLocalTodayValue,
+  startOfSelectedCalendarMonthValue,
+  zonedWallTimeValueToUtcIso,
+} from "../datetimeLocal";
 import {
   createRouterPeer,
   getDashboardLiveStatus,
-  getActiveRouter,
   getMetrics,
   getMonthlySummary,
   getMonthlySummaryByRouter,
@@ -17,8 +22,9 @@ import {
   getSummaryRaw,
   getSummaryRawByRouter,
   listInterfaces,
+  listPeers,
   listRouters,
-  listSavedPeersSelected,
+  routerPeers,
   routerInterfaceDetail,
   type Metrics,
   type MonthlySummaryPoint,
@@ -30,12 +36,11 @@ import {
 } from "../api";
 
 type ScopeUnit = "minutes" | "hours" | "days";
-type RouterScope = "all" | "active" | "selected";
+type RouterScope = "all" | "selected";
 
 type PeerStatus = { online: boolean; last: string; raw_last_handshake: number };
 type UsageTotals = { rx: number; tx: number };
 
-const ROUTER_PEER_PREVIEW_COUNT = 6;
 const FILTER_STATUS_VALUES = new Set(["all", "online", "offline", "enabled", "disabled"]);
 
 function Card({ className = "", ...props }: React.HTMLAttributes<HTMLDivElement>) {
@@ -71,6 +76,24 @@ function FairUsageShieldIcon({ throttled }: { throttled: boolean }) {
     >
       <path d={path} />
     </svg>
+  );
+}
+
+function RouterSyncWarningBadge({ status }: { status?: string }) {
+  if (!status || status === "synced") return null;
+  const label = status === "missing" ? "Missing on RouterOS" : "New on RouterOS";
+  return (
+    <span
+      className="absolute right-3 top-3 z-10 inline-flex h-6 w-6 items-center justify-center rounded-full bg-rose-600 shadow ring-2 ring-white dark:ring-gray-900"
+      title={label}
+      aria-label={label}
+    >
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" className="h-3.5 w-3.5 text-white" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+        <path d="M12 8v5" />
+        <path d="M12 17h.01" />
+        <path d="M10.2 3.4 2.7 18a2 2 0 0 0 1.8 2.9h15a2 2 0 0 0 1.8-2.9L13.8 3.4a2 2 0 0 0-3.6 0Z" />
+      </svg>
+    </span>
   );
 }
 
@@ -110,6 +133,115 @@ function formatRelativeHandshake(ageSec?: number) {
   if (h < 24) return `${h}h ago`;
   if (d < 30) return `${d}d ago`;
   return `${mon}mo ago`;
+}
+
+function initialAddPeerForm(routerId: number | null) {
+  return {
+    routerId,
+    interface: "wgmik",
+    name: "",
+    allowed: "",
+    privateKey: "",
+    publicKey: "",
+    serverPublicKey: "",
+    endpointHost: "",
+    endpointPort: "51820",
+    configName: "",
+    customEndpoint: "",
+    dns: "8.8.8.8, 1.1.1.1",
+    mtu: "1280",
+    persistentKeepalive: "25",
+    allowedIps: "0.0.0.0/0, ::/0",
+    presharedKey: "",
+  };
+}
+
+function resolveClientEndpoint(customEndpoint: string, endpointHost: string, endpointPort: string | number) {
+  const port = Number(endpointPort) || 51820;
+  const customEp = customEndpoint.trim();
+  const defaultHost = endpointHost.trim();
+  const defaultEndpoint = defaultHost ? `${defaultHost}:${port}` : "HOST:PORT";
+  if (!customEp) return defaultEndpoint;
+  if (customEp.startsWith("[") && customEp.includes("]")) {
+    return customEp.includes("]:") ? customEp : `${customEp}:${port}`;
+  }
+  if (/:[0-9]{1,5}$/.test(customEp)) return customEp;
+  if (customEp.includes(":")) return `[${customEp}]:${port}`;
+  return `${customEp}:${port}`;
+}
+
+function isValidWgBase64Key(value: string) {
+  const key = value.trim();
+  if (!key) return false;
+  try {
+    return atob(key).length === 32;
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeConfigFileBase(name: string, fallback: string) {
+  const raw = name.trim() || fallback.trim() || "wg-peer";
+  const safe = raw.replace(/[/\\?%*:|"<>]/g, "_").replace(/\s+/g, "_").slice(0, 120);
+  return safe || "wg-peer";
+}
+
+function ipv4ToBigInt(value: string): bigint | null {
+  const parts = value.trim().split(".");
+  if (parts.length !== 4) return null;
+  let out = 0n;
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null;
+    const n = Number(part);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    out = (out << 8n) + BigInt(n);
+  }
+  return out;
+}
+
+function bigIntToIpv4(value: bigint) {
+  return [24n, 16n, 8n, 0n].map((shift) => Number((value >> shift) & 255n)).join(".");
+}
+
+function firstAddressPart(value: string) {
+  return value.split(",")[0]?.trim() || "";
+}
+
+function findAvailableInterfaceAddress(interfaceAddresses: string[] = [], peersForInterface: Array<{ allowed_address?: string }>) {
+  const used = new Set<bigint>();
+  for (const peer of peersForInterface) {
+    const first = firstAddressPart(peer.allowed_address || "");
+    const ip = ipv4ToBigInt(first.split("/")[0] || "");
+    if (ip !== null) used.add(ip);
+  }
+
+  for (const addr of interfaceAddresses) {
+    const [ipText, prefixText] = addr.trim().split("/");
+    const routerIp = ipv4ToBigInt(ipText || "");
+    const prefix = Number(prefixText);
+    if (routerIp === null || !Number.isInteger(prefix) || prefix < 1 || prefix > 30) continue;
+
+    const hostBits = 32 - prefix;
+    const size = 1n << BigInt(hostBits);
+    const mask = (0xffffffffn << BigInt(hostBits)) & 0xffffffffn;
+    const network = routerIp & mask;
+    const firstHost = network + 1n;
+    const lastHost = network + size - 2n;
+    if (firstHost > lastHost) continue;
+
+    const scan = (start: bigint, end: bigint): bigint | null => {
+      for (let candidate = start; candidate <= end; candidate += 1n) {
+        if (candidate === routerIp || used.has(candidate)) continue;
+        return candidate;
+      }
+      return null;
+    };
+
+    const afterRouter = routerIp < lastHost ? scan(routerIp + 1n, lastHost) : null;
+    const wrapped = afterRouter ?? scan(firstHost, routerIp > firstHost ? routerIp - 1n : lastHost);
+    if (wrapped !== null) return `${bigIntToIpv4(wrapped)}/32`;
+  }
+  return "";
 }
 
 function buildChartData(
@@ -176,12 +308,14 @@ function UsageChart({
   monthly,
   raw,
   timezone,
+  dateCalendar,
   emptyLabel,
 }: {
   scopeUnit: ScopeUnit;
   monthly: MonthlySummaryPoint[];
   raw: SummaryRawPoint[];
   timezone: string;
+  dateCalendar: string;
   emptyLabel: string;
 }) {
   const chartId = React.useId().replace(/:/g, "");
@@ -211,12 +345,7 @@ function UsageChart({
           tickFormatter={(val: string) => {
             try {
               if (scopeUnit === "days") {
-                const d = new Date(`${val}T00:00:00Z`);
-                return new Intl.DateTimeFormat(undefined, {
-                  timeZone: timezone || "UTC",
-                  month: "numeric",
-                  day: "numeric",
-                }).format(d);
+                return formatCalendarDayLabel(val, { timeZone: timezone || "UTC", dateCalendar });
               }
               const d = new Date(val);
               return new Intl.DateTimeFormat(undefined, {
@@ -235,16 +364,9 @@ function UsageChart({
           labelFormatter={(label) => {
             try {
               if (scopeUnit === "days") {
-                return new Intl.DateTimeFormat(undefined, {
-                  timeZone: timezone || "UTC",
-                  dateStyle: "full",
-                }).format(new Date(`${label}T00:00:00Z`));
+                return formatCalendarDayLabel(String(label), { timeZone: timezone || "UTC", dateCalendar, long: true });
               }
-              return new Intl.DateTimeFormat(undefined, {
-                timeZone: timezone || "UTC",
-                dateStyle: "medium",
-                timeStyle: "medium",
-              }).format(new Date(label));
+              return formatCalendarDateTime(new Date(label), { timeZone: timezone || "UTC", dateCalendar, includeTime: true });
             } catch {
               return label;
             }
@@ -313,7 +435,6 @@ export default function Dashboard() {
 
   const [setupOk, setSetupOk] = React.useState<null | boolean>(null);
   const [routers, setRouters] = React.useState<Router[]>([]);
-  const [activeRouterId, setActiveRouterId] = React.useState<number | null>(null);
   const [monthly, setMonthly] = React.useState<MonthlySummaryPoint[]>([]);
   const [raw, setRaw] = React.useState<SummaryRawPoint[]>([]);
   const [monthlyByRouter, setMonthlyByRouter] = React.useState<RouterMonthlySummaryPoint[]>([]);
@@ -324,12 +445,11 @@ export default function Dashboard() {
   const [fairUsageThrottledByPeer, setFairUsageThrottledByPeer] = React.useState<Record<number, boolean>>({});
   const [statusMap, setStatusMap] = React.useState<Record<number, PeerStatus>>({});
   const [metrics, setMetrics] = React.useState<Metrics | null>(null);
-  const [timeFrom, setTimeFrom] = React.useState("");
-  const [timeTo, setTimeTo] = React.useState("");
-  const [allTime, setAllTime] = React.useState(false);
   const [todayTick, setTodayTick] = React.useState(0);
   const [localFilterText, setLocalFilterText] = React.useState("");
   const [expandedRouters, setExpandedRouters] = React.useState<Record<number, boolean>>({});
+  const [showHiddenPeersByRouter, setShowHiddenPeersByRouter] = React.useState<Record<number, boolean>>({});
+  const [routerLoadError, setRouterLoadError] = React.useState("");
 
   const [showAdd, setShowAdd] = React.useState(false);
   const [fabOpen, setFabOpen] = React.useState(false);
@@ -337,124 +457,107 @@ export default function Dashboard() {
   const [addErr, setAddErr] = React.useState("");
   const [interfaceOptions, setInterfaceOptions] = React.useState<string[]>([]);
   const [interfaceLoadFailed, setInterfaceLoadFailed] = React.useState(false);
-  const [form, setForm] = React.useState(() => ({
-    routerId: null as number | null,
-    interface: "wgmik",
-    name: "",
-    allowed: "10.65.74.100/32",
-    privateKey: "",
-    publicKey: "",
-    usePsk: false,
-    psk: "",
-    serverPublicKey: "",
-    endpoint: "",
-    dns: "8.8.8.8, 1.1.1.1",
-    mtu: "1280",
-    persistentKeepalive: "25",
-    allowedIps: "0.0.0.0/0, ::/0",
-  }));
+  const [lastAddRouterId, setLastAddRouterId] = React.useState<number | null>(null);
+  const [form, setForm] = React.useState(() => initialAddPeerForm(null));
+  const [showAddPrivateKey, setShowAddPrivateKey] = React.useState(false);
+  const [showAddPresharedKey, setShowAddPresharedKey] = React.useState(false);
 
-  const refreshSec = settings?.dashboard_refresh_seconds ?? 30;
-  const scopeValue = settings?.dashboard_scope_value ?? 14;
-  const scopeUnit = (settings?.dashboard_scope_unit as ScopeUnit) ?? "days";
-
-  const dashRefreshInput = useLooseNumberInput(
-    refreshSec,
-    (n) => update({ dashboard_refresh_seconds: n }),
-    { min: 5, emptyFallback: 5 },
-  );
-  const dashScopeInput = useLooseNumberInput(
-    scopeValue,
-    (n) => update({ dashboard_scope_value: n }),
-    { min: 1, emptyFallback: 1 },
-  );
+  const refreshSec = Math.max(5, Number(settings?.poll_interval_seconds) || 30);
+  const dashboardPeerPreviewCount = Math.max(1, Math.min(50, Number(settings?.dashboard_peer_preview_count) || 6));
+  const scopeValue = Math.max(1, Number(settings?.dashboard_scope_value) || 24);
+  const scopeUnit: ScopeUnit = settings?.dashboard_scope_unit === "minutes" || settings?.dashboard_scope_unit === "days"
+    ? settings.dashboard_scope_unit
+    : "hours";
   const timezone = settings?.timezone ?? "UTC";
+  const dateCalendar = settings?.date_calendar ?? "gregorian";
+  const weekStartDay = Number(settings?.week_start_day ?? 0);
+  const timeMode = normalizeUsageTimeMode(
+    settings?.dashboard_time_mode ?? (settings?.dashboard_time_frame_today ? "today" : "rolling"),
+  );
+  const customStart = settings?.dashboard_custom_start ?? "";
+  const customEnd = settings?.dashboard_custom_end ?? "";
   const showKindPills = settings?.show_kind_pills ?? true;
   const showHwStats = settings?.show_hw_stats ?? true;
   const filterStatus = FILTER_STATUS_VALUES.has(settings?.dashboard_filter_status ?? "")
     ? (settings?.dashboard_filter_status as "all" | "online" | "offline" | "enabled" | "disabled")
     : "all";
   const sortBy = (settings?.dashboard_sort_by as "name" | "last_seen" | "created" | "usage") ?? "created";
-  const rawScope = ((settings?.dashboard_router_scope as RouterScope | undefined) ?? "all");
-  const rawSelectedRouterIds = normalizeRouterIds(settings?.dashboard_selected_router_ids);
-  const todayFrame = Boolean(settings?.dashboard_time_frame_today);
+  const rawScope = settings?.dashboard_router_scope === "selected" ? "selected" : "all";
+  const rawSelectedRouterIdsSource = settings?.dashboard_selected_router_ids;
+  const rawSelectedRouterIds = React.useMemo(
+    () => normalizeRouterIds(rawSelectedRouterIdsSource),
+    [rawSelectedRouterIdsSource],
+  );
+  const customRangeMs = React.useMemo(() => {
+    if (timeMode !== "custom" || !customStart || !customEnd) return 0;
+    const startMs = new Date(customStart).getTime();
+    const endMs = new Date(customEnd).getTime();
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return 0;
+    return endMs - startMs;
+  }, [customEnd, customStart, timeMode]);
+  const chartScopeUnit: ScopeUnit = timeMode === "today"
+    ? "hours"
+    : timeMode === "this_month" || timeMode === "all_time"
+      ? "days"
+      : timeMode === "custom"
+        ? customRangeMs > 3 * 24 * 3600 * 1000
+          ? "days"
+          : "hours"
+        : scopeUnit;
+  const effectiveAllTime = timeMode === "all_time";
 
   const toIso = React.useCallback((value: string) => {
-    if (!value) return undefined;
-    const date = new Date(value);
-    if (!Number.isFinite(date.getTime())) return undefined;
-    return date.toISOString();
-  }, []);
-  const rawStartIso = toIso(timeFrom);
-  const rawEndIso = toIso(timeTo);
+    return zonedWallTimeValueToUtcIso(value, timezone);
+  }, [timezone]);
+  const customStartIso = toIso(customStart);
+  const customEndIso = toIso(customEnd);
 
   const effectiveStartIso = React.useMemo(() => {
-    if (allTime) return undefined;
-    if (todayFrame) {
-      const d = new Date();
-      d.setHours(0, 0, 0, 0);
-      return d.toISOString();
-    }
-    return rawStartIso;
-  }, [allTime, todayFrame, rawStartIso, todayTick]);
+    if (timeMode === "today") return toIso(startOfLocalTodayValue(timezone));
+    if (timeMode === "this_month") return toIso(startOfSelectedCalendarMonthValue(dateCalendar, timezone));
+    if (timeMode === "custom") return customStartIso;
+    return undefined;
+  }, [customStartIso, dateCalendar, timeMode, timezone, toIso, todayTick]);
 
   const effectiveEndIso = React.useMemo(() => {
-    if (allTime) return undefined;
-    if (todayFrame) return new Date().toISOString();
-    return rawEndIso;
-  }, [allTime, todayFrame, rawEndIso, todayTick]);
-
-  const timeFrameActive = allTime || !!rawStartIso || !!rawEndIso || todayFrame;
-
-  const displayTimeFrom = React.useMemo(() => {
-    if (todayFrame) {
-      const d = new Date();
-      d.setHours(0, 0, 0, 0);
-      return formatDatetimeLocalValue(d);
-    }
-    return timeFrom;
-  }, [todayFrame, timeFrom, todayTick]);
+    if (timeMode === "today" || timeMode === "this_month") return new Date().toISOString();
+    if (timeMode === "custom") return customEndIso;
+    return undefined;
+  }, [customEndIso, timeMode, todayTick]);
 
   React.useEffect(() => {
-    if (scopeUnit !== "days" && allTime) setAllTime(false);
-  }, [scopeUnit, allTime]);
-
-  React.useEffect(() => {
-    if (!todayFrame) return;
+    if (timeMode !== "today" && timeMode !== "this_month") return;
     setTodayTick((t) => t + 1);
     const ms = Math.max(5000, refreshSec * 1000);
     const id = window.setInterval(() => setTodayTick((t) => t + 1), ms);
     return () => window.clearInterval(id);
-  }, [todayFrame, refreshSec]);
+  }, [timeMode, refreshSec]);
+
+  const loadRouters = React.useCallback(async () => {
+    try {
+      setRouterLoadError("");
+      const routerRows = await listRouters();
+      setRouters(routerRows);
+      setSetupOk(routerRows.length > 0);
+    } catch (e: any) {
+      setRouters([]);
+      setSetupOk(false);
+      setRouterLoadError(e?.message || "Failed to load router profiles.");
+    }
+  }, []);
 
   React.useEffect(() => {
-    (async () => {
-      try {
-        const [routerRows, active] = await Promise.all([listRouters(), getActiveRouter()]);
-        if (!routerRows.length) {
-          setSetupOk(false);
-          navigate("/setup", { replace: true });
-          return;
-        }
-        setRouters(routerRows);
-        setActiveRouterId(active?.router_id ?? null);
-        setSetupOk(true);
-      } catch {
-        setSetupOk(false);
-        navigate("/setup", { replace: true });
-      }
-    })();
-  }, [navigate]);
+    void loadRouters();
+  }, [loadRouters]);
 
   const routerIdsSet = React.useMemo(() => new Set(routers.map((router) => router.id)), [routers]);
 
   const normalizedScopeState = React.useMemo(() => {
     const validSelected = rawSelectedRouterIds.filter((id) => routerIdsSet.has(id));
-    let scope: RouterScope = rawScope === "active" || rawScope === "selected" || rawScope === "all" ? rawScope : "all";
-    if (scope === "active" && (!activeRouterId || !routerIdsSet.has(activeRouterId))) scope = "all";
+    let scope: RouterScope = rawScope === "selected" || rawScope === "all" ? rawScope : "all";
     if (scope === "selected" && validSelected.length === 0) scope = "all";
     return { scope, selectedRouterIds: validSelected };
-  }, [rawScope, rawSelectedRouterIds, routerIdsSet, activeRouterId]);
+  }, [rawScope, rawSelectedRouterIds, routerIdsSet]);
 
   React.useEffect(() => {
     if (!settings || !routers.length) return;
@@ -478,49 +581,57 @@ export default function Dashboard() {
     [routers],
   );
 
+  const enabledRoutersByName = React.useMemo(
+    () => routersByName.filter((r) => r.enabled !== false),
+    [routersByName],
+  );
+
   const inScopeRouters = React.useMemo(() => {
-    if (normalizedScopeState.scope === "active") {
-      return activeRouterId && routersById[activeRouterId] ? [routersById[activeRouterId]] : [];
-    }
+    const isEnabled = (r: Router | undefined): r is Router => !!r && r.enabled !== false;
     if (normalizedScopeState.scope === "selected") {
       return normalizedScopeState.selectedRouterIds
         .map((id) => routersById[id])
-        .filter((router): router is Router => !!router);
+        .filter(isEnabled);
     }
-    return routersByName;
-  }, [normalizedScopeState, activeRouterId, routersById, routersByName]);
+    return enabledRoutersByName;
+  }, [normalizedScopeState, routersById, enabledRoutersByName]);
 
   const inScopeRouterIds = React.useMemo(() => inScopeRouters.map((router) => router.id), [inScopeRouters]);
   const inScopeRouterIdsKey = React.useMemo(() => inScopeRouterIds.join(","), [inScopeRouterIds]);
   const singleInScopeRouterId = inScopeRouterIds.length === 1 ? inScopeRouterIds[0] : null;
+  const showScopeOverviewChart = inScopeRouters.length > 1;
   const scopeSignature = React.useMemo(
     () => JSON.stringify({
       routerIds: inScopeRouterIds,
-      scopeUnit,
+      scopeUnit: chartScopeUnit,
       scopeValue,
-      allTime,
-      todayFrame,
+      timeMode,
       todayTick,
-      startIso: todayFrame ? "" : (rawStartIso || ""),
-      endIso: todayFrame ? "" : (rawEndIso || ""),
+      startIso: effectiveStartIso || "",
+      endIso: effectiveEndIso || "",
     }),
-    [inScopeRouterIds, scopeUnit, scopeValue, allTime, todayFrame, todayTick, rawStartIso, rawEndIso],
+    [inScopeRouterIds, chartScopeUnit, scopeValue, timeMode, todayTick, effectiveStartIso, effectiveEndIso],
   );
   const scopeSignatureRef = React.useRef(scopeSignature);
-  const statusRequestRef = React.useRef(0);
+  const statusScopeRef = React.useRef(inScopeRouterIdsKey);
   const rangeSeconds = React.useMemo(() => {
-    if (scopeUnit === "days") return null;
-    const baseSeconds = scopeUnit === "minutes" ? Math.max(1, scopeValue) * 60 : Math.max(1, scopeValue) * 3600;
+    if (chartScopeUnit === "days") return null;
+    const baseSeconds = chartScopeUnit === "minutes" ? Math.max(1, scopeValue) * 60 : Math.max(1, scopeValue) * 3600;
+    if (timeMode === "today") return 24 * 3600;
     if (!effectiveStartIso) return baseSeconds;
     const startMs = new Date(effectiveStartIso).getTime();
     const endMs = new Date(effectiveEndIso || new Date().toISOString()).getTime();
     if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return baseSeconds;
     return Math.max(60, Math.floor((endMs - startMs) / 1000));
-  }, [scopeUnit, scopeValue, effectiveStartIso, effectiveEndIso]);
+  }, [chartScopeUnit, scopeValue, timeMode, effectiveStartIso, effectiveEndIso]);
 
   React.useEffect(() => {
     scopeSignatureRef.current = scopeSignature;
   }, [scopeSignature]);
+
+  React.useEffect(() => {
+    statusScopeRef.current = inScopeRouterIdsKey;
+  }, [inScopeRouterIdsKey]);
 
   const filteredPeers = React.useMemo(() => {
     let out = [...peers];
@@ -565,8 +676,20 @@ export default function Dashboard() {
   const routerSections = React.useMemo(() => {
     return inScopeRouters
       .map((router) => {
-        const routerPeers = filteredPeers.filter((peer) => peer.router_id === router.id);
-        const totals = routerPeers.reduce(
+        const routerAllPeers = filteredPeers.filter((peer) => peer.router_id === router.id);
+        const activePeers = routerAllPeers.filter((peer) => peer.selected !== false);
+        const pendingNewPeers = routerAllPeers.filter((peer) => peer.selected === false && peer.router_sync_status === "new");
+        const hiddenPeers = routerAllPeers.filter((peer) => peer.selected === false && peer.router_sync_status !== "new");
+        const showHiddenPeers = !!showHiddenPeersByRouter[router.id];
+        const baseRouterPeers = showHiddenPeers ? [...activePeers, ...pendingNewPeers, ...hiddenPeers] : [...activePeers, ...pendingNewPeers];
+        // Float peers with a router-sync warning (missing / new drift) to the top so the
+        // red caution overlay is always visible, even when the list is collapsed. Array.sort
+        // is stable, so the existing relative order is preserved within each group.
+        const hasSyncWarning = (peer: SavedPeer) => (peer.router_sync_status || "synced") !== "synced";
+        const routerPeers = [...baseRouterPeers].sort(
+          (a, b) => Number(hasSyncWarning(b)) - Number(hasSyncWarning(a)),
+        );
+        const totals = activePeers.reduce(
           (acc, peer) => {
             const usage = peerUsageMap[peer.id] || { rx: 0, tx: 0 };
             acc.rx += usage.rx;
@@ -575,8 +698,8 @@ export default function Dashboard() {
           },
           { rx: 0, tx: 0 },
         );
-        const online = routerPeers.filter((peer) => statusMap[peer.id]?.online).length;
-        const disabled = routerPeers.filter((peer) => peer.disabled).length;
+        const online = activePeers.filter((peer) => statusMap[peer.id]?.online).length;
+        const disabled = activePeers.filter((peer) => peer.disabled).length;
         const monthlyRows = routerMonthlyMap[router.id] || [];
         const rawRows = routerRawMap[router.id] || [];
         return {
@@ -585,20 +708,26 @@ export default function Dashboard() {
           totals,
           online,
           disabled,
+          hidden: hiddenPeers.length,
+          showHiddenPeers,
           monthly: monthlyRows,
           raw: rawRows,
         };
       })
       .filter((section) => !hasPeerFilters || section.peers.length > 0);
-  }, [inScopeRouters, filteredPeers, peerUsageMap, statusMap, routerMonthlyMap, routerRawMap, hasPeerFilters]);
+  }, [inScopeRouters, filteredPeers, peerUsageMap, statusMap, routerMonthlyMap, routerRawMap, hasPeerFilters, showHiddenPeersByRouter]);
 
   const toggleRouterExpanded = React.useCallback((routerId: number) => {
     setExpandedRouters((current) => ({ ...current, [routerId]: !current[routerId] }));
   }, []);
 
+  const toggleRouterHiddenPeers = React.useCallback((routerId: number) => {
+    setShowHiddenPeersByRouter((current) => ({ ...current, [routerId]: !current[routerId] }));
+  }, []);
+
   const loadPeers = React.useCallback(async (signature: string) => {
     try {
-      const rows = await listSavedPeersSelected(undefined, inScopeRouterIds);
+      const rows = await listPeers(0, false, undefined, inScopeRouterIds);
       if (signature !== scopeSignatureRef.current) return;
       setPeers(rows);
     } catch {
@@ -609,10 +738,10 @@ export default function Dashboard() {
 
   const loadChartData = React.useCallback(async (signature: string) => {
     try {
-      if (scopeUnit === "days") {
+      if (chartScopeUnit === "days") {
         if (singleInScopeRouterId) {
           let aggregateRows: MonthlySummaryPoint[] = [];
-          if (allTime) {
+          if (effectiveAllTime) {
             aggregateRows = await getMonthlySummary(undefined, undefined, { allTime: true, routerIds: inScopeRouterIds });
           } else if (effectiveStartIso || effectiveEndIso) {
             aggregateRows = await getMonthlySummary(undefined, undefined, { start: effectiveStartIso, end: effectiveEndIso, routerIds: inScopeRouterIds });
@@ -629,7 +758,7 @@ export default function Dashboard() {
           })));
         } else {
           let routerRows: RouterMonthlySummaryPoint[] = [];
-          if (allTime) {
+          if (effectiveAllTime) {
             routerRows = await getMonthlySummaryByRouter(undefined, undefined, { allTime: true, routerIds: inScopeRouterIds });
           } else if (effectiveStartIso || effectiveEndIso) {
             routerRows = await getMonthlySummaryByRouter(undefined, undefined, { start: effectiveStartIso, end: effectiveEndIso, routerIds: inScopeRouterIds });
@@ -646,7 +775,7 @@ export default function Dashboard() {
       }
 
       const seconds = rangeSeconds ?? 3600;
-      const interval = scopeUnit === "minutes" ? 60 : 3600;
+      const interval = chartScopeUnit === "minutes" ? 60 : 3600;
       if (singleInScopeRouterId) {
         const aggregateRows = await getSummaryRaw(seconds, undefined, interval, effectiveStartIso, effectiveEndIso, inScopeRouterIds);
         if (signature !== scopeSignatureRef.current) return;
@@ -667,7 +796,7 @@ export default function Dashboard() {
       setMonthlyByRouter([]);
     } catch {
       if (signature !== scopeSignatureRef.current) return;
-      if (scopeUnit === "days") {
+      if (chartScopeUnit === "days") {
         setMonthly([]);
         setMonthlyByRouter([]);
         setRaw([]);
@@ -679,7 +808,7 @@ export default function Dashboard() {
         setMonthlyByRouter([]);
       }
     }
-  }, [scopeUnit, singleInScopeRouterId, allTime, effectiveStartIso, effectiveEndIso, scopeValue, inScopeRouterIds, rangeSeconds]);
+  }, [chartScopeUnit, singleInScopeRouterId, effectiveAllTime, effectiveStartIso, effectiveEndIso, scopeValue, inScopeRouterIds, rangeSeconds]);
 
   const loadUsageMap = React.useCallback(async (signature: string) => {
     try {
@@ -691,8 +820,8 @@ export default function Dashboard() {
         end?: string;
         allTime?: boolean;
       } = { routerIds: inScopeRouterIds };
-      if (scopeUnit === "days") {
-        if (allTime) {
+      if (chartScopeUnit === "days") {
+        if (effectiveAllTime) {
           opts.allTime = true;
         } else if (effectiveStartIso || effectiveEndIso) {
           opts.start = effectiveStartIso;
@@ -724,7 +853,7 @@ export default function Dashboard() {
       setFairUsageByPeer({});
       setFairUsageThrottledByPeer({});
     }
-  }, [scopeUnit, scopeValue, allTime, effectiveStartIso, effectiveEndIso, inScopeRouterIds, rangeSeconds]);
+  }, [chartScopeUnit, scopeValue, effectiveAllTime, effectiveStartIso, effectiveEndIso, inScopeRouterIds, rangeSeconds]);
 
   const loadMetrics = React.useCallback(async () => {
     try {
@@ -736,27 +865,33 @@ export default function Dashboard() {
   }, []);
 
   const loadStatusMap = React.useCallback(async () => {
-    const requestId = ++statusRequestRef.current;
+    const scopeKey = inScopeRouterIdsKey;
     if (inScopeRouterIds.length === 0) {
       setStatusMap({});
       return;
     }
     try {
       const rows = await getDashboardLiveStatus(undefined, inScopeRouterIds);
-      if (requestId !== statusRequestRef.current) return;
-      const next: Record<number, PeerStatus> = {};
-      for (const row of rows) {
-        next[row.peer_id] = {
-          online: row.online,
-          last: formatRelativeHandshake(row.raw_last_handshake),
-          raw_last_handshake: row.raw_last_handshake || 0,
-        };
-      }
-      setStatusMap(next);
+      // Only discard if the router scope changed while this request was in flight.
+      // Overlapping polls in the same scope are intentionally merged so a batched response
+      // delayed by one unreachable router still lands in state on the next poll.
+      if (scopeKey !== statusScopeRef.current) return;
+      setStatusMap((prev) => {
+        if (scopeKey !== statusScopeRef.current) return prev;
+        const merged: Record<number, PeerStatus> = { ...prev };
+        for (const row of rows) {
+          merged[row.peer_id] = {
+            online: row.online,
+            last: formatRelativeHandshake(row.raw_last_handshake),
+            raw_last_handshake: row.raw_last_handshake || 0,
+          };
+        }
+        return merged;
+      });
     } catch {
-      if (requestId !== statusRequestRef.current) return;
+      // Network error; keep previously-known status.
     }
-  }, [inScopeRouterIds]);
+  }, [inScopeRouterIds, inScopeRouterIdsKey]);
 
   const refreshDashboardData = React.useCallback(async () => {
     const signature = scopeSignature;
@@ -769,53 +904,56 @@ export default function Dashboard() {
     ]);
   }, [scopeSignature, loadPeers, loadUsageMap, loadChartData, loadMetrics, loadStatusMap]);
 
+  const refreshDashboardDataRef = React.useRef(refreshDashboardData);
+  React.useEffect(() => {
+    refreshDashboardDataRef.current = refreshDashboardData;
+  }, [refreshDashboardData]);
+
   React.useEffect(() => {
     if (setupOk !== true || !settings || inScopeRouterIds.length === 0) return;
-    void refreshDashboardData();
+    void refreshDashboardDataRef.current();
   }, [
     setupOk,
     settings ? 1 : 0,
     inScopeRouterIdsKey,
-    scopeUnit,
+    chartScopeUnit,
     scopeValue,
-    allTime,
-    todayFrame,
+    timeMode,
     todayTick,
-    rawStartIso,
-    rawEndIso,
-    refreshDashboardData,
+    effectiveStartIso,
+    effectiveEndIso,
   ]);
 
   React.useEffect(() => {
     if (setupOk !== true || !refreshSec || inScopeRouterIds.length === 0) return;
     const id = window.setInterval(() => {
-      void refreshDashboardData();
+      void refreshDashboardDataRef.current();
     }, refreshSec * 1000);
     return () => window.clearInterval(id);
-  }, [setupOk, refreshSec, inScopeRouterIdsKey, refreshDashboardData]);
+  }, [setupOk, refreshSec, inScopeRouterIdsKey]);
 
   React.useEffect(() => {
     if (setupOk !== true || inScopeRouterIds.length === 0) {
-      statusRequestRef.current += 1;
       setStatusMap({});
     }
   }, [setupOk, inScopeRouterIdsKey]);
 
   const defaultAddRouterId = React.useMemo(() => {
-    if (activeRouterId && inScopeRouterIds.includes(activeRouterId)) return activeRouterId;
-    if (inScopeRouterIds.length > 0) return inScopeRouterIds[0];
-    if (routers.length > 0) return routers[0].id;
-    return null;
-  }, [activeRouterId, inScopeRouterIds, routers]);
+    const preferredIds = inScopeRouterIds.length > 0
+      ? inScopeRouterIds
+      : enabledRoutersByName.length > 0
+        ? enabledRoutersByName.map((router) => router.id)
+        : routersByName.map((router) => router.id);
+    if (lastAddRouterId && preferredIds.includes(lastAddRouterId)) return lastAddRouterId;
+    return preferredIds[0] ?? null;
+  }, [inScopeRouterIds, enabledRoutersByName, routersByName, lastAddRouterId]);
 
   React.useEffect(() => {
     if (!showAdd) return;
     setAddErr("");
-    setForm((prev) => ({
-      ...prev,
-      routerId: defaultAddRouterId,
-      interface: prev.interface || "wgmik",
-    }));
+    setShowAddPrivateKey(false);
+    setShowAddPresharedKey(false);
+    setForm(initialAddPeerForm(defaultAddRouterId));
   }, [showAdd, defaultAddRouterId]);
 
   React.useEffect(() => {
@@ -853,18 +991,24 @@ export default function Dashboard() {
     let cancelled = false;
     (async () => {
       try {
-        const [routersList, ifaceCfg] = await Promise.all([
+        const [routersList, ifaceCfg, livePeers] = await Promise.all([
           Promise.resolve(routers),
           routerInterfaceDetail(routerId, form.interface),
+          routerPeers(routerId, form.interface).catch(() => []),
         ]);
         if (cancelled) return;
         const router = routersList.find((row) => row.id === routerId);
-        const endpointHost = ifaceCfg.public_host || router?.host || "";
-        const endpointPort = ifaceCfg.listen_port || 51820;
+        const endpointHost = (ifaceCfg.public_host || router?.host || "").trim();
+        const endpointPort = String(ifaceCfg.listen_port || 51820);
+        const suggestedAddress = findAvailableInterfaceAddress(ifaceCfg.addresses || [], livePeers);
         setForm((prev) => ({
           ...prev,
           serverPublicKey: ifaceCfg.public_key || "",
-          endpoint: endpointHost && endpointPort ? `${endpointHost}:${endpointPort}` : prev.endpoint,
+          endpointHost,
+          endpointPort,
+          allowed: !prev.allowed.trim() || prev.allowed.trim() === "10.65.74.100/32"
+            ? suggestedAddress || prev.allowed
+            : prev.allowed,
         }));
       } catch {
         // Manual fallback is fine.
@@ -903,7 +1047,7 @@ export default function Dashboard() {
 
   function generatePsk() {
     const p = crypto.getRandomValues(new Uint8Array(32));
-    setForm((prev) => ({ ...prev, psk: bytesToBase64(p), usePsk: true }));
+    setForm((prev) => ({ ...prev, presharedKey: bytesToBase64(p) }));
   }
 
   React.useEffect(() => {
@@ -926,16 +1070,33 @@ export default function Dashboard() {
     }
   }, [form.privateKey, form.publicKey]);
 
-  const qrConfig = React.useMemo(() => {
-    if (!form.privateKey || !form.allowed) return "";
+  const addEndpoint = React.useMemo(
+    () => resolveClientEndpoint(form.customEndpoint, form.endpointHost, form.endpointPort),
+    [form.customEndpoint, form.endpointHost, form.endpointPort],
+  );
+
+  const isValidAddPrivateKey = React.useMemo(
+    () => isValidWgBase64Key(form.privateKey),
+    [form.privateKey],
+  );
+
+  const isValidAddPresharedKey = React.useMemo(() => {
+    const key = form.presharedKey.trim();
+    return !key || isValidWgBase64Key(key);
+  }, [form.presharedKey]);
+
+  const addClientConfig = React.useMemo(() => {
+    const priv = form.privateKey.trim();
+    const addr = form.allowed.trim();
     const dns = form.dns.trim();
     const mtuNum = form.mtu.trim();
     const keepaliveNum = form.persistentKeepalive.trim();
     const allowedIps = form.allowedIps.trim();
+    const psk = form.presharedKey.trim();
     const lines = [
       "[Interface]",
-      `PrivateKey = ${form.privateKey}`,
-      `Address = ${form.allowed}`,
+      `PrivateKey = ${priv || "YOUR_PRIVATE_KEY"}`,
+      ...(addr ? [`Address = ${addr}`] : []),
       ...(dns ? [`DNS = ${dns}`] : []),
       ...(() => {
         if (!mtuNum) return [];
@@ -944,9 +1105,9 @@ export default function Dashboard() {
       })(),
       "",
       "[Peer]",
-      `PublicKey = ${form.serverPublicKey || "SERVER_PUBLIC_KEY"}`,
-      ...(form.usePsk && form.psk ? [`PresharedKey = ${form.psk}`] : []),
-      `Endpoint = ${form.endpoint || "HOST:PORT"}`,
+      `PublicKey = ${form.serverPublicKey.trim() || "SERVER_PUBLIC_KEY"}`,
+      ...(psk && isValidAddPresharedKey ? [`PresharedKey = ${psk}`] : []),
+      `Endpoint = ${addEndpoint}`,
       ...(allowedIps ? [`AllowedIPs = ${allowedIps}`] : []),
       ...(() => {
         if (!keepaliveNum) return [];
@@ -955,7 +1116,21 @@ export default function Dashboard() {
       })(),
     ];
     return lines.join("\n");
-  }, [form]);
+  }, [form, addEndpoint, isValidAddPresharedKey]);
+
+  const downloadAddClientConfigFile = React.useCallback(() => {
+    const base = sanitizeConfigFileBase(form.configName, form.name);
+    const blob = new Blob([addClientConfig], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${base}.conf`;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, [addClientConfig, form.configName, form.name]);
 
   if (setupOk === null) {
     return (
@@ -965,7 +1140,63 @@ export default function Dashboard() {
     );
   }
 
-  const globalSeries = scopeUnit === "days" ? monthly : raw;
+  if (routerLoadError) {
+    return (
+      <div className="mx-auto px-4 md:px-6 py-6">
+        <div className="mx-auto my-12 md:my-16 w-full max-w-[720px] rounded-3xl ring-1 ring-rose-200 bg-white dark:bg-gray-900 dark:ring-rose-500/30 shadow-sm p-10 text-center grid gap-4">
+          <div className="text-2xl font-semibold text-gray-900 dark:text-gray-100">Dashboard unavailable</div>
+          <div className="text-sm text-gray-500 dark:text-gray-400">{routerLoadError}</div>
+          <div className="flex items-center justify-center gap-3 pt-2">
+            <button
+              type="button"
+              onClick={() => void loadRouters()}
+              className="inline-flex items-center gap-2 rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate("/settings")}
+              className="inline-flex items-center gap-2 rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+            >
+              Open Settings
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (routers.length === 0) {
+    return (
+      <div className="mx-auto px-4 md:px-6 py-6">
+        <div className="mx-auto my-12 md:my-16 w-full max-w-[720px] rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 shadow-sm p-10 text-center grid gap-4">
+          <div className="text-2xl font-semibold text-gray-900 dark:text-gray-100">No router profiles yet</div>
+          <div className="text-sm text-gray-500 dark:text-gray-400">
+            The dashboard is the home for an existing workspace. First-time router setup and peer import now live in the dedicated setup flow.
+          </div>
+          <div className="flex items-center justify-center gap-3 pt-2">
+            <button
+              type="button"
+              onClick={() => navigate("/setup")}
+              className="inline-flex items-center gap-2 rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+            >
+              Open Setup
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate("/settings")}
+              className="inline-flex items-center gap-2 rounded-full bg-gray-100 text-gray-800 px-4 py-2 text-sm shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+            >
+              Open Settings
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const globalSeries = showScopeOverviewChart ? (chartScopeUnit === "days" ? monthly : raw) : [];
   const globalTotals = globalSeries.reduce(
     (acc, point) => {
       acc.rx += point.rx || 0;
@@ -974,44 +1205,55 @@ export default function Dashboard() {
     },
     { rx: 0, tx: 0 },
   );
+  const showRouterSections = routerSections.length > 0;
+  const usageSubtitle = inScopeRouters.length === 0
+    ? "No active routers in the current scope."
+    : inScopeRouters.length === 1
+      ? `Showing usage for ${inScopeRouters[0].name}.`
+      : "Combined traffic across all routers currently in scope.";
 
   return (
     <div className="mx-auto px-4 md:px-6 py-6">
       <h1 className="text-xl font-semibold text-gray-900 dark:text-gray-100 mb-4">Overview</h1>
 
-      <div className="mx-auto my-8 w-full max-w-[1120px] rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 p-6 grid gap-6">
+      <div className="mx-auto my-8 w-full min-w-0 max-w-[1120px] rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 p-6 grid gap-6">
         <div className="flex flex-col gap-4">
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
             <div>
               <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">Usage</div>
-              <div className="text-xs text-gray-500 dark:text-gray-400">Combined traffic across all routers currently in scope.</div>
+              <div className="text-xs text-gray-500 dark:text-gray-400">{usageSubtitle}</div>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {(["all", "active", "selected"] as RouterScope[]).map((scope) => (
-                <button
-                  key={scope}
-                  type="button"
-                  onClick={() => update({ dashboard_router_scope: scope })}
-                  className={`rounded-full px-3 py-1.5 text-xs shadow ${
-                    normalizedScopeState.scope === scope
-                      ? "bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900"
-                      : "bg-gray-100 text-gray-800 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
-                  }`}
-                >
-                  {scope === "all" ? "All routers" : scope === "active" ? "Active router" : "Selected routers"}
-                </button>
-              ))}
-            </div>
+            {enabledRoutersByName.length > 1 && (
+              <div className="flex flex-wrap items-center gap-2">
+                {(["all", "selected"] as RouterScope[]).map((scope) => (
+                  <button
+                    key={scope}
+                    type="button"
+                    onClick={() => update({ dashboard_router_scope: scope })}
+                    className={`rounded-full px-3 py-1.5 text-xs shadow ${
+                      normalizedScopeState.scope === scope
+                        ? "bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900"
+                        : "bg-gray-100 text-gray-800 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                    }`}
+                  >
+                    {scope === "all" ? "All routers" : "Selected routers"}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
-          {normalizedScopeState.scope === "selected" && (
+          {enabledRoutersByName.length > 1 && normalizedScopeState.scope === "selected" && (
             <div className="flex flex-wrap items-center gap-2">
               {routersByName.map((router) => {
                 const selected = normalizedScopeState.selectedRouterIds.includes(router.id);
+                const paused = router.enabled === false;
                 return (
                   <button
                     key={router.id}
                     type="button"
+                    disabled={paused}
+                    title={paused ? "Router is paused — resume it in Settings to use." : undefined}
                     onClick={() => {
                       const current = normalizedScopeState.selectedRouterIds;
                       if (selected) {
@@ -1026,150 +1268,57 @@ export default function Dashboard() {
                       }
                     }}
                     className={`rounded-full px-3 py-1.5 text-xs shadow ${
-                      selected
+                      paused
+                        ? "bg-gray-100 text-gray-400 cursor-not-allowed dark:bg-gray-800 dark:text-gray-500"
+                        : selected
                         ? "bg-indigo-100 text-indigo-800 dark:bg-indigo-500/10 dark:text-indigo-300"
                         : "bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
                     }`}
                   >
-                    {router.name}
+                    {router.name}{paused ? " · paused" : ""}
                   </button>
                 );
               })}
             </div>
           )}
 
-          <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3 text-xs text-gray-600 dark:text-gray-300">
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="flex items-center gap-2">
-                <span>Auto refresh</span>
-                <input
-                  type="number"
-                  min={5}
-                  className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                  {...dashRefreshInput}
-                />
-                <span>s</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span>Last</span>
-                <input
-                  type="number"
-                  min={1}
-                  className="w-16 rounded-full border border-gray-900 bg-gray-900 text-white px-2 py-1 text-xs focus:ring-1 focus:ring-gray-400 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-300"
-                  {...dashScopeInput}
-                />
-                <select
-                  value={scopeUnit}
-                  onChange={(e) => update({ dashboard_scope_unit: e.target.value })}
-                  className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950"
-                >
-                  <option value="minutes">minutes</option>
-                  <option value="hours">hours</option>
-                  <option value="days">days</option>
-                </select>
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <span>Time frame</span>
-              <button
-                type="button"
-                onClick={() => {
-                  if (todayFrame) {
-                    const d = new Date();
-                    d.setHours(0, 0, 0, 0);
-                    setTimeFrom(formatDatetimeLocalValue(d));
-                    setTimeTo(formatDatetimeLocalValue(new Date()));
-                    update({ dashboard_time_frame_today: false });
-                  } else {
-                    setAllTime(false);
-                    update({ dashboard_time_frame_today: true });
-                  }
-                }}
-                className={`rounded-full px-3 py-1 text-xs border shadow ${
-                  todayFrame
-                    ? "border-gray-900 bg-gray-900 text-white dark:border-gray-100 dark:bg-gray-100 dark:text-gray-900"
-                    : "border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 hover:bg-gray-50 dark:hover:bg-gray-900"
-                }`}
-              >
-                Today
-              </button>
-              <input
-                type="datetime-local"
-                value={displayTimeFrom}
-                onChange={(e) => {
-                  update({ dashboard_time_frame_today: false });
-                  setTimeFrom(e.target.value);
-                }}
-                disabled={allTime || todayFrame}
-                className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60"
-              />
-              <span>to</span>
-              {todayFrame ? (
-                <span
-                  className="inline-flex items-center rounded-full border border-dashed border-gray-300 bg-gray-50 px-2.5 py-1 text-xs text-gray-600 dark:border-gray-600 dark:bg-gray-900/50 dark:text-gray-300"
-                  title="End of range always matches the current time while Today is on"
-                >
-                  Now
-                </span>
-              ) : (
-                <input
-                  type="datetime-local"
-                  value={timeTo}
-                  onChange={(e) => {
-                    update({ dashboard_time_frame_today: false });
-                    setTimeTo(e.target.value);
-                  }}
-                  disabled={allTime}
-                  className="rounded-full border border-gray-200 dark:border-gray-800 px-2 py-1 text-xs focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 bg-white dark:bg-gray-950 disabled:opacity-60"
-                />
-              )}
-              {scopeUnit === "days" && (
-                <label className="inline-flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={allTime}
-                    onChange={(e) => {
-                      const next = e.target.checked;
-                      setAllTime(next);
-                      update({ dashboard_time_frame_today: false });
-                      if (next) {
-                        setTimeFrom("");
-                        setTimeTo("");
-                      }
-                    }}
-                  />
-                  <span>All time</span>
-                </label>
-              )}
-              <button
-                type="button"
-                onClick={() => {
-                  setAllTime(false);
-                  update({ dashboard_time_frame_today: false });
-                  setTimeFrom("");
-                  setTimeTo("");
-                }}
-                disabled={!timeFrameActive}
-                className="rounded-full border border-gray-200 dark:border-gray-800 px-3 py-1 text-xs bg-white dark:bg-gray-950 disabled:opacity-60"
-              >
-                Clear
-              </button>
-            </div>
-          </div>
+          <UsageTimeControls
+            mode={timeMode}
+            rollingValue={scopeValue}
+            rollingUnit={scopeUnit}
+            customStart={customStart}
+            customEnd={customEnd}
+            autoRefreshSeconds={refreshSec}
+            showAutoRefresh={false}
+            dateCalendar={dateCalendar}
+            timezone={timezone}
+            weekStartDay={weekStartDay}
+            onModeChange={(mode) => update({ dashboard_time_mode: mode, dashboard_time_frame_today: mode === "today" })}
+            onRollingValueChange={(value) => update({ dashboard_scope_value: value, dashboard_time_mode: "rolling", dashboard_time_frame_today: false })}
+            onRollingUnitChange={(unit) => update({ dashboard_scope_unit: unit, dashboard_time_mode: "rolling", dashboard_time_frame_today: false })}
+            onCustomStartChange={(value) => update({ dashboard_custom_start: value, dashboard_time_mode: "custom", dashboard_time_frame_today: false })}
+            onCustomEndChange={(value) => update({ dashboard_custom_end: value, dashboard_time_mode: "custom", dashboard_time_frame_today: false })}
+            peerPreviewMax={dashboardPeerPreviewCount}
+            onPeerPreviewMaxChange={(value) => update({ dashboard_peer_preview_count: value })}
+          />
 
-          <div className="h-56">
-            <MemoUsageChart scopeUnit={scopeUnit} monthly={monthly} raw={raw} timezone={timezone} emptyLabel="No usage data yet" />
-          </div>
+          {showScopeOverviewChart && (
+            <>
+              <div className="h-56">
+                <MemoUsageChart scopeUnit={chartScopeUnit} monthly={monthly} raw={raw} timezone={timezone} dateCalendar={dateCalendar} emptyLabel="No usage data yet" />
+              </div>
 
-          <div className="flex flex-wrap items-center gap-4 text-xs text-gray-500 dark:text-gray-400">
-            <div>Total Download: <span className="font-medium text-gray-700 dark:text-gray-300">{fmtBytes(globalTotals.tx)}</span></div>
-            <div>Total Upload: <span className="font-medium text-gray-700 dark:text-gray-300">{fmtBytes(globalTotals.rx)}</span></div>
-            <div>Routers in scope: <span className="font-medium text-gray-700 dark:text-gray-300">{inScopeRouters.length}</span></div>
-          </div>
+              <div className="flex flex-wrap items-center gap-4 text-xs text-gray-500 dark:text-gray-400">
+                <div>Total Download: <span className="font-medium text-gray-700 dark:text-gray-300">{fmtBytes(globalTotals.tx)}</span></div>
+                <div>Total Upload: <span className="font-medium text-gray-700 dark:text-gray-300">{fmtBytes(globalTotals.rx)}</span></div>
+                <div>Routers in scope: <span className="font-medium text-gray-700 dark:text-gray-300">{inScopeRouters.length}</span></div>
+              </div>
+            </>
+          )}
         </div>
 
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="flex flex-col sm:flex-row gap-3 w-full md:w-auto">
+        <div className="flex flex-col gap-4 md:flex-row md:flex-wrap md:items-center md:justify-between">
+          <div className="flex min-w-0 w-full flex-col gap-3 sm:flex-row md:flex-1">
             <input
               className="rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700 w-full sm:w-64"
               placeholder="Search peers..."
@@ -1203,7 +1352,7 @@ export default function Dashboard() {
               setAddErr("");
               setShowAdd(true);
             }}
-            className="inline-flex items-center gap-2 rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white whitespace-nowrap"
+            className="inline-flex shrink-0 items-center gap-2 self-start rounded-full bg-gray-900 px-4 py-2 text-sm text-white shadow hover:bg-black dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white sm:whitespace-nowrap"
           >
             Add peer to router +
           </button>
@@ -1211,16 +1360,16 @@ export default function Dashboard() {
       </div>
 
       <div className="mx-auto w-full max-w-[1120px] grid gap-6">
-        {filteredPeers.length === 0 ? (
+        {!showRouterSections ? (
           <div className="rounded-3xl ring-1 ring-gray-200 bg-white dark:bg-gray-900 dark:ring-gray-800 p-6 text-sm text-gray-500 dark:text-gray-400">
             No peers in scope for the current router selection and filters.
           </div>
         ) : (
           routerSections.map((section) => (
             (() => {
-              const canCollapsePeers = section.peers.length > ROUTER_PEER_PREVIEW_COUNT;
+              const canCollapsePeers = section.peers.length > dashboardPeerPreviewCount;
               const peersExpanded = canCollapsePeers ? !!expandedRouters[section.router.id] : true;
-              const visiblePeers = peersExpanded ? section.peers : section.peers.slice(0, ROUTER_PEER_PREVIEW_COUNT);
+              const visiblePeers = peersExpanded ? section.peers : section.peers.slice(0, dashboardPeerPreviewCount);
               const hiddenPeerCount = Math.max(0, section.peers.length - visiblePeers.length);
 
               return (
@@ -1236,6 +1385,9 @@ export default function Dashboard() {
                       <span>Peers <span className="font-medium text-gray-800 dark:text-gray-100">{section.peers.length}</span></span>
                       <span>Online <span className="font-medium text-gray-800 dark:text-gray-100">{section.online}</span></span>
                       <span>Disabled <span className="font-medium text-gray-800 dark:text-gray-100">{section.disabled}</span></span>
+                      {section.hidden > 0 && (
+                        <span className="text-gray-400 dark:text-gray-500">Hidden <span className="font-medium">{section.hidden}</span></span>
+                      )}
                       <span>Down <span className="font-medium text-gray-800 dark:text-gray-100">{fmtBytes(section.totals.tx)}</span></span>
                       <span>Up <span className="font-medium text-gray-800 dark:text-gray-100">{fmtBytes(section.totals.rx)}</span></span>
                     </div>
@@ -1245,10 +1397,11 @@ export default function Dashboard() {
                     <div className="grid gap-5">
                       <div className="h-52">
                         <MemoUsageChart
-                          scopeUnit={scopeUnit}
+                          scopeUnit={chartScopeUnit}
                           monthly={section.monthly}
                           raw={section.raw}
                           timezone={timezone}
+                          dateCalendar={dateCalendar}
                           emptyLabel="No usage data for this router in the current timeframe"
                         />
                       </div>
@@ -1262,12 +1415,15 @@ export default function Dashboard() {
                               const usage = peerUsageMap[peer.id] || { rx: 0, tx: 0 };
                               const status = statusMap[peer.id];
                               return (
-                                <Card
-                                  key={peer.id}
-                                  className="p-4 ring-gray-300 shadow hover:shadow-lg hover:-translate-y-0.5 cursor-pointer rounded-xl"
-                                  onClick={() => navigate(`/peer/${peer.id}`)}
-                                >
-                                  <div className="flex items-center justify-between gap-3">
+	                                <Card
+	                                  key={peer.id}
+	                                  className={`relative p-4 ring-gray-300 shadow hover:shadow-lg hover:-translate-y-0.5 cursor-pointer rounded-xl ${
+	                                    peer.selected === false ? "opacity-70 ring-dashed" : ""
+	                                  }`}
+	                                  onClick={() => navigate(`/peer/${peer.id}`)}
+	                                >
+	                                  <RouterSyncWarningBadge status={peer.router_sync_status} />
+	                                  <div className="flex items-center justify-between gap-3">
                                     <div className="min-w-0">
                                       <div className="text-sm text-gray-500 dark:text-gray-400">{peer.name}</div>
                                       <div className="text-lg text-gray-900 dark:text-gray-100 truncate" title={(peer.allowed_address || "").replace(/\/32/g, "")}>
@@ -1293,10 +1449,20 @@ export default function Dashboard() {
                                         ) : null}
                                         <span title="Usage in selected timeframe">↓ {fmtBytes(usage.tx)} · ↑ {fmtBytes(usage.rx)}</span>
                                       </div>
-                                      <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs ${peer.disabled ? "bg-rose-100 text-rose-800" : "bg-indigo-100 text-indigo-800"}`}>
-                                        <span className={`inline-block w-2 h-2 rounded-full ${peer.disabled ? "bg-rose-500" : "bg-indigo-500"}`} />
-                                        {peer.disabled ? "Deactivated" : "Active"}
-                                      </span>
+                                      <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs ${
+	                                        peer.router_sync_status === "new"
+	                                          ? "bg-rose-100 text-rose-800 dark:bg-rose-500/10 dark:text-rose-300"
+	                                          : peer.selected === false
+	                                          ? "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+	                                          : peer.disabled
+	                                            ? "bg-rose-100 text-rose-800"
+                                            : "bg-indigo-100 text-indigo-800"
+                                      }`}>
+                                        <span className={`inline-block w-2 h-2 rounded-full ${
+	                                          peer.router_sync_status === "new" ? "bg-rose-500" : peer.selected === false ? "bg-gray-400" : peer.disabled ? "bg-rose-500" : "bg-indigo-500"
+	                                        }`} />
+	                                        {peer.router_sync_status === "new" ? "Pending" : peer.selected === false ? "Hidden" : peer.disabled ? "Deactivated" : "Active"}
+	                                      </span>
                                       {showKindPills && (() => {
                                         const addr = peer.allowed_address.trim();
                                         const outbound = addr === "0.0.0.0/0" || addr === "::/0";
@@ -1326,8 +1492,18 @@ export default function Dashboard() {
                             })}
                           </div>
 
-                          {canCollapsePeers && (
-                            <div className="flex justify-center pt-1">
+                          {(canCollapsePeers || (peersExpanded && section.hidden > 0)) && (
+                            <div className="flex flex-col items-center gap-1 pt-1">
+                              {peersExpanded && section.hidden > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => toggleRouterHiddenPeers(section.router.id)}
+                                  className="text-[11px] font-normal text-gray-400 underline-offset-2 hover:text-gray-600 hover:underline dark:text-gray-600 dark:hover:text-gray-400"
+                                >
+                                  {section.showHiddenPeers ? "hide hidden peers" : `show hidden peers (${section.hidden})`}
+                                </button>
+                              )}
+                              {canCollapsePeers && (
                                 <button
                                   type="button"
                                   onClick={() => toggleRouterExpanded(section.router.id)}
@@ -1349,6 +1525,7 @@ export default function Dashboard() {
                                     />
                                   </svg>
                                 </button>
+                              )}
                             </div>
                           )}
                         </div>
@@ -1379,7 +1556,7 @@ export default function Dashboard() {
           </svg>
         </button>
 
-        <div className={`flex flex-col gap-2 transition-all duration-200 origin-bottom ${fabOpen ? "scale-100 opacity-100" : "scale-75 opacity-0 pointer-events-none"}`}>
+        <div className={`w-12 flex flex-col items-center gap-2 transition-all duration-200 origin-bottom ${fabOpen ? "scale-100 opacity-100" : "scale-75 opacity-0 pointer-events-none"}`}>
           <a href="/settings" className="h-10 w-10 rounded-full bg-white text-gray-900 ring-1 ring-gray-300 shadow flex items-center justify-center hover:shadow-md dark:bg-gray-900 dark:text-gray-100 dark:ring-gray-700 transition-all duration-150" title="Settings" style={{ transitionDelay: fabOpen ? "50ms" : "0ms" }}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <circle cx="12" cy="12" r="3" />
@@ -1416,13 +1593,20 @@ export default function Dashboard() {
                 <label className="text-xs text-gray-500 dark:text-gray-400">Router</label>
                 <select
                   value={form.routerId ?? ""}
-                  onChange={(e) => setForm((prev) => ({ ...prev, routerId: Number(e.target.value) || null }))}
+                  onChange={(e) => setForm((prev) => ({
+                    ...prev,
+                    routerId: Number(e.target.value) || null,
+                    allowed: "",
+                    serverPublicKey: "",
+                    endpointHost: "",
+                    endpointPort: "51820",
+                  }))}
                   className="rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700"
                 >
                   <option value="">Select router</option>
                   {routersByName.map((router) => (
                     <option key={router.id} value={router.id}>
-                      {router.name} ({router.host})
+                      {router.name} ({router.host}){router.enabled === false ? " · Paused" : ""}
                     </option>
                   ))}
                 </select>
@@ -1433,7 +1617,7 @@ export default function Dashboard() {
                 {interfaceOptions.length > 0 && !interfaceLoadFailed ? (
                   <select
                     value={form.interface}
-                    onChange={(e) => setForm((prev) => ({ ...prev, interface: e.target.value }))}
+                    onChange={(e) => setForm((prev) => ({ ...prev, interface: e.target.value, allowed: "" }))}
                     className="rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700"
                   >
                     {interfaceOptions.map((iface) => (
@@ -1445,7 +1629,7 @@ export default function Dashboard() {
                 ) : (
                   <input
                     value={form.interface}
-                    onChange={(e) => setForm((prev) => ({ ...prev, interface: e.target.value }))}
+                    onChange={(e) => setForm((prev) => ({ ...prev, interface: e.target.value, allowed: "" }))}
                     className="rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700"
                     placeholder="wgmik"
                   />
@@ -1464,27 +1648,50 @@ export default function Dashboard() {
               </div>
 
               <div className="grid gap-2">
+                <label className="text-xs text-gray-500 dark:text-gray-400">Config name (optional)</label>
+                <input
+                  value={form.configName}
+                  onChange={(e) => setForm((prev) => ({ ...prev, configName: e.target.value }))}
+                  className="rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700"
+                  placeholder="Used as download filename"
+                />
+              </div>
+
+              <div className="grid gap-2">
                 <label className="text-xs text-gray-500 dark:text-gray-400">Allowed address (inbound)</label>
                 <input
                   value={form.allowed}
                   onChange={(e) => setForm((prev) => ({ ...prev, allowed: e.target.value }))}
                   className="rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700"
-                  placeholder="10.65.74.100/32"
+                  placeholder="Auto-suggested from interface subnet"
                 />
               </div>
 
               <div className="grid gap-2">
                 <div className="flex items-center justify-between">
                   <label className="text-xs text-gray-500 dark:text-gray-400">Keys</label>
-                  <button onClick={generateKeypair} className="text-xs rounded-full bg-gray-900 text-white px-3 py-1 shadow hover:bg-black dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white">Generate</button>
+                  <button type="button" onClick={generateKeypair} className="text-xs rounded-full bg-gray-900 text-white px-3 py-1 shadow hover:bg-black dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white">Generate</button>
                 </div>
-                <label className="text-xs text-gray-500 dark:text-gray-400">Private key (base64)</label>
-                <input
-                  value={form.privateKey}
-                  onChange={(e) => setForm((prev) => ({ ...prev, privateKey: e.target.value, publicKey: "" }))}
-                  className="rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700"
-                  placeholder="PrivateKey (base64)"
-                />
+                <label className="text-xs text-gray-500 dark:text-gray-400">Private key</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type={showAddPrivateKey ? "text" : "password"}
+                    value={form.privateKey}
+                    onChange={(e) => setForm((prev) => ({ ...prev, privateKey: e.target.value, publicKey: "" }))}
+                    className="w-full rounded-xl border border-gray-200 px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700"
+                    placeholder="base64 32-byte key"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowAddPrivateKey((s) => !s)}
+                    className="shrink-0 rounded-full border border-gray-200 dark:border-gray-800 px-3 py-2 text-xs bg-white dark:bg-gray-950"
+                  >
+                    {showAddPrivateKey ? "Hide" : "Show"}
+                  </button>
+                </div>
+                {form.privateKey.trim() && !isValidAddPrivateKey && (
+                  <div className="text-xs text-rose-600">Private key must be base64 (32 bytes).</div>
+                )}
                 <label className="text-xs text-gray-500 dark:text-gray-400">Public key (auto)</label>
                 <input
                   readOnly
@@ -1498,32 +1705,60 @@ export default function Dashboard() {
               <div className="grid gap-2">
                 <div className="flex items-center justify-between">
                   <label className="text-xs text-gray-500 dark:text-gray-400">Preshared key (optional)</label>
-                  <button onClick={generatePsk} className="text-xs rounded-full bg-gray-100 text-gray-800 px-3 py-1 shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700">Generate</button>
+                  <button type="button" onClick={generatePsk} className="text-xs rounded-full bg-gray-100 text-gray-800 px-3 py-1 shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700">Generate</button>
                 </div>
-                <input
-                  value={form.psk}
-                  onChange={(e) => setForm((prev) => ({ ...prev, psk: e.target.value, usePsk: !!e.target.value }))}
-                  className="rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700"
-                  placeholder="PresharedKey (base64)"
-                />
+                <div className="flex items-center gap-2">
+                  <input
+                    type={showAddPresharedKey ? "text" : "password"}
+                    value={form.presharedKey}
+                    onChange={(e) => setForm((prev) => ({ ...prev, presharedKey: e.target.value }))}
+                    className="w-full rounded-xl border border-gray-200 px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700"
+                    placeholder="base64 32-byte key"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowAddPresharedKey((s) => !s)}
+                    className="shrink-0 rounded-full border border-gray-200 dark:border-gray-800 px-3 py-2 text-xs bg-white dark:bg-gray-950"
+                  >
+                    {showAddPresharedKey ? "Hide" : "Show"}
+                  </button>
+                </div>
+                {form.presharedKey.trim() && !isValidAddPresharedKey && (
+                  <div className="text-xs text-rose-600">Preshared key must be base64 (32 bytes), or leave empty.</div>
+                )}
               </div>
 
               <div className="flex items-center gap-3 pt-2">
                 <button
-                  disabled={addBusy || !form.routerId || !form.name || !form.publicKey || !form.allowed || form.allowed.trim() === "0.0.0.0/0" || form.allowed.trim() === "::/0"}
+                  disabled={
+                    addBusy ||
+                    !form.routerId ||
+                    !form.name.trim() ||
+                    !isValidAddPrivateKey ||
+                    !form.publicKey ||
+                    !form.allowed.trim() ||
+                    form.allowed.trim() === "0.0.0.0/0" ||
+                    form.allowed.trim() === "::/0" ||
+                    !isValidAddPresharedKey
+                  }
                   onClick={async () => {
                     setAddErr("");
                     try {
                       if (!form.routerId) throw new Error("Select a router first.");
+                      if (!isValidAddPrivateKey) throw new Error("Generate or enter a valid private key first.");
+                      if (!isValidAddPresharedKey) throw new Error("Fix the preshared key or leave it empty.");
                       setAddBusy(true);
                       await createRouterPeer(form.routerId, {
                         interface: form.interface || "wgmik",
                         name: form.name.trim(),
                         public_key: form.publicKey,
                         private_key: form.privateKey.trim(),
+                        preshared_key: form.presharedKey.trim() || undefined,
+                        config_name: form.configName.trim() || undefined,
+                        custom_endpoint: form.customEndpoint.trim() || undefined,
                         allowed_address: form.allowed.trim(),
-                        comment: "",
                       });
+                      setLastAddRouterId(form.routerId);
                       setShowAdd(false);
                       await refreshDashboardData();
                     } catch (e: any) {
@@ -1544,11 +1779,26 @@ export default function Dashboard() {
                 </button>
               </div>
               {addErr && <div className="text-sm text-red-600">{addErr}</div>}
-              <div className="text-xs text-gray-500 dark:text-gray-400">Save creates the peer on the selected router and stores the client private key encrypted so you can see it later.</div>
+              <div className="text-xs text-gray-500 dark:text-gray-400">Save creates the peer on the selected router and stores the client private key, preshared key, config name, and custom endpoint for the peer detail view.</div>
             </div>
 
             <div className="grid gap-3">
-              <div className="text-sm text-gray-700 dark:text-gray-200">Client config (QR)</div>
+              <div className="flex items-center justify-between">
+                <div className="text-sm text-gray-700 dark:text-gray-200">Client config</div>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(addClientConfig);
+                    } catch {
+                      // ignore
+                    }
+                  }}
+                  className="rounded-full bg-gray-100 text-gray-800 px-3 py-1 text-xs shadow hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-100 dark:hover:bg-gray-700"
+                >
+                  Copy
+                </button>
+              </div>
               <div className="grid gap-2">
                 <label className="text-xs text-gray-500 dark:text-gray-400">Server public key</label>
                 <input
@@ -1559,12 +1809,20 @@ export default function Dashboard() {
                 />
               </div>
               <div className="grid gap-2">
-                <label className="text-xs text-gray-500 dark:text-gray-400">Endpoint</label>
+                <label className="text-xs text-gray-500 dark:text-gray-400">Custom endpoint (optional)</label>
                 <input
-                  value={form.endpoint}
-                  onChange={(e) => setForm((prev) => ({ ...prev, endpoint: e.target.value }))}
+                  value={form.customEndpoint}
+                  onChange={(e) => setForm((prev) => ({ ...prev, customEndpoint: e.target.value }))}
                   className="rounded-xl border border-gray-200 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800 dark:focus:ring-gray-700"
-                  placeholder="host:port"
+                  placeholder="vpn.example.com or 1.2.3.4:8080"
+                />
+              </div>
+              <div className="grid gap-2">
+                <label className="text-xs text-gray-500 dark:text-gray-400">Endpoint preview</label>
+                <input
+                  readOnly
+                  value={addEndpoint}
+                  className="rounded-xl border border-gray-200 px-3 py-2 text-sm bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100 dark:border-gray-800"
                 />
               </div>
               <div className="grid gap-2">
@@ -1610,13 +1868,27 @@ export default function Dashboard() {
                 />
               </div>
               <div className="rounded-2xl bg-gray-50 dark:bg-gray-950 ring-1 ring-gray-200 dark:ring-gray-800 p-4 min-h-[320px] flex items-center justify-center">
-                {qrConfig ? <QRCode value={qrConfig} size={256} /> : <div className="text-sm text-gray-500 dark:text-gray-400">Generate or fill required fields to preview QR</div>}
+                {isValidAddPrivateKey ? (
+                  <QRCode value={addClientConfig} size={256} />
+                ) : (
+                  <div className="text-sm text-gray-500 dark:text-gray-400 text-center">
+                    Generate or paste a valid private key to render a QR code.
+                  </div>
+                )}
               </div>
               <textarea
                 readOnly
-                value={qrConfig}
+                value={addClientConfig}
                 className="min-h-[180px] rounded-2xl border border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-950 px-3 py-2 text-xs font-mono text-gray-800 dark:text-gray-100"
               />
+              <button
+                type="button"
+                onClick={downloadAddClientConfigFile}
+                disabled={!addClientConfig}
+                className="justify-self-start rounded-full bg-gray-900 text-white px-4 py-2 text-sm shadow hover:bg-black disabled:opacity-50 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white"
+              >
+                Save config file
+              </button>
             </div>
           </div>
         </div>

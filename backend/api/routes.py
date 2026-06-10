@@ -1,22 +1,34 @@
 from fastapi import APIRouter, Depends, HTTPException, Response, Request, Query, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from sqlalchemy import func, text
+from sqlalchemy import func, or_, text
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from ..db import get_db, Base, engine, SessionLocal
+from ..db import get_db, Base, engine, SessionLocal, sqlite_database_path
+from ..destructive_ops import exclusive_operation_gate, ExclusiveOperationInProgress
 from ..settings import settings
-from ..scheduler import update_scheduler_interval
+from ..scheduler import (
+    update_scheduler_interval,
+    set_polling_paused,
+    reschedule_usage_maintenance_job,
+    get_usage_maintenance_next_run,
+)
 from ..security import SecretBox
-from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User, FairUsageRule, FairUsageAssignment, FairUsageState, FairUsageTier
+from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User, UserSecurityEvent, FairUsageRule, FairUsageAssignment, FairUsageState, FairUsageTier, PeerTotalsMerge, TelegramPeerBinding, TelegramSignupToken, TelegramNotificationLog
 from ..auth import verify_password, get_password_hash, create_access_token, verify_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from ..routeros.factory import make_client
+from ..routeros.version import assert_routeros_supported, is_routeros_supported
 from ..usage_maintenance import (
+    cancel_usage_maintenance,
+    get_last_auto_run,
     get_usage_maintenance_status,
     is_usage_maintenance_running,
+    load_auto_maintenance_settings,
+    normalize_auto_maintenance_settings,
     start_usage_maintenance,
 )
 from ..fair_usage_sync import (
+    FU_QUEUE_PREFIX,
     apply_fair_usage_policy,
     FairUsageRouterError,
     peer_ids_with_applicable_fair_usage,
@@ -34,12 +46,18 @@ from ..fair_usage_peer_status_dto import (
 )
 from ..fair_usage_tiers import ordered_tiers_for_rule, replace_rule_tiers
 from ..usage_bucketing import aggregate_rows_to_local_buckets, aggregate_router_rows_to_local_buckets
-from ..wg_export_prefs import merge_wgmik_endpoint_in_comment, parse_wgmik_endpoint_from_comment
+from ..calendar_utils import (
+    app_date_calendar,
+    normalize_date_calendar,
+    selected_month_bounds_utc,
+)
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 import traceback
 from ipaddress import ip_network
 import os
+import sqlite3
+import httpx
 from zoneinfo import ZoneInfo
 import base64
 import json
@@ -86,6 +104,11 @@ def _normalize_router_ids(router_ids: Optional[List[int]]) -> Optional[List[int]
         seen.add(rid)
         out.append(rid)
     return out
+
+
+def _normalize_dashboard_router_scope(value: Optional[str]) -> str:
+    value = (value or "all").strip().lower()
+    return value if value in {"all", "selected"} else "all"
 
 
 def _resolve_router_filter(
@@ -420,12 +443,73 @@ def _peer_is_online(last_handshake: Optional[int], disabled: bool) -> bool:
     return last_handshake <= settings.online_threshold_seconds
 
 
-def _fetch_all_router_peers(router_row: Router):
-    client = make_client(router_row)
+def _fetch_all_router_peers(router_row: Router, timeout: Optional[float] = None):
+    client = make_client(router_row, timeout=timeout) if timeout is not None else make_client(router_row)
     return router_row.id, client.list_all_wireguard_peers()
 
 
+# Per-router timeout for the dashboard live_status batched call. An unreachable router
+# should fail fast so the overall HTTP response doesn't stall (and get clobbered by the
+# next poll on the client side).
+_DASHBOARD_LIVE_STATUS_ROUTER_TIMEOUT = 4.0
+
+
 # --- Authentication & Users ---
+_LOGIN_FAILURE_LIMIT = 5
+_LOGIN_LOCK_MINUTES = 15
+_PASSWORD_MIN_LENGTH = 12
+
+
+def _record_user_security_event(
+    db: Session,
+    event_type: str,
+    *,
+    actor_user_id: Optional[int] = None,
+    target_user_id: Optional[int] = None,
+    detail: Optional[object] = None,
+) -> None:
+    encoded = ""
+    if detail is not None:
+        encoded = detail if isinstance(detail, str) else json.dumps(detail, separators=(",", ":"), sort_keys=True)
+    db.add(
+        UserSecurityEvent(
+            actor_user_id=actor_user_id,
+            target_user_id=target_user_id,
+            event_type=event_type,
+            detail=encoded,
+        )
+    )
+
+
+def _validate_password_policy(password: str) -> None:
+    if len(password) < _PASSWORD_MIN_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {_PASSWORD_MIN_LENGTH} characters long",
+        )
+
+
+def _is_user_locked(user: User, now: Optional[datetime] = None) -> bool:
+    if user.locked_until is None:
+        return False
+    ref = now or datetime.utcnow()
+    return user.locked_until > ref
+
+
+def _revoke_user_sessions(user: User) -> None:
+    user.session_version = int(user.session_version or 0) + 1
+
+
+def _set_auth_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+
 
 def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     token = request.cookies.get("access_token")
@@ -434,17 +518,27 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
         )
-    username = verify_token(token)
-    if username is None:
+    claims = verify_token(token)
+    if claims is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
         )
-    user = db.query(User).filter(User.username == username).first()
+    user = db.get(User, claims["user_id"])
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found",
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User inactive",
+        )
+    if int(user.session_version or 0) != claims["session_version"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
         )
     return user
 
@@ -456,27 +550,89 @@ class LoginRequest(BaseModel):
 
 @router.post("/auth/login")
 def login(creds: LoginRequest, response: Response, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == creds.username).first()
-    if not user or not verify_password(creds.password, user.hashed_password):
+    username = creds.username.strip()
+    now = datetime.utcnow()
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        _record_user_security_event(
+            db,
+            "login_failure",
+            detail={"username": username, "reason": "unknown_username"},
+        )
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
         )
-    
+
+    if not user.is_active:
+        _record_user_security_event(
+            db,
+            "login_failure",
+            target_user_id=user.id,
+            detail={"username": username, "reason": "inactive"},
+        )
+        db.commit()
+        raise HTTPException(status_code=403, detail="Account is inactive")
+
+    if _is_user_locked(user, now):
+        _record_user_security_event(
+            db,
+            "login_failure",
+            target_user_id=user.id,
+            detail={"username": username, "reason": "locked", "locked_until": user.locked_until.isoformat()},
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=423,
+            detail="Account is temporarily locked. Ask another admin to unlock it or wait 15 minutes.",
+        )
+
+    if not verify_password(creds.password, user.hashed_password):
+        user.failed_login_attempts = int(user.failed_login_attempts or 0) + 1
+        _record_user_security_event(
+            db,
+            "login_failure",
+            target_user_id=user.id,
+            detail={"username": username, "reason": "bad_password", "attempts": user.failed_login_attempts},
+        )
+        if user.failed_login_attempts >= _LOGIN_FAILURE_LIMIT:
+            user.locked_until = now + timedelta(minutes=_LOGIN_LOCK_MINUTES)
+            _record_user_security_event(
+                db,
+                "account_lock",
+                target_user_id=user.id,
+                detail={"username": username, "locked_until": user.locked_until.isoformat()},
+            )
+            db.commit()
+            raise HTTPException(
+                status_code=423,
+                detail="Account is temporarily locked. Ask another admin to unlock it or wait 15 minutes.",
+            )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+        )
+
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    user.last_login_at = now
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
+        user.id,
+        int(user.session_version or 1),
+        expires_delta=access_token_expires,
     )
-    
-    # Set HTTP-only cookie
-    response.set_cookie(
-        key="access_token",
-        value=access_token,
-        httponly=True,
-        samesite="lax",
-        secure=False, # Set to True in production with HTTPS
-        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    _record_user_security_event(
+        db,
+        "login_success",
+        actor_user_id=user.id,
+        target_user_id=user.id,
+        detail={"username": username},
     )
+    db.commit()
+    _set_auth_cookie(response, access_token)
     return {"ok": True}
 
 
@@ -486,11 +642,88 @@ def logout(response: Response):
     return {"ok": True}
 
 
+class SetupStateDTO(BaseModel):
+    needs_initial_setup: bool
+
+
+@router.get("/auth/setup-state", response_model=SetupStateDTO)
+def setup_state(db: Session = Depends(get_db)):
+    user_count = int(db.query(func.count(User.id)).scalar() or 0)
+    return SetupStateDTO(needs_initial_setup=user_count == 0)
+
+
+class InitialSetupRequest(BaseModel):
+    username: str
+    password: str
+
+
+@router.post("/auth/setup")
+def initial_setup(req: InitialSetupRequest, response: Response, db: Session = Depends(get_db)):
+    """Create the first admin account during first-run onboarding.
+
+    Only succeeds while the user table is empty; once any user exists this
+    becomes a 409 so the endpoint can't be used to seed extra admins.
+    """
+    existing_count = int(db.query(func.count(User.id)).scalar() or 0)
+    if existing_count > 0:
+        raise HTTPException(status_code=409, detail="Setup already completed")
+
+    username = (req.username or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+    _validate_password_policy(req.password)
+
+    now = datetime.utcnow()
+    user = User(
+        username=username,
+        hashed_password=get_password_hash(req.password),
+        is_admin=True,
+        is_active=True,
+        session_version=1,
+        password_changed_at=now,
+        must_change_password=False,
+        last_login_at=now,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    access_token = create_access_token(
+        user.id,
+        int(user.session_version or 1),
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+    _record_user_security_event(
+        db,
+        "initial_setup",
+        actor_user_id=user.id,
+        target_user_id=user.id,
+        detail={"username": username},
+    )
+    db.commit()
+    _set_auth_cookie(response, access_token)
+    return {"ok": True}
+
+
 class UserDTO(BaseModel):
     id: int
     username: str
     is_admin: bool
+    is_active: bool
+    last_login_at: Optional[datetime]
+    locked_until: Optional[datetime]
+    must_change_password: bool
     created_at: datetime
+
+
+class AuthBootstrapDTO(BaseModel):
+    user: UserDTO
+    router_count: int
+    enabled_router_count: int
+    peer_count: int
+    selected_peer_count: int
+    needs_onboarding: bool
+    needs_peer_import: bool
 
 
 @router.get("/auth/me", response_model=UserDTO)
@@ -500,10 +733,35 @@ def read_users_me(current_user: User = Depends(get_current_user)):
 
 def user_to_dto(u: User) -> UserDTO:
     return UserDTO(
-        id=u.id, 
-        username=u.username, 
-        is_admin=u.is_admin, 
-        created_at=u.created_at
+        id=u.id,
+        username=u.username,
+        is_admin=u.is_admin,
+        is_active=u.is_active,
+        last_login_at=u.last_login_at,
+        locked_until=u.locked_until,
+        must_change_password=u.must_change_password,
+        created_at=u.created_at,
+    )
+
+
+@router.get("/auth/bootstrap", response_model=AuthBootstrapDTO)
+def auth_bootstrap(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    router_count = int(db.query(func.count(Router.id)).scalar() or 0)
+    enabled_router_count = int(
+        db.query(func.count(Router.id)).filter(Router.enabled == True).scalar() or 0  # noqa: E712
+    )
+    peer_count = int(db.query(func.count(Peer.id)).scalar() or 0)
+    selected_peer_count = int(
+        db.query(func.count(Peer.id)).filter(Peer.selected == True).scalar() or 0  # noqa: E712
+    )
+    return AuthBootstrapDTO(
+        user=user_to_dto(current_user),
+        router_count=router_count,
+        enabled_router_count=enabled_router_count,
+        peer_count=peer_count,
+        selected_peer_count=selected_peer_count,
+        needs_onboarding=router_count == 0,
+        needs_peer_import=router_count > 0 and peer_count == 0,
     )
 
 
@@ -514,47 +772,185 @@ class CreateUserRequest(BaseModel):
 
 @router.post("/users", response_model=UserDTO)
 def create_user(req: CreateUserRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    existing = db.query(User).filter(User.username == req.username).first()
+    _require_admin(current_user)
+    username = req.username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+    _validate_password_policy(req.password)
+    existing = db.query(User).filter(User.username == username).first()
     if existing:
         raise HTTPException(status_code=400, detail="Username already exists")
-    
+
+    now = datetime.utcnow()
     user = User(
-        username=req.username,
+        username=username,
         hashed_password=get_password_hash(req.password),
-        is_admin=True # For now only creating admins
+        is_admin=True,
+        is_active=True,
+        session_version=1,
+        password_changed_at=now,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
+    _record_user_security_event(
+        db,
+        "user_create",
+        actor_user_id=current_user.id,
+        target_user_id=user.id,
+        detail={"username": user.username},
+    )
+    db.commit()
     return user_to_dto(user)
 
 
 @router.get("/users", response_model=List[UserDTO])
 def list_users(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    users = db.query(User).all()
+    _require_admin(current_user)
+    users = db.query(User).order_by(User.username.asc()).all()
     return [user_to_dto(u) for u in users]
+
+
+class UpdateUserRequest(BaseModel):
+    is_active: Optional[bool] = None
+    unlock: Optional[bool] = None
+
+
+@router.patch("/users/{user_id}", response_model=UserDTO)
+def update_user(
+    user_id: int,
+    req: UpdateUserRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(current_user)
+    if req.is_active is None and not req.unlock:
+        raise HTTPException(status_code=400, detail="No user changes requested")
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if req.unlock:
+        user.failed_login_attempts = 0
+        user.locked_until = None
+        _record_user_security_event(
+            db,
+            "user_unlock",
+            actor_user_id=current_user.id,
+            target_user_id=user.id,
+            detail={"username": user.username},
+        )
+
+    if req.is_active is not None and req.is_active != user.is_active:
+        if user.id == current_user.id and req.is_active is False:
+            raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
+        user.is_active = req.is_active
+        _revoke_user_sessions(user)
+        _record_user_security_event(
+            db,
+            "user_reactivate" if req.is_active else "user_deactivate",
+            actor_user_id=current_user.id,
+            target_user_id=user.id,
+            detail={"username": user.username},
+        )
+
+    db.commit()
+    db.refresh(user)
+    return user_to_dto(user)
+
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str
+
+
+@router.post("/users/{user_id}/reset-password")
+def reset_user_password(
+    user_id: int,
+    req: AdminResetPasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(current_user)
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Use change password for your own account")
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    _validate_password_policy(req.new_password)
+    now = datetime.utcnow()
+    user.hashed_password = get_password_hash(req.new_password)
+    user.password_changed_at = now
+    user.must_change_password = True
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    _revoke_user_sessions(user)
+    _record_user_security_event(
+        db,
+        "admin_password_reset",
+        actor_user_id=current_user.id,
+        target_user_id=user.id,
+        detail={"username": user.username},
+    )
+    db.commit()
+    return {"ok": True}
 
 
 @router.delete("/users/{user_id}")
 def delete_user(user_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # Don't delete yourself
+    _require_admin(current_user)
     if user_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
-        
+
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-        
+    if user.is_active:
+        raise HTTPException(status_code=400, detail="Deactivate the account before deleting it")
+
+    _record_user_security_event(
+        db,
+        "user_delete",
+        actor_user_id=current_user.id,
+        detail={"username": user.username, "deleted_user_id": user.id},
+    )
     db.delete(user)
     db.commit()
+    return {"ok": True}
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@router.post("/auth/change-password")
+def change_password(
+    req: ChangePasswordRequest,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not verify_password(req.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    _validate_password_policy(req.new_password)
+    if verify_password(req.new_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="New password must be different")
+
+    current_user.hashed_password = get_password_hash(req.new_password)
+    current_user.password_changed_at = datetime.utcnow()
+    current_user.must_change_password = False
+    current_user.failed_login_attempts = 0
+    current_user.locked_until = None
+    _revoke_user_sessions(current_user)
+    _record_user_security_event(
+        db,
+        "password_change",
+        actor_user_id=current_user.id,
+        target_user_id=current_user.id,
+        detail={"username": current_user.username},
+    )
+    db.commit()
+    response.delete_cookie("access_token")
     return {"ok": True}
 
 
@@ -566,10 +962,11 @@ class SettingsDTO(BaseModel):
     online_threshold_seconds: int
     monthly_reset_day: int
     timezone: str
+    date_calendar: str = "gregorian"
     week_start_day: int
     show_kind_pills: bool
     show_hw_stats: bool
-    dashboard_refresh_seconds: int
+    dashboard_peer_preview_count: int = 6
     peer_default_scope_unit: str
     peer_default_scope_value: int
     dashboard_scope_unit: str
@@ -578,12 +975,28 @@ class SettingsDTO(BaseModel):
     dashboard_selected_router_ids: List[int]
     dashboard_filter_status: str
     dashboard_sort_by: str
+    dashboard_time_mode: str = "rolling"
+    dashboard_custom_start: str = ""
+    dashboard_custom_end: str = ""
     dashboard_time_frame_today: bool = False
+    peer_time_mode: str = "rolling"
+    peer_custom_start: str = ""
+    peer_custom_end: str = ""
     peer_time_frame_today: bool = False
-    peer_refresh_seconds: int
     raw_sample_retention_hours: int
     minute_rollup_retention_days: int
     daily_rollup_retention_days: int
+    usage_maintenance_auto_enabled: bool = False
+    usage_maintenance_auto_frequency: str = "daily"
+    usage_maintenance_auto_interval_days: int = 2
+    usage_maintenance_auto_weekday: int = 6
+    usage_maintenance_auto_time: str = "04:30"
+    usage_maintenance_backup_keep: int = 3
+
+
+def _normalize_usage_time_mode(value: Optional[str]) -> str:
+    value = (value or "rolling").strip().lower()
+    return value if value in {"today", "this_month", "all_time", "rolling", "custom"} else "rolling"
 
 
 class MetricsDTO(BaseModel):
@@ -645,21 +1058,27 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
         "online_threshold_seconds": settings.online_threshold_seconds,
         "monthly_reset_day": settings.monthly_reset_day,
         "timezone": settings.timezone,
+        "date_calendar": app_date_calendar(),
         "week_start_day": 0,
         "show_kind_pills": True,
         "show_hw_stats": True,
-        "dashboard_refresh_seconds": 30,
-        "peer_default_scope_unit": "days",
-        "peer_default_scope_value": 14,
-        "dashboard_scope_unit": "days",
-        "dashboard_scope_value": 14,
+        "dashboard_peer_preview_count": 6,
+        "peer_default_scope_unit": "minutes",
+        "peer_default_scope_value": 60,
+        "dashboard_scope_unit": "hours",
+        "dashboard_scope_value": 24,
         "dashboard_router_scope": "all",
         "dashboard_selected_router_ids": [],
         "dashboard_filter_status": "all",
         "dashboard_sort_by": "created",
+        "dashboard_time_mode": "rolling",
+        "dashboard_custom_start": "",
+        "dashboard_custom_end": "",
         "dashboard_time_frame_today": False,
+        "peer_time_mode": "rolling",
+        "peer_custom_start": "",
+        "peer_custom_end": "",
         "peer_time_frame_today": False,
-        "peer_refresh_seconds": 30,
         "raw_sample_retention_hours": 24,
         "minute_rollup_retention_days": 90,
         "daily_rollup_retention_days": 0,
@@ -667,9 +1086,10 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
     # Overlay any values persisted in SettingsKV
     for key in (
         "week_start_day",
+        "date_calendar",
         "show_kind_pills",
         "show_hw_stats",
-        "dashboard_refresh_seconds",
+        "dashboard_peer_preview_count",
         "peer_default_scope_unit",
         "peer_default_scope_value",
         "dashboard_scope_unit",
@@ -678,9 +1098,14 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
         "dashboard_selected_router_ids",
         "dashboard_filter_status",
         "dashboard_sort_by",
+        "dashboard_time_mode",
+        "dashboard_custom_start",
+        "dashboard_custom_end",
         "dashboard_time_frame_today",
+        "peer_time_mode",
+        "peer_custom_start",
+        "peer_custom_end",
         "peer_time_frame_today",
-        "peer_refresh_seconds",
         "raw_sample_retention_hours",
         "minute_rollup_retention_days",
         "daily_rollup_retention_days",
@@ -690,10 +1115,9 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
             continue
         if key in (
             "week_start_day",
-            "dashboard_refresh_seconds",
+            "dashboard_peer_preview_count",
             "peer_default_scope_value",
             "dashboard_scope_value",
-            "peer_refresh_seconds",
             "raw_sample_retention_hours",
             "minute_rollup_retention_days",
             "daily_rollup_retention_days",
@@ -709,6 +1133,8 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
                     data[key] = [rid for rid in _normalize_router_ids(parsed) or []]
             except Exception:
                 data[key] = []
+        elif key == "dashboard_router_scope":
+            data[key] = _normalize_dashboard_router_scope(kv.value)
         elif key in (
             "show_kind_pills",
             "show_hw_stats",
@@ -716,6 +1142,8 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
             "peer_time_frame_today",
         ):
             data[key] = kv.value.lower() == "true"
+        elif key == "date_calendar":
+            data[key] = normalize_date_calendar(kv.value)
         else:
             data[key] = kv.value
     # Back-compat: if dashboard_scope_days exists but new keys don't, treat it as days.
@@ -727,9 +1155,19 @@ def get_settings(db: Session = Depends(get_db), current_user: User = Depends(get
                 data["dashboard_scope_value"] = int(legacy.value)
             except ValueError:
                 pass
+    if not db.get(SettingsKV, "dashboard_time_mode") and data.get("dashboard_time_frame_today"):
+        data["dashboard_time_mode"] = "today"
+    if not db.get(SettingsKV, "peer_time_mode") and data.get("peer_time_frame_today"):
+        data["peer_time_mode"] = "today"
+    data["dashboard_time_mode"] = _normalize_usage_time_mode(data.get("dashboard_time_mode"))
+    data["peer_time_mode"] = _normalize_usage_time_mode(data.get("peer_time_mode"))
     data["raw_sample_retention_hours"] = max(1, min(24 * 365, int(data["raw_sample_retention_hours"])))
     data["minute_rollup_retention_days"] = max(1, min(3650, int(data["minute_rollup_retention_days"])))
     data["daily_rollup_retention_days"] = max(0, min(36500, int(data["daily_rollup_retention_days"])))
+    data.update(load_auto_maintenance_settings(db))
+    data["monthly_reset_day"] = max(1, min(31, int(data["monthly_reset_day"])))
+    data["dashboard_peer_preview_count"] = max(1, min(50, int(data.get("dashboard_peer_preview_count", 6))))
+    data["date_calendar"] = normalize_date_calendar(data.get("date_calendar"))
     return SettingsDTO(**data)
 
 
@@ -748,28 +1186,54 @@ def update_settings(dto: SettingsDTO, db: Session = Depends(get_db), current_use
         # Core settings
         "poll_interval_seconds": str(dto.poll_interval_seconds),
         "online_threshold_seconds": str(dto.online_threshold_seconds),
-        "monthly_reset_day": str(dto.monthly_reset_day),
+        "monthly_reset_day": str(max(1, min(31, int(dto.monthly_reset_day)))),
         "timezone": dto.timezone,
+        "date_calendar": normalize_date_calendar(dto.date_calendar),
         "week_start_day": str(max(0, min(6, int(dto.week_start_day)))),
         # UI preferences
         "show_kind_pills": str(dto.show_kind_pills).lower(),
         "show_hw_stats": str(dto.show_hw_stats).lower(),
-        "dashboard_refresh_seconds": str(dto.dashboard_refresh_seconds),
+        "dashboard_peer_preview_count": str(max(1, min(50, int(dto.dashboard_peer_preview_count)))),
         "peer_default_scope_unit": dto.peer_default_scope_unit,
         "peer_default_scope_value": str(dto.peer_default_scope_value),
         "dashboard_scope_unit": dto.dashboard_scope_unit,
         "dashboard_scope_value": str(dto.dashboard_scope_value),
-        "dashboard_router_scope": dto.dashboard_router_scope,
+        "dashboard_router_scope": _normalize_dashboard_router_scope(dto.dashboard_router_scope),
         "dashboard_selected_router_ids": json.dumps(_normalize_router_ids(dto.dashboard_selected_router_ids) or []),
         "dashboard_filter_status": dto.dashboard_filter_status,
         "dashboard_sort_by": dto.dashboard_sort_by,
+        "dashboard_time_mode": _normalize_usage_time_mode(dto.dashboard_time_mode),
+        "dashboard_custom_start": dto.dashboard_custom_start,
+        "dashboard_custom_end": dto.dashboard_custom_end,
         "dashboard_time_frame_today": str(dto.dashboard_time_frame_today).lower(),
+        "peer_time_mode": _normalize_usage_time_mode(dto.peer_time_mode),
+        "peer_custom_start": dto.peer_custom_start,
+        "peer_custom_end": dto.peer_custom_end,
         "peer_time_frame_today": str(dto.peer_time_frame_today).lower(),
-        "peer_refresh_seconds": str(dto.peer_refresh_seconds),
         "raw_sample_retention_hours": str(max(1, min(24 * 365, int(dto.raw_sample_retention_hours)))),
         "minute_rollup_retention_days": str(max(1, min(3650, int(dto.minute_rollup_retention_days)))),
         "daily_rollup_retention_days": str(max(0, min(36500, int(dto.daily_rollup_retention_days)))),
     }
+    auto_schedule = normalize_auto_maintenance_settings(
+        {
+            "usage_maintenance_auto_enabled": dto.usage_maintenance_auto_enabled,
+            "usage_maintenance_auto_frequency": dto.usage_maintenance_auto_frequency,
+            "usage_maintenance_auto_interval_days": dto.usage_maintenance_auto_interval_days,
+            "usage_maintenance_auto_weekday": dto.usage_maintenance_auto_weekday,
+            "usage_maintenance_auto_time": dto.usage_maintenance_auto_time,
+            "usage_maintenance_backup_keep": dto.usage_maintenance_backup_keep,
+        }
+    )
+    overrides.update(
+        {
+            "usage_maintenance_auto_enabled": "1" if auto_schedule["usage_maintenance_auto_enabled"] else "0",
+            "usage_maintenance_auto_frequency": auto_schedule["usage_maintenance_auto_frequency"],
+            "usage_maintenance_auto_interval_days": str(auto_schedule["usage_maintenance_auto_interval_days"]),
+            "usage_maintenance_auto_weekday": str(auto_schedule["usage_maintenance_auto_weekday"]),
+            "usage_maintenance_auto_time": auto_schedule["usage_maintenance_auto_time"],
+            "usage_maintenance_backup_keep": str(auto_schedule["usage_maintenance_backup_keep"]),
+        }
+    )
 
     for k, v in overrides.items():
         kv = db.get(SettingsKV, k)
@@ -778,12 +1242,18 @@ def update_settings(dto: SettingsDTO, db: Session = Depends(get_db), current_use
             db.add(kv)
         else:
             kv.value = v
+
+    for retired_key in ("dashboard_refresh_seconds", "peer_refresh_seconds", "active_router_id"):
+        retired = db.get(SettingsKV, retired_key)
+        if retired:
+            db.delete(retired)
     
     # Update runtime config for core logic (immediate effect without restart)
     settings.poll_interval_seconds = dto.poll_interval_seconds
     settings.online_threshold_seconds = dto.online_threshold_seconds
-    settings.monthly_reset_day = dto.monthly_reset_day
+    settings.monthly_reset_day = max(1, min(31, int(dto.monthly_reset_day)))
     settings.timezone = dto.timezone
+    settings.date_calendar = normalize_date_calendar(dto.date_calendar)
     
     # Hot-reload scheduler interval
     try:
@@ -792,6 +1262,13 @@ def update_settings(dto: SettingsDTO, db: Session = Depends(get_db), current_use
         pass
 
     db.commit()
+
+    # Hot-reload the auto-maintenance job (time/timezone may have changed)
+    try:
+        reschedule_usage_maintenance_job()
+    except Exception:
+        pass
+
     return get_settings(db)
 
 
@@ -803,6 +1280,7 @@ class RouterCreateDTO(BaseModel):
     username: str
     password: str
     tls_verify: bool = True
+    enabled: bool = True
 
 
 class RouterUpdateDTO(BaseModel):
@@ -813,6 +1291,7 @@ class RouterUpdateDTO(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
     tls_verify: Optional[bool] = None
+    enabled: Optional[bool] = None
 
 
 class RouterDTO(BaseModel):
@@ -823,6 +1302,10 @@ class RouterDTO(BaseModel):
     port: int
     username: str
     tls_verify: bool
+    enabled: bool = True
+    ros_version: str = ""
+    ros_version_checked_at: Optional[datetime] = None
+    ros_supported: bool = False
 
     class Config:
         from_attributes = True
@@ -831,7 +1314,276 @@ class WGInterfaceDTO(BaseModel):
     public_key: str
     listen_port: int
     public_host: str
+    addresses: List[str] = Field(default_factory=list)
 
+
+class RouterDeleteImpactDTO(BaseModel):
+    router_id: int
+    router_name: str
+    dashboard_selected: bool = False
+    peer_count: int = 0
+    selected_peer_count: int = 0
+    usage_sample_rows: int = 0
+    usage_minute_rows: int = 0
+    usage_daily_rows: int = 0
+    usage_monthly_rows: int = 0
+    quota_count: int = 0
+    action_count: int = 0
+    telegram_binding_count: int = 0
+    telegram_log_count: int = 0
+    signup_token_count: int = 0
+    fair_usage_assignment_count: int = 0
+    fair_usage_state_count: int = 0
+    router_rule_count: int = 0
+    merge_ledger_count: int = 0
+    peer_setting_count: int = 0
+
+
+class RouterDeleteResultDTO(RouterDeleteImpactDTO):
+    signup_tokens_updated: int = 0
+    signup_tokens_deleted: int = 0
+    backup_path: Optional[str] = None
+    post_delete_quick_check: str = ""
+
+
+_PEER_SCOPED_SETTINGS_PREFIXES = (
+    "peer_private_key",
+    "peer_preshared_key",
+    "peer_export_config_name",
+    "peer_export_endpoint",
+    "quota_valid_from",
+    "quota_valid_until",
+)
+
+
+def _peer_scoped_setting_keys(peer_ids: list[int]) -> list[str]:
+    keys: list[str] = []
+    for peer_id in peer_ids:
+        for prefix in _PEER_SCOPED_SETTINGS_PREFIXES:
+            keys.append(f"{prefix}:{peer_id}")
+    return keys
+
+
+def _normalized_dashboard_selected_router_ids(db: Session) -> list[int]:
+    kv = db.get(SettingsKV, "dashboard_selected_router_ids")
+    if not kv or not (kv.value or "").strip():
+        return []
+    try:
+        raw = json.loads(kv.value)
+    except Exception:
+        return []
+    return _normalize_router_ids(raw) or []
+
+
+def _router_delete_backup_path(db_path: str, router_id: int, router_name: str) -> str:
+    backup_dir = os.path.join(os.path.dirname(db_path), "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    safe_name = "".join(ch.lower() if ch.isalnum() else "-" for ch in router_name).strip("-") or "router"
+    return os.path.join(backup_dir, f"router-delete-{router_id}-{safe_name}-{stamp}.db")
+
+
+def _backup_sqlite_database_for_router_delete(router_id: int, router_name: str) -> Optional[str]:
+    db_path = sqlite_database_path()
+    if not db_path or not os.path.exists(db_path):
+        return None
+
+    backup_path = _router_delete_backup_path(db_path, router_id, router_name)
+    source = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True, timeout=30)
+    target = sqlite3.connect(backup_path, timeout=30)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+    return backup_path
+
+
+def _assert_sqlite_quick_check(db: Session, phase: str) -> str:
+    if not settings.database_url.startswith("sqlite:"):
+        return "skipped"
+    try:
+        rows = [str(row[0]) for row in db.execute(text("PRAGMA quick_check")).fetchall()]
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"database quick_check failed {phase}: {exc}") from exc
+    if rows == ["ok"]:
+        return "ok"
+    detail = "; ".join(rows[:5]) if rows else "unknown"
+    if len(rows) > 5:
+        detail += f"; ... ({len(rows)} messages)"
+    raise HTTPException(status_code=409, detail=f"database quick_check failed {phase}: {detail}")
+
+
+def _count_signup_tokens_referencing_peers(db: Session, peer_id_set: set[int]) -> int:
+    if not peer_id_set:
+        return 0
+    count = 0
+    for token in db.query(TelegramSignupToken).all():
+        try:
+            token_peer_ids = {
+                int(pid)
+                for pid in json.loads(token.peer_ids or "[]")
+                if int(pid) > 0
+            }
+        except Exception:
+            continue
+        if token_peer_ids & peer_id_set:
+            count += 1
+    return count
+
+
+def _router_delete_residue_counts(
+    db: Session,
+    *,
+    router_id: int,
+    peer_ids: list[int],
+    rule_ids: list[int],
+) -> dict[str, int]:
+    peer_id_set = set(peer_ids)
+    counts: dict[str, int] = {
+        "routers": db.query(Router).filter(Router.id == router_id).count(),
+        "peers": db.query(Peer).filter(Peer.router_id == router_id).count(),
+        "router_rules": db.query(FairUsageRule).filter(FairUsageRule.router_id == router_id).count(),
+    }
+    if peer_ids:
+        peer_setting_keys = _peer_scoped_setting_keys(peer_ids)
+        counts.update(
+            {
+                "usage_samples": db.query(UsageSample).filter(UsageSample.peer_id.in_(peer_ids)).count(),
+                "usage_minute": db.query(UsageMinute).filter(UsageMinute.peer_id.in_(peer_ids)).count(),
+                "usage_daily": db.query(UsageDaily).filter(UsageDaily.peer_id.in_(peer_ids)).count(),
+                "usage_monthly": db.query(UsageMonthly).filter(UsageMonthly.peer_id.in_(peer_ids)).count(),
+                "quotas": db.query(Quota).filter(Quota.peer_id.in_(peer_ids)).count(),
+                "actions": db.query(Action).filter(Action.peer_id.in_(peer_ids)).count(),
+                "telegram_bindings": db.query(TelegramPeerBinding).filter(TelegramPeerBinding.peer_id.in_(peer_ids)).count(),
+                "telegram_logs": db.query(TelegramNotificationLog).filter(TelegramNotificationLog.peer_id.in_(peer_ids)).count(),
+                "peer_settings": db.query(SettingsKV).filter(SettingsKV.key.in_(peer_setting_keys)).count() if peer_setting_keys else 0,
+                "signup_tokens": _count_signup_tokens_referencing_peers(db, peer_id_set),
+            }
+        )
+    if peer_ids or rule_ids:
+        assignment_clauses = []
+        state_clauses = []
+        if peer_ids:
+            assignment_clauses.append(FairUsageAssignment.peer_id.in_(peer_ids))
+            state_clauses.append(FairUsageState.peer_id.in_(peer_ids))
+        if rule_ids:
+            assignment_clauses.append(FairUsageAssignment.rule_id.in_(rule_ids))
+            state_clauses.append(FairUsageState.rule_id.in_(rule_ids))
+        counts["fair_usage_assignments"] = db.query(FairUsageAssignment).filter(or_(*assignment_clauses)).count()
+        counts["fair_usage_state"] = db.query(FairUsageState).filter(or_(*state_clauses)).count()
+    if rule_ids:
+        counts["fair_usage_tiers"] = db.query(FairUsageTier).filter(FairUsageTier.rule_id.in_(rule_ids)).count()
+        counts["fair_usage_rules"] = db.query(FairUsageRule).filter(FairUsageRule.id.in_(rule_ids)).count()
+
+    merge_clauses = [PeerTotalsMerge.source_router_id == router_id, PeerTotalsMerge.target_router_id == router_id]
+    if peer_ids:
+        merge_clauses.extend([
+            PeerTotalsMerge.source_peer_id.in_(peer_ids),
+            PeerTotalsMerge.target_peer_id.in_(peer_ids),
+        ])
+    counts["merge_ledger"] = db.query(PeerTotalsMerge).filter(or_(*merge_clauses)).count()
+    return counts
+
+
+def _assert_router_delete_has_no_residue(db: Session, router_id: int, peer_ids: list[int], rule_ids: list[int]) -> None:
+    residues = {
+        name: count
+        for name, count in _router_delete_residue_counts(
+            db,
+            router_id=router_id,
+            peer_ids=peer_ids,
+            rule_ids=rule_ids,
+        ).items()
+        if count
+    }
+    if residues:
+        detail = ", ".join(f"{name}={count}" for name, count in sorted(residues.items()))
+        raise HTTPException(status_code=500, detail=f"router delete incomplete; rolled back: {detail}")
+
+
+def _router_delete_impact(
+    db: Session,
+    row: Router,
+) -> tuple[RouterDeleteImpactDTO, list[int], list[int]]:
+    peer_ids = [int(pid) for (pid,) in db.query(Peer.id).filter(Peer.router_id == row.id).all()]
+    rule_ids = [int(rid) for (rid,) in db.query(FairUsageRule.id).filter(FairUsageRule.router_id == row.id).all()]
+    dashboard_selected_router_ids = _normalized_dashboard_selected_router_ids(db)
+    peer_setting_keys = _peer_scoped_setting_keys(peer_ids)
+    peer_id_set = set(peer_ids)
+
+    signup_token_count = 0
+    if peer_id_set:
+        for token in db.query(TelegramSignupToken).all():
+            try:
+                token_peer_ids = {
+                    int(pid)
+                    for pid in json.loads(token.peer_ids or "[]")
+                    if int(pid) > 0
+                }
+            except Exception:
+                continue
+            if token_peer_ids & peer_id_set:
+                signup_token_count += 1
+
+    rule_or_peer_clauses = []
+    if peer_ids:
+        rule_or_peer_clauses.append(FairUsageAssignment.peer_id.in_(peer_ids))
+    if rule_ids:
+        rule_or_peer_clauses.append(FairUsageAssignment.rule_id.in_(rule_ids))
+
+    state_clauses = []
+    if peer_ids:
+        state_clauses.append(FairUsageState.peer_id.in_(peer_ids))
+    if rule_ids:
+        state_clauses.append(FairUsageState.rule_id.in_(rule_ids))
+
+    merge_clauses = [PeerTotalsMerge.source_router_id == row.id, PeerTotalsMerge.target_router_id == row.id]
+    if peer_ids:
+        merge_clauses.extend([
+            PeerTotalsMerge.source_peer_id.in_(peer_ids),
+            PeerTotalsMerge.target_peer_id.in_(peer_ids),
+        ])
+
+    impact = RouterDeleteImpactDTO(
+        router_id=row.id,
+        router_name=row.name,
+        dashboard_selected=row.id in dashboard_selected_router_ids,
+        peer_count=len(peer_ids),
+        selected_peer_count=db.query(Peer).filter(Peer.router_id == row.id, Peer.selected == True).count(),
+        usage_sample_rows=db.query(UsageSample).filter(UsageSample.peer_id.in_(peer_ids)).count() if peer_ids else 0,
+        usage_minute_rows=db.query(UsageMinute).filter(UsageMinute.peer_id.in_(peer_ids)).count() if peer_ids else 0,
+        usage_daily_rows=db.query(UsageDaily).filter(UsageDaily.peer_id.in_(peer_ids)).count() if peer_ids else 0,
+        usage_monthly_rows=db.query(UsageMonthly).filter(UsageMonthly.peer_id.in_(peer_ids)).count() if peer_ids else 0,
+        quota_count=db.query(Quota).filter(Quota.peer_id.in_(peer_ids)).count() if peer_ids else 0,
+        action_count=db.query(Action).filter(Action.peer_id.in_(peer_ids)).count() if peer_ids else 0,
+        telegram_binding_count=db.query(TelegramPeerBinding).filter(TelegramPeerBinding.peer_id.in_(peer_ids)).count() if peer_ids else 0,
+        telegram_log_count=db.query(TelegramNotificationLog).filter(TelegramNotificationLog.peer_id.in_(peer_ids)).count() if peer_ids else 0,
+        signup_token_count=signup_token_count,
+        fair_usage_assignment_count=db.query(FairUsageAssignment).filter(or_(*rule_or_peer_clauses)).count() if rule_or_peer_clauses else 0,
+        fair_usage_state_count=db.query(FairUsageState).filter(or_(*state_clauses)).count() if state_clauses else 0,
+        router_rule_count=len(rule_ids),
+        merge_ledger_count=db.query(PeerTotalsMerge).filter(or_(*merge_clauses)).count(),
+        peer_setting_count=db.query(SettingsKV).filter(SettingsKV.key.in_(peer_setting_keys)).count() if peer_setting_keys else 0,
+    )
+    return impact, peer_ids, rule_ids
+
+
+def _refresh_router_version_or_raise(router_row: Router) -> None:
+    try:
+        client = make_client(router_row)
+        version = (client.get_system_version() or "").strip()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"router connection failed: {exc}") from exc
+
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    router_row.ros_version = version
+    router_row.ros_version_checked_at = now_utc
+    router_row.ros_supported = is_routeros_supported(version)
+    try:
+        assert_routeros_supported(version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/routers", response_model=RouterDTO)
@@ -847,7 +1599,9 @@ def create_router(dto: RouterCreateDTO, db: Session = Depends(get_db), current_u
         username=dto.username,
         secret_enc=box.encrypt(dto.password),
         tls_verify=dto.tls_verify,
+        enabled=dto.enabled,
     )
+    _refresh_router_version_or_raise(r)
     db.add(r)
     db.commit()
     db.refresh(r)
@@ -884,72 +1638,162 @@ def update_router(router_id: int, dto: RouterUpdateDTO, db: Session = Depends(ge
         row.secret_enc = box.encrypt(dto.password)
     if dto.tls_verify is not None:
         row.tls_verify = dto.tls_verify
+    if dto.enabled is not None:
+        row.enabled = bool(dto.enabled)
+    _refresh_router_version_or_raise(row)
     db.commit()
     db.refresh(row)
     return row
 
 
-@router.delete("/routers/{router_id}")
-def delete_router(router_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+@router.get("/routers/{router_id}/delete-impact", response_model=RouterDeleteImpactDTO)
+def get_router_delete_impact(router_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     row = db.get(Router, router_id)
     if not row:
         raise HTTPException(status_code=404, detail="router not found")
-    # Clear active router if it points to this router
-    kv = db.get(SettingsKV, "active_router_id")
-    if kv and kv.value.strip() == str(router_id):
-        db.delete(kv)
-    db.delete(row)
-    db.commit()
-    return {"ok": True}
+    impact, _, _ = _router_delete_impact(db, row)
+    return impact
+
+
+@router.delete("/routers/{router_id}", response_model=RouterDeleteResultDTO)
+def delete_router(router_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if is_usage_maintenance_running(db):
+        raise HTTPException(
+            status_code=409,
+            detail="Usage maintenance is running. Wait for it to finish before deleting a router.",
+        )
+
+    row = db.get(Router, router_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="router not found")
+    try:
+        with exclusive_operation_gate.begin(
+            key="router-delete",
+            label=f"Deleting router {row.name}",
+            detail=f"Deleting router {row.name}. Dashboard polling is temporarily paused; retry shortly.",
+        ):
+            set_polling_paused(True)
+            backup_path: Optional[str] = None
+            try:
+                router_name = row.name
+                # Release any read transaction opened while loading the router
+                # before taking a SQLite backup from a separate connection.
+                db.rollback()
+                backup_path = _backup_sqlite_database_for_router_delete(router_id, router_name)
+                _assert_sqlite_quick_check(db, "before router delete")
+
+                row = db.get(Router, router_id)
+                if not row:
+                    raise HTTPException(status_code=404, detail="router not found")
+                impact, peer_ids, rule_ids = _router_delete_impact(db, row)
+                peer_id_set = set(peer_ids)
+
+                # End the read transaction before taking the SQLite write lock explicitly.
+                db.rollback()
+                db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+                row = db.get(Router, router_id)
+                if not row:
+                    raise HTTPException(status_code=404, detail="router not found")
+
+                # Drop the retired active-router preference if it still exists.
+                kv = db.get(SettingsKV, "active_router_id")
+                if kv:
+                    db.delete(kv)
+
+                # Remove deleted router from dashboard-selected router preferences.
+                dashboard_selected_kv = db.get(SettingsKV, "dashboard_selected_router_ids")
+                if dashboard_selected_kv:
+                    router_ids = [rid for rid in _normalized_dashboard_selected_router_ids(db) if rid != router_id]
+                    dashboard_selected_kv.value = json.dumps(router_ids)
+
+                signup_tokens_updated = 0
+                signup_tokens_deleted = 0
+                if peer_id_set:
+                    for token in db.query(TelegramSignupToken).all():
+                        try:
+                            token_peer_ids = [int(pid) for pid in json.loads(token.peer_ids or "[]") if int(pid) > 0]
+                        except Exception:
+                            continue
+                        filtered_peer_ids = [pid for pid in token_peer_ids if pid not in peer_id_set]
+                        if filtered_peer_ids == token_peer_ids:
+                            continue
+                        if filtered_peer_ids:
+                            token.peer_ids = json.dumps(filtered_peer_ids)
+                            signup_tokens_updated += 1
+                        else:
+                            db.delete(token)
+                            signup_tokens_deleted += 1
+
+                if peer_ids:
+                    db.query(TelegramPeerBinding).filter(TelegramPeerBinding.peer_id.in_(peer_ids)).delete(synchronize_session=False)
+                    db.query(TelegramNotificationLog).filter(TelegramNotificationLog.peer_id.in_(peer_ids)).delete(synchronize_session=False)
+                    db.query(Quota).filter(Quota.peer_id.in_(peer_ids)).delete(synchronize_session=False)
+                    db.query(UsageSample).filter(UsageSample.peer_id.in_(peer_ids)).delete(synchronize_session=False)
+                    db.query(UsageMinute).filter(UsageMinute.peer_id.in_(peer_ids)).delete(synchronize_session=False)
+                    db.query(UsageDaily).filter(UsageDaily.peer_id.in_(peer_ids)).delete(synchronize_session=False)
+                    db.query(UsageMonthly).filter(UsageMonthly.peer_id.in_(peer_ids)).delete(synchronize_session=False)
+                    db.query(Action).filter(Action.peer_id.in_(peer_ids)).delete(synchronize_session=False)
+
+                    peer_setting_keys = _peer_scoped_setting_keys(peer_ids)
+                    if peer_setting_keys:
+                        db.query(SettingsKV).filter(SettingsKV.key.in_(peer_setting_keys)).delete(synchronize_session=False)
+
+                assignment_clauses = []
+                if peer_ids:
+                    assignment_clauses.append(FairUsageAssignment.peer_id.in_(peer_ids))
+                if rule_ids:
+                    assignment_clauses.append(FairUsageAssignment.rule_id.in_(rule_ids))
+                if assignment_clauses:
+                    db.query(FairUsageAssignment).filter(or_(*assignment_clauses)).delete(synchronize_session=False)
+
+                state_clauses = []
+                if peer_ids:
+                    state_clauses.append(FairUsageState.peer_id.in_(peer_ids))
+                if rule_ids:
+                    state_clauses.append(FairUsageState.rule_id.in_(rule_ids))
+                if state_clauses:
+                    db.query(FairUsageState).filter(or_(*state_clauses)).delete(synchronize_session=False)
+
+                if rule_ids:
+                    db.query(FairUsageTier).filter(FairUsageTier.rule_id.in_(rule_ids)).delete(synchronize_session=False)
+                    db.query(FairUsageRule).filter(FairUsageRule.id.in_(rule_ids)).delete(synchronize_session=False)
+
+                merge_clauses = [PeerTotalsMerge.source_router_id == router_id, PeerTotalsMerge.target_router_id == router_id]
+                if peer_ids:
+                    merge_clauses.extend([
+                        PeerTotalsMerge.source_peer_id.in_(peer_ids),
+                        PeerTotalsMerge.target_peer_id.in_(peer_ids),
+                    ])
+                db.query(PeerTotalsMerge).filter(or_(*merge_clauses)).delete(synchronize_session=False)
+
+                if peer_ids:
+                    db.query(Peer).filter(Peer.id.in_(peer_ids)).delete(synchronize_session=False)
+
+                db.delete(row)
+                db.flush()
+                _assert_router_delete_has_no_residue(db, router_id, peer_ids, rule_ids)
+                post_delete_quick_check = _assert_sqlite_quick_check(db, "after router delete")
+                db.commit()
+                return RouterDeleteResultDTO(
+                    **impact.model_dump(),
+                    signup_tokens_updated=signup_tokens_updated,
+                    signup_tokens_deleted=signup_tokens_deleted,
+                    backup_path=backup_path,
+                    post_delete_quick_check=post_delete_quick_check,
+                )
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                set_polling_paused(False)
+    except ExclusiveOperationInProgress as exc:
+        raise HTTPException(status_code=409, detail=exc.user_message)
 
 
 @router.get("/routers", response_model=list[RouterDTO])
 def list_routers(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     return db.query(Router).all()
-
-
-class ActiveRouterDTO(BaseModel):
-    router_id: Optional[int] = None
-
-
-@router.get("/active_router", response_model=ActiveRouterDTO)
-def get_active_router(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    kv = db.get(SettingsKV, "active_router_id")
-    if not kv or not kv.value.strip():
-        return ActiveRouterDTO(router_id=None)
-    try:
-        rid = int(kv.value.strip())
-        if rid <= 0:
-            return ActiveRouterDTO(router_id=None)
-        return ActiveRouterDTO(router_id=rid)
-    except ValueError:
-        return ActiveRouterDTO(router_id=None)
-
-
-@router.post("/active_router", response_model=ActiveRouterDTO)
-def set_active_router(dto: ActiveRouterDTO, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if dto.router_id is None:
-        kv = db.get(SettingsKV, "active_router_id")
-        if kv:
-            db.delete(kv)
-            db.commit()
-        return ActiveRouterDTO(router_id=None)
-
-    rid = int(dto.router_id)
-    if rid <= 0:
-        raise HTTPException(status_code=400, detail="router_id must be positive")
-    router = db.get(Router, rid)
-    if not router:
-        raise HTTPException(status_code=404, detail="router not found")
-
-    kv = db.get(SettingsKV, "active_router_id")
-    if kv is None:
-        kv = SettingsKV(key="active_router_id", value=str(rid))
-        db.add(kv)
-    else:
-        kv.value = str(rid)
-    db.commit()
-    return ActiveRouterDTO(router_id=rid)
 
 
 @router.get("/routers/{router_id}/interfaces", response_model=List[str])
@@ -978,7 +1822,13 @@ def get_interface(router_id: int, iface: str, db: Session = Depends(get_db), cur
         except Exception:
             primary_host = ""
         host = primary_host or router.host
-        return WGInterfaceDTO(name=cfg.name, public_key=cfg.public_key, listen_port=cfg.listen_port, public_host=host)
+        return WGInterfaceDTO(
+            name=cfg.name,
+            public_key=cfg.public_key,
+            listen_port=cfg.listen_port,
+            public_host=host,
+            addresses=cfg.addresses or [],
+        )
     except KeyError:
         raise HTTPException(status_code=404, detail="interface not found")
     except Exception as e:
@@ -1046,6 +1896,9 @@ class PeerListDTO(BaseModel):
     allowed_address: str
     disabled: bool
     selected: bool
+    router_sync_status: str = "synced"
+    router_sync_first_seen_at: Optional[datetime] = None
+    router_sync_last_seen_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -1082,15 +1935,31 @@ def get_dashboard_live_status(
     for row in rows:
         peer_lookup.setdefault(int(row.router_id), {})[(row.interface, row.public_key)] = int(row.peer_id)
 
-    routers = db.query(Router).filter(Router.id.in_(list(peer_lookup.keys()))).all()
+    routers = (
+        db.query(Router)
+        .filter(
+            Router.id.in_(list(peer_lookup.keys())),
+            Router.enabled == True,  # noqa: E712
+            Router.ros_supported == True,  # noqa: E712
+        )
+        .all()
+    )
     if not routers:
         return []
+
+    # ORM instances are not safe to use from worker threads; detach before ThreadPoolExecutor.
+    for r in routers:
+        db.expunge(r)
 
     out: list[DashboardLiveStatusDTO] = []
     max_workers = min(max(len(routers), 1), 4)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(_fetch_all_router_peers, router_row): router_row.id
+            executor.submit(
+                _fetch_all_router_peers,
+                router_row,
+                _DASHBOARD_LIVE_STATUS_ROUTER_TIMEOUT,
+            ): router_row.id
             for router_row in routers
         }
         for future in as_completed(future_map):
@@ -1158,7 +2027,6 @@ def import_peers(router_id: int, items: list[PeerImportItem], db: Session = Depe
             name=row.name or "",
             public_key=row.public_key,
             allowed_address=row.allowed_address,
-            comment="",
             disabled=bool(disabled),
             selected=it.selected,
         ))
@@ -1172,8 +2040,10 @@ class PeerCreateRouterDTO(BaseModel):
     name: str
     public_key: str
     allowed_address: str
-    comment: Optional[str] = ""
     private_key: Optional[str] = None
+    preshared_key: Optional[str] = None
+    config_name: Optional[str] = None
+    custom_endpoint: Optional[str] = None
 
 
 def _is_valid_wg_private_key_b64(s: str) -> bool:
@@ -1250,10 +2120,6 @@ def _build_client_export_prefs_out(db: Session, row: Peer) -> PeerClientExportPr
     kv_ep = db.get(SettingsKV, f"peer_export_endpoint:{row.id}")
     name = (kv_name.value or "").strip() if kv_name and kv_name.value else ""
     ep = (kv_ep.value or "").strip() if kv_ep and kv_ep.value else ""
-    if not ep:
-        parsed = parse_wgmik_endpoint_from_comment(row.comment)
-        if parsed:
-            ep = parsed
     psk = _get_peer_preshared_key_decrypted(db, row.id)
     if psk is None and row.router_id and row.ros_id:
         router = db.get(Router, row.router_id)
@@ -1324,16 +2190,6 @@ def patch_peer_client_export_prefs(
                 client.set_peer_client_endpoint(row.interface, row.ros_id, ep_st or None)
             except Exception as e:
                 raise HTTPException(status_code=502, detail=f"router client-endpoint update failed: {e}")
-        # Strip legacy |WGMIK:ep=… suffix from comment (older app versions used comment as a side channel).
-        cleaned = merge_wgmik_endpoint_in_comment(row.comment, "")
-        if cleaned != (row.comment or ""):
-            row.comment = cleaned
-            if client:
-                try:
-                    client.set_peer_comment(row.interface, row.ros_id, cleaned)
-                except Exception as e:
-                    raise HTTPException(status_code=502, detail=f"router comment cleanup failed: {e}")
-
     if dto.preshared_key is not None:
         pk = dto.preshared_key.strip()
         if pk == "":
@@ -1377,6 +2233,19 @@ def create_router_peer(router_id: int, dto: PeerCreateRouterDTO, db: Session = D
     except Exception:
         raise HTTPException(status_code=400, detail="invalid allowed_address format")
 
+    private_key = dto.private_key.strip() if dto.private_key is not None else None
+    if private_key:
+        if not _is_valid_wg_private_key_b64(private_key):
+            raise HTTPException(status_code=400, detail="invalid private_key (must be base64 32 bytes)")
+
+    preshared_key = dto.preshared_key.strip() if dto.preshared_key is not None else None
+    if preshared_key:
+        if not _is_valid_wg_private_key_b64(preshared_key):
+            raise HTTPException(status_code=400, detail="invalid preshared_key (must be base64 32 bytes)")
+
+    config_name = (dto.config_name or "").strip()
+    custom_endpoint = (dto.custom_endpoint or "").strip()
+
     client = make_client(router)
 
     # If DB row already exists, prevent accidental duplicates
@@ -1407,10 +2276,11 @@ def create_router_peer(router_id: int, dto: PeerCreateRouterDTO, db: Session = D
             ros_id = client.add_wireguard_peer(
                 interface=dto.interface,
                 public_key=dto.public_key,
-                private_key=(dto.private_key.strip() if dto.private_key else None),
+                private_key=private_key,
+                preshared_key=preshared_key,
+                client_endpoint=custom_endpoint or None,
                 allowed_address=dto.allowed_address,
                 name=dto.name or "",
-                comment=dto.comment or "",
                 disabled=False,
             )
         except Exception as e:
@@ -1423,7 +2293,6 @@ def create_router_peer(router_id: int, dto: PeerCreateRouterDTO, db: Session = D
         name=name or "",
         public_key=dto.public_key,
         allowed_address=allowed_address,
-        comment=dto.comment or "",
         disabled=disabled,
         selected=True,
     )
@@ -1432,22 +2301,32 @@ def create_router_peer(router_id: int, dto: PeerCreateRouterDTO, db: Session = D
     db.refresh(row)
 
     # Optional: store client private key encrypted in DB (RouterOS doesn't store peer private keys).
-    if dto.private_key is not None:
-        pk = dto.private_key.strip()
+    if private_key is not None:
+        pk = private_key
         if pk == "":
             kv = db.get(SettingsKV, f"peer_private_key:{row.id}")
             if kv:
                 db.delete(kv)
                 db.commit()
         else:
-            if not _is_valid_wg_private_key_b64(pk):
-                raise HTTPException(status_code=400, detail="invalid private_key (must be base64 32 bytes)")
             box = SecretBox(settings.secret_key)
             token = box.encrypt(pk)
             kv = db.get(SettingsKV, f"peer_private_key:{row.id}") or SettingsKV(key=f"peer_private_key:{row.id}", value="")
             kv.value = token
             db.add(kv)
             db.commit()
+    if preshared_key:
+        _store_peer_preshared_key(db, row.id, preshared_key)
+    if config_name:
+        kv = db.get(SettingsKV, f"peer_export_config_name:{row.id}") or SettingsKV(key=f"peer_export_config_name:{row.id}", value="")
+        kv.value = config_name
+        db.add(kv)
+    if custom_endpoint:
+        kv = db.get(SettingsKV, f"peer_export_endpoint:{row.id}") or SettingsKV(key=f"peer_export_endpoint:{row.id}", value="")
+        kv.value = custom_endpoint
+        db.add(kv)
+    if preshared_key or config_name or custom_endpoint:
+        db.commit()
     return row
 
 
@@ -1566,151 +2445,32 @@ def test_router_connection(router_id: int, db: Session = Depends(get_db), curren
     router = db.get(Router, router_id)
     if not router:
         raise HTTPException(status_code=404, detail="router not found")
-    client = make_client(router)
     try:
+        client = make_client(router)
+        version = (client.get_system_version() or "").strip()
+        router.ros_version = version
+        router.ros_version_checked_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        router.ros_supported = is_routeros_supported(version)
+        if not router.ros_supported:
+            db.commit()
+            try:
+                assert_routeros_supported(version)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail="RouterOS 7.15 or newer is required")
         _ = client.list_wireguard_interfaces()
-        return {"ok": True}
+        db.commit()
+        return {
+            "ok": True,
+            "ros_version": router.ros_version,
+            "ros_version_checked_at": router.ros_version_checked_at,
+            "ros_supported": router.ros_supported,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=502, detail=f"router connection failed: {e}")
-
-
-class RouterSyncResultDTO(BaseModel):
-    ok: bool
-    router_id: int
-    interfaces: list[str]
-    updated: int
-    created: int
-    missing: int
-
-
-@router.post("/routers/{router_id}/sync", response_model=RouterSyncResultDTO)
-def sync_router(router_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """
-    One-shot DB ↔ RouterOS reconciliation for a router.
-    - Updates existing DB peers (ros_id/name/allowed_address/disabled) to match RouterOS
-    - Discovers new RouterOS peers into DB (selected=false)
-    - Marks DB peers missing on RouterOS as selected=false
-    """
-    router = db.get(Router, router_id)
-    if not router:
-        raise HTTPException(status_code=404, detail="router not found")
-    client = make_client(router)
-    try:
-        ifaces = client.list_wireguard_interfaces()
-        live_rows = client.list_all_wireguard_peers()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"router connection failed: {e}")
-
-    # Prefetch DB peers for this router
-    db_peers = db.query(Peer).filter(Peer.router_id == router_id).all()
-    by_key: dict[tuple[str, str], Peer] = {(p.interface, p.public_key): p for p in db_peers}
-
-    seen: set[tuple[str, str]] = set()
-    updated = 0
-    created = 0
-    now_utc = datetime.now(timezone.utc)
-
-    for lp in live_rows:
-        key = (lp.interface, lp.public_key)
-        seen.add(key)
-        row = by_key.get(key)
-        if row:
-            changed = False
-            if lp.ros_id and row.ros_id != lp.ros_id:
-                row.ros_id = lp.ros_id
-                changed = True
-            if (row.name or "") != (lp.name or ""):
-                row.name = lp.name or ""
-                changed = True
-            if (row.allowed_address or "") != (lp.allowed_address or ""):
-                row.allowed_address = lp.allowed_address or ""
-                changed = True
-            if (row.comment or "") != (lp.comment or ""):
-                row.comment = lp.comment or ""
-                changed = True
-            cep = (getattr(lp, "client_endpoint", "") or "").strip()
-            if cep:
-                kv_ep = db.get(SettingsKV, f"peer_export_endpoint:{row.id}") or SettingsKV(
-                    key=f"peer_export_endpoint:{row.id}", value=""
-                )
-                if (kv_ep.value or "").strip() != cep:
-                    kv_ep.value = cep
-                    db.add(kv_ep)
-            else:
-                ep = parse_wgmik_endpoint_from_comment(row.comment)
-                if ep:
-                    kv_ep = db.get(SettingsKV, f"peer_export_endpoint:{row.id}") or SettingsKV(
-                        key=f"peer_export_endpoint:{row.id}", value=""
-                    )
-                    kv_ep.value = ep
-                    db.add(kv_ep)
-            if bool(row.disabled) != bool(lp.disabled):
-                row.disabled = bool(lp.disabled)
-                changed = True
-                db.add(
-                    Action(
-                        peer_id=row.id,
-                        ts=now_utc,
-                        action="router_disable" if row.disabled else "router_enable",
-                        note="Detected router state change during sync",
-                    )
-                )
-            if changed:
-                updated += 1
-        else:
-            disabled = lp.disabled
-            if isinstance(disabled, str):
-                disabled = disabled.strip().lower() in ("1", "true", "yes", "on", "enabled")
-            row = Peer(
-                router_id=router_id,
-                interface=lp.interface,
-                ros_id=lp.ros_id or "",
-                name=lp.name or "",
-                public_key=lp.public_key,
-                allowed_address=lp.allowed_address,
-                comment="",
-                disabled=bool(disabled),
-                selected=False,
-            )
-            db.add(row)
-            db.flush()
-            by_key[key] = row
-            created += 1
-            db.add(
-                Action(
-                    peer_id=row.id,
-                    ts=now_utc,
-                    action="router_discovered",
-                    note="Discovered on router during sync (selected=false)",
-                )
-            )
-
-    # Mark missing peers as unselected (keeps history)
-    missing = 0
-    for row in db_peers:
-        k = (row.interface, row.public_key)
-        if row.interface in ifaces and k not in seen:
-            if row.selected:
-                row.selected = False
-                missing += 1
-                db.add(
-                    Action(
-                        peer_id=row.id,
-                        ts=now_utc,
-                        action="router_missing",
-                        note=f"Peer not found on router during sync; unselected",
-                    )
-                )
-
-    db.commit()
-    return RouterSyncResultDTO(
-        ok=True,
-        router_id=router_id,
-        interfaces=ifaces,
-        updated=updated,
-        created=created,
-        missing=missing,
-    )
 
 
 #
@@ -1740,6 +2500,74 @@ def list_saved_peers(
 class PeerUpdateDTO(BaseModel):
     selected: Optional[bool] = None
     disabled: Optional[bool] = None
+    name: Optional[str] = Field(default=None, max_length=255)
+
+
+def _router_delete_missing(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        if exc.response is not None and exc.response.status_code == 404:
+            return True
+        try:
+            payload = exc.response.json() if exc.response is not None else {}
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            msg = " ".join(str(payload.get(key, "")) for key in ("message", "detail", "error")).lower()
+            if "not found" in msg or "no such item" in msg:
+                return True
+    msg = str(exc).lower()
+    return "404 not found" in msg or "not found" in msg or "no such item" in msg
+
+
+def _router_delete_failure_can_be_local_only(peer: Peer, exc: Exception) -> bool:
+    if _router_delete_missing(exc):
+        return True
+    # Hidden/unselected peers are already outside normal management. RouterOS can return
+    # 500 for stale ids on DELETE; don't let that trap the local ghost record forever.
+    return peer.selected is False and isinstance(exc, httpx.HTTPStatusError)
+
+
+def _delete_peer_local_data(db: Session, row: Peer) -> None:
+    peer_id = int(row.id)
+    for suffix in (
+        f"peer_private_key:{peer_id}",
+        f"peer_preshared_key:{peer_id}",
+        f"peer_export_config_name:{peer_id}",
+        f"peer_export_endpoint:{peer_id}",
+        f"quota_valid_from:{peer_id}",
+        f"quota_valid_until:{peer_id}",
+    ):
+        kv = db.get(SettingsKV, suffix)
+        if kv:
+            db.delete(kv)
+
+    db.query(UsageSample).filter(UsageSample.peer_id == peer_id).delete(synchronize_session=False)
+    db.query(UsageMinute).filter(UsageMinute.peer_id == peer_id).delete(synchronize_session=False)
+    db.query(UsageDaily).filter(UsageDaily.peer_id == peer_id).delete(synchronize_session=False)
+    db.query(UsageMonthly).filter(UsageMonthly.peer_id == peer_id).delete(synchronize_session=False)
+    db.query(Quota).filter(Quota.peer_id == peer_id).delete(synchronize_session=False)
+    db.query(Action).filter(Action.peer_id == peer_id).delete(synchronize_session=False)
+    db.query(FairUsageAssignment).filter(FairUsageAssignment.peer_id == peer_id).delete(synchronize_session=False)
+    db.query(FairUsageState).filter(FairUsageState.peer_id == peer_id).delete(synchronize_session=False)
+    db.query(TelegramPeerBinding).filter(TelegramPeerBinding.peer_id == peer_id).delete(synchronize_session=False)
+    db.query(TelegramNotificationLog).filter(TelegramNotificationLog.peer_id == peer_id).delete(synchronize_session=False)
+    db.query(PeerTotalsMerge).filter(
+        or_(PeerTotalsMerge.source_peer_id == peer_id, PeerTotalsMerge.target_peer_id == peer_id)
+    ).delete(synchronize_session=False)
+    for token in db.query(TelegramSignupToken).all():
+        try:
+            peer_ids = [int(pid) for pid in json.loads(token.peer_ids or "[]") if int(pid) > 0]
+        except Exception:
+            continue
+        filtered = [pid for pid in peer_ids if pid != peer_id]
+        if filtered == peer_ids:
+            continue
+        if filtered:
+            token.peer_ids = json.dumps(filtered)
+        else:
+            db.delete(token)
+
+    db.delete(row)
 
 
 @router.patch("/peers/{peer_id}", response_model=PeerListDTO)
@@ -1748,7 +2576,47 @@ def update_peer(peer_id: int, dto: PeerUpdateDTO, db: Session = Depends(get_db),
     if not row:
         raise HTTPException(status_code=404, detail="peer not found")
     if dto.selected is not None:
-        row.selected = dto.selected
+        desired_selected = bool(dto.selected)
+        if row.selected != desired_selected:
+            row.selected = desired_selected
+            db.add(
+                Action(
+                    peer_id=row.id,
+                    ts=datetime.now(timezone.utc),
+                    action="manual_show" if desired_selected else "manual_hide",
+                    note="via API",
+                )
+            )
+    if dto.name is not None:
+        new_name = dto.name.strip()
+        if (row.name or "") != new_name:
+            prev = row.name or ""
+            r = db.get(Router, row.router_id)
+            old_fu = f"{FU_QUEUE_PREFIX}{row.name or row.id}"
+            client = None
+            if r and (row.ros_id or "").strip():
+                client = make_client(r)
+                try:
+                    client.set_peer_name(row.interface, row.ros_id, new_name)
+                except Exception as e:
+                    raise HTTPException(status_code=502, detail=f"router update failed: {e}")
+            row.name = new_name
+            new_fu = f"{FU_QUEUE_PREFIX}{row.name or row.id}"
+            if client and old_fu != new_fu:
+                fus = db.query(FairUsageState).filter(FairUsageState.peer_id == row.id).first()
+                if fus and fus.throttled and (fus.ros_queue_id or "").strip():
+                    try:
+                        client.set_simple_queue_name((fus.ros_queue_id or "").strip(), new_fu)
+                    except Exception:
+                        pass
+            db.add(
+                Action(
+                    peer_id=row.id,
+                    ts=datetime.now(timezone.utc),
+                    action="peer_rename",
+                    note=f'"{prev}" -> "{new_name}"',
+                )
+            )
     if dto.disabled is not None:
         desired = bool(dto.disabled)
         # For real RouterOS peers, only flip DB state if router call succeeds.
@@ -1781,31 +2649,94 @@ def delete_peer(peer_id: int, skip_router: bool = False, db: Session = Depends(g
         raise HTTPException(status_code=404, detail="peer not found")
     
     router_deleted = False
-    # If it's a RouterOS-backed peer, delete it on the router first (unless skipped).
+    # If it's an active RouterOS-backed peer, delete it on the router first (unless skipped).
+    # Hidden/unselected rows are historical local records; their ros_id may be stale or
+    # reused by a real peer, so deleting them must not touch RouterOS.
     r = db.get(Router, row.router_id)
-    if r and row.ros_id and not skip_router:
+    if r and row.ros_id and row.selected is not False and not skip_router:
         client = make_client(r)
         try:
             client.remove_wireguard_peer(row.interface, row.ros_id)
             router_deleted = True
         except Exception as e:
-            # Don't lie: if router delete failed, keep DB record.
-            raise HTTPException(status_code=502, detail=f"router delete failed: {e}")
-            
-    # Remove any stored client secret material for this peer.
-    for suffix in (
-        f"peer_private_key:{peer_id}",
-        f"peer_preshared_key:{peer_id}",
-        f"peer_export_config_name:{peer_id}",
-        f"peer_export_endpoint:{peer_id}",
-    ):
-        kv = db.get(SettingsKV, suffix)
-        if kv:
-            db.delete(kv)
+            if _router_delete_failure_can_be_local_only(row, e):
+                router_deleted = False
+            else:
+                # Don't lie: if router delete failed, keep DB record.
+                raise HTTPException(status_code=502, detail=f"router delete failed: {e}")
 
-    db.delete(row)
+    # Remove any active fair-usage queues for this peer before deleting local state.
+    if r:
+        for st in db.query(FairUsageState).filter(FairUsageState.peer_id == peer_id).all():
+            if st.ros_queue_id:
+                try:
+                    client = make_client(r)
+                    client.remove_simple_queue(st.ros_queue_id)
+                except Exception:
+                    pass
+
+    _delete_peer_local_data(db, row)
     db.commit()
     return {"ok": True, "deleted_peer_id": peer_id, "router_deleted": router_deleted}
+
+
+class PeerRouterSyncResolveDTO(BaseModel):
+    action: str
+
+
+def _clear_peer_router_sync_status(row: Peer) -> None:
+    row.router_sync_status = "synced"
+    row.router_sync_first_seen_at = None
+    row.router_sync_last_seen_at = None
+
+
+@router.post("/peers/{peer_id}/router-sync/resolve")
+def resolve_peer_router_sync(
+    peer_id: int,
+    dto: PeerRouterSyncResolveDTO,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    row = db.get(Peer, peer_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="peer not found")
+
+    status_value = (row.router_sync_status or "synced").strip().lower()
+    action_value = (dto.action or "").strip().lower()
+    now_utc = datetime.now(timezone.utc)
+
+    if status_value == "missing":
+        if action_value == "hide":
+            row.selected = False
+            _clear_peer_router_sync_status(row)
+            db.add(Action(peer_id=row.id, ts=now_utc, action="router_missing_hide", note="Admin hid missing peer"))
+            db.commit()
+            db.refresh(row)
+            return row
+        if action_value == "delete":
+            _delete_peer_local_data(db, row)
+            db.commit()
+            return {"ok": True, "deleted_peer_id": peer_id, "router_deleted": False}
+        raise HTTPException(status_code=400, detail="missing peers support actions: hide, delete")
+
+    if status_value == "new":
+        if action_value == "accept":
+            row.selected = True
+            _clear_peer_router_sync_status(row)
+            db.add(Action(peer_id=row.id, ts=now_utc, action="router_new_accept", note="Admin added RouterOS-discovered peer"))
+            db.commit()
+            db.refresh(row)
+            return row
+        if action_value == "hide":
+            row.selected = False
+            _clear_peer_router_sync_status(row)
+            db.add(Action(peer_id=row.id, ts=now_utc, action="router_new_hide", note="Admin kept RouterOS-discovered peer hidden"))
+            db.commit()
+            db.refresh(row)
+            return row
+        raise HTTPException(status_code=400, detail="new peers support actions: accept, hide")
+
+    raise HTTPException(status_code=400, detail="peer has no pending RouterOS sync decision")
 
 
 class ActionDTO(BaseModel):
@@ -2090,9 +3021,22 @@ def get_peer_quota(peer_id: int, db: Session = Depends(get_db), current_user: Us
     vu = db.get(SettingsKV, f"quota_valid_until:{peer_id}")
     valid_from = vf.value if vf else None
     valid_until = vu.value if vu else None
-    # usage this month
-    prefix = datetime.utcnow().strftime("%Y-%m-")
-    rows = db.query(UsageDaily).filter(UsageDaily.peer_id == peer_id, UsageDaily.day.like(f"{prefix}%")).all()
+    # Usage in the selected calendar month. Daily rollups are still stored with Gregorian
+    # keys, so use the selected calendar boundary converted back to UTC/Gregorian dates.
+    start_month_utc, end_month_utc = selected_month_bounds_utc(
+        datetime.now(timezone.utc),
+        app_zoneinfo(),
+        app_date_calendar(),
+    )
+    rows = (
+        db.query(UsageDaily)
+        .filter(
+            UsageDaily.peer_id == peer_id,
+            UsageDaily.day >= start_month_utc.date().strftime("%Y-%m-%d"),
+            UsageDaily.day <= end_month_utc.date().strftime("%Y-%m-%d"),
+        )
+        .all()
+    )
     used_rx = sum(r.rx for r in rows)
     used_tx = sum(r.tx for r in rows)
     return QuotaDTO(
@@ -2567,8 +3511,11 @@ def get_summary_raw_by_router(
 class UsageMaintenanceStatusDTO(BaseModel):
     running: bool
     phase: str
+    phase_label: Optional[str] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    cancelled_at: Optional[str] = None
     last_error: Optional[str] = None
     last_completed_phase: Optional[str] = None
     resume_cursor: Optional[dict] = None
@@ -2584,14 +3531,31 @@ class UsageMaintenanceStatusDTO(BaseModel):
     raw_prune_before: Optional[str] = None
     minute_prune_before: Optional[str] = None
     daily_prune_before: Optional[str] = None
+    cancel_requested: bool = False
+    can_cancel: bool = False
+    trigger: str = "manual"
+    next_scheduled_run: Optional[str] = None
+    last_auto_run: Optional[str] = None
+    elapsed_seconds: int = 0
+    estimated_remaining_seconds: Optional[int] = None
+    progress_percent: float = 0
+    phase_progress_percent: float = 0
+    processed_units: int = 0
+    total_units: int = 0
 
 
 @router.get("/admin/usage_maintenance", response_model=UsageMaintenanceStatusDTO)
 def read_usage_maintenance_status(
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     _require_admin(current_user)
-    return UsageMaintenanceStatusDTO(**get_usage_maintenance_status())
+    status = get_usage_maintenance_status()
+    next_run = get_usage_maintenance_next_run()
+    schedule_enabled = load_auto_maintenance_settings(db)["usage_maintenance_auto_enabled"]
+    status["next_scheduled_run"] = next_run.isoformat() if (next_run and schedule_enabled) else None
+    status["last_auto_run"] = get_last_auto_run(db)
+    return UsageMaintenanceStatusDTO(**status)
 
 
 @router.post("/admin/usage_maintenance/run", response_model=UsageMaintenanceStatusDTO, status_code=202)
@@ -2606,6 +3570,14 @@ def run_usage_maintenance(
     if not started:
         raise HTTPException(status_code=409, detail="Usage maintenance is already running")
     return UsageMaintenanceStatusDTO(**status)
+
+
+@router.post("/admin/usage_maintenance/cancel", response_model=UsageMaintenanceStatusDTO)
+def cancel_running_usage_maintenance(
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    return UsageMaintenanceStatusDTO(**cancel_usage_maintenance())
 
 
 @router.post("/admin/purge_usage")
@@ -2771,6 +3743,7 @@ class FairUsageRuleUpdateDTO(BaseModel):
     time_scope: Optional[str] = None
     scope_type: Optional[str] = None
     router_id: Optional[int] = None
+    peer_ids: Optional[List[int]] = None
     sort_order: Optional[int] = None
     passthrough: Optional[bool] = None
     enabled: Optional[bool] = None
@@ -2813,11 +3786,16 @@ class FairUsageRuleDTO(BaseModel):
 
 
 def _fu_rule_to_dto(rule: FairUsageRule, db: Session, include_peers: bool = False) -> FairUsageRuleDTO:
-    assignments = db.query(FairUsageAssignment).filter(FairUsageAssignment.rule_id == rule.id).all()
+    assignments = (
+        db.query(FairUsageAssignment)
+        .join(Peer, Peer.id == FairUsageAssignment.peer_id)
+        .filter(FairUsageAssignment.rule_id == rule.id, Peer.selected == True)
+        .all()
+    )
     peers_out: List[FairUsageAssignedPeerDTO] = []
     if include_peers and assignments:
         peer_ids = [a.peer_id for a in assignments]
-        peers = db.query(Peer).filter(Peer.id.in_(peer_ids)).all()
+        peers = db.query(Peer).filter(Peer.id.in_(peer_ids), Peer.selected == True).all()
         for p in peers:
             peers_out.append(FairUsageAssignedPeerDTO(
                 peer_id=p.id, name=p.name, allowed_address=p.allowed_address,
@@ -2862,6 +3840,19 @@ def _fu_rule_to_dto(rule: FairUsageRule, db: Session, include_peers: bool = Fals
         assigned_peer_count=len(assignments),
         assigned_peers=peers_out,
     )
+
+
+def _replace_fair_usage_assignments(db: Session, rule_id: int, peer_ids: Optional[List[int]]) -> None:
+    db.query(FairUsageAssignment).filter(FairUsageAssignment.rule_id == rule_id).delete(synchronize_session=False)
+    seen: set[int] = set()
+    for pid in peer_ids or []:
+        if pid in seen:
+            continue
+        seen.add(pid)
+        peer = db.get(Peer, pid)
+        if not peer or not peer.selected:
+            continue
+        db.add(FairUsageAssignment(rule_id=rule_id, peer_id=pid))
 
 
 @router.post("/fair-usage/rules", response_model=FairUsageRuleDTO)
@@ -2916,11 +3907,7 @@ def create_fair_usage_rule(dto: FairUsageRuleCreateDTO, db: Session = Depends(ge
     _persist_rule_tiers(db, rule.id, want_tiered, dto.tiers if want_tiered else None)
 
     if dto.scope_type == "peer" and dto.peer_ids:
-        for pid in dto.peer_ids:
-            peer = db.get(Peer, pid)
-            if not peer:
-                continue
-            db.add(FairUsageAssignment(rule_id=rule.id, peer_id=pid))
+        _replace_fair_usage_assignments(db, rule.id, dto.peer_ids)
     db.commit()
     db.refresh(rule)
     return _fu_rule_to_dto(rule, db, include_peers=True)
@@ -2945,6 +3932,7 @@ def update_fair_usage_rule(rule_id: int, dto: FairUsageRuleUpdateDTO, db: Sessio
     rule = db.get(FairUsageRule, rule_id)
     if not rule:
         raise HTTPException(status_code=404, detail="rule not found")
+    fields_set = getattr(dto, "model_fields_set", set())
 
     if dto.name is not None:
         rule.name = dto.name
@@ -2978,8 +3966,14 @@ def update_fair_usage_rule(rule_id: int, dto: FairUsageRuleUpdateDTO, db: Sessio
         if dto.scope_type not in ("global", "router", "peer"):
             raise HTTPException(status_code=400, detail="scope_type must be 'global', 'router', or 'peer'")
         rule.scope_type = dto.scope_type
-    if dto.router_id is not None:
+    if "router_id" in fields_set:
         rule.router_id = dto.router_id
+    if rule.scope_type == "router" and not rule.router_id:
+        raise HTTPException(status_code=400, detail="router_id is required for router-scoped rules")
+    if rule.scope_type != "router":
+        rule.router_id = None
+    if "peer_ids" in fields_set:
+        _replace_fair_usage_assignments(db, rule.id, dto.peer_ids if rule.scope_type == "peer" else [])
     if dto.sort_order is not None:
         rule.sort_order = dto.sort_order
     if dto.passthrough is not None:
@@ -3045,7 +4039,7 @@ def assign_peers_to_rule(rule_id: int, dto: FairUsageAssignDTO, db: Session = De
         raise HTTPException(status_code=404, detail="rule not found")
     for pid in dto.peer_ids:
         peer = db.get(Peer, pid)
-        if not peer:
+        if not peer or not peer.selected:
             continue
         existing = (
             db.query(FairUsageAssignment)

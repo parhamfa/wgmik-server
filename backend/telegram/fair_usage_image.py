@@ -7,6 +7,8 @@ import logging
 from urllib.parse import quote
 
 from ..fair_usage_peer_status_dto import FairUsagePeerStatusDTO
+from ..calendar_utils import app_date_calendar
+from ..settings import settings
 from .screenshot_config import SCREENSHOT_DEVICE_SCALE_FACTOR
 
 logger = logging.getLogger("wgmik.telegram.fu_image")
@@ -22,7 +24,15 @@ async def render_fair_usage_peer_card_png(
     """Screenshot the /render/fair-usage page with the DTO baked into the URL hash."""
     from playwright.async_api import async_playwright
 
-    payload = json.dumps({"status": dto.model_dump(), "peerName": peer_label}, separators=(",", ":"))
+    payload = json.dumps(
+        {
+            "status": dto.model_dump(),
+            "peerName": peer_label,
+            "timezone": settings.timezone,
+            "dateCalendar": app_date_calendar(),
+        },
+        separators=(",", ":"),
+    )
     fragment = quote(payload, safe="")
     url = f"{_FRONTEND_ORIGIN}/render/fair-usage#{fragment}"
 

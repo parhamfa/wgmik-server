@@ -1,5 +1,31 @@
 export const base = "";
 
+function formatApiErrorDetail(detail: unknown): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => {
+        if (!item || typeof item !== "object") return String(item);
+        const row = item as { loc?: unknown; msg?: unknown; message?: unknown };
+        const message = typeof row.msg === "string" ? row.msg : typeof row.message === "string" ? row.message : "";
+        const loc = Array.isArray(row.loc) ? row.loc.filter((part) => part !== "body").join(".") : "";
+        return [loc, message].filter(Boolean).join(": ");
+      })
+      .filter(Boolean);
+    return parts.join("; ");
+  }
+  if (detail && typeof detail === "object") {
+    const row = detail as { detail?: unknown; error?: unknown; message?: unknown };
+    return (
+      formatApiErrorDetail(row.detail) ||
+      formatApiErrorDetail(row.message) ||
+      formatApiErrorDetail(row.error) ||
+      JSON.stringify(detail)
+    );
+  }
+  return detail == null ? "" : String(detail);
+}
+
 export async function fetchJson(url: string, init?: RequestInit) {
   const res = await fetch(base + url, init);
   if (res.status === 401) {
@@ -13,7 +39,7 @@ export async function fetchJson(url: string, init?: RequestInit) {
     let msg = text;
     try {
       const json = JSON.parse(text);
-      if (json.detail) msg = json.detail;
+      if (json.detail) msg = formatApiErrorDetail(json.detail);
     } catch { }
     throw new Error(msg || res.statusText);
   }
@@ -28,25 +54,38 @@ export type SettingsDTO = {
   monthly_reset_day: number;
   // Previously used fields in Settings.tsx
   timezone: string;
+  date_calendar: "gregorian" | "persian";
   week_start_day: number;
-  dashboard_refresh_seconds: number;
-  peer_refresh_seconds: number;
+  /** Collapsed router sections: max peer pill cards before "Show all" (1–50). */
+  dashboard_peer_preview_count: number;
   peer_default_scope_unit: string;
   peer_default_scope_value: number;
   dashboard_scope_unit: string;
   dashboard_scope_value: number;
-  dashboard_router_scope: "all" | "active" | "selected";
+  dashboard_router_scope: "all" | "selected";
   dashboard_selected_router_ids: number[];
   dashboard_filter_status: string;
   dashboard_sort_by: string;
+  dashboard_time_mode: "today" | "this_month" | "all_time" | "rolling" | "custom";
+  dashboard_custom_start: string;
+  dashboard_custom_end: string;
   /** Dashboard usage chart: fixed start at local midnight, end tracks "now" */
   dashboard_time_frame_today: boolean;
+  peer_time_mode: "today" | "this_month" | "all_time" | "rolling" | "custom";
+  peer_custom_start: string;
+  peer_custom_end: string;
   /** Peer detail usage chart: same semantics as dashboard_time_frame_today */
   peer_time_frame_today: boolean;
   show_hw_stats: boolean; // Alias field often used
   raw_sample_retention_hours: number;
   minute_rollup_retention_days: number;
   daily_rollup_retention_days: number;
+  usage_maintenance_auto_enabled: boolean;
+  usage_maintenance_auto_frequency: "daily" | "every_n_days" | "weekly";
+  usage_maintenance_auto_interval_days: number;
+  usage_maintenance_auto_weekday: number;
+  usage_maintenance_auto_time: string;
+  usage_maintenance_backup_keep: number;
 };
 
 export type QuotaDTO = {
@@ -73,6 +112,90 @@ export async function updateSettings(dto: SettingsDTO): Promise<SettingsDTO> {
   });
 }
 
+export type LocalUserDTO = {
+  id: number;
+  username: string;
+  is_admin: boolean;
+  is_active: boolean;
+  last_login_at: string | null;
+  locked_until: string | null;
+  must_change_password: boolean;
+  created_at: string;
+};
+
+export type AuthBootstrapDTO = {
+  user: LocalUserDTO;
+  router_count: number;
+  enabled_router_count: number;
+  peer_count: number;
+  selected_peer_count: number;
+  needs_onboarding: boolean;
+  needs_peer_import: boolean;
+};
+
+export async function getAuthBootstrap(): Promise<AuthBootstrapDTO> {
+  return fetchJson("/api/auth/bootstrap");
+}
+
+export type SetupStateDTO = {
+  needs_initial_setup: boolean;
+};
+
+export async function getSetupState(): Promise<SetupStateDTO> {
+  return fetchJson("/api/auth/setup-state");
+}
+
+export async function createInitialAdmin(data: { username: string; password: string }): Promise<{ ok: boolean }> {
+  return fetchJson("/api/auth/setup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function listUsers(): Promise<LocalUserDTO[]> {
+  return fetchJson("/api/users");
+}
+
+export async function createUser(data: { username: string; password: string }): Promise<LocalUserDTO> {
+  return fetchJson("/api/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateUserAccount(
+  userId: number,
+  data: { is_active?: boolean; unlock?: boolean },
+): Promise<LocalUserDTO> {
+  return fetchJson(`/api/users/${userId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function resetUserPassword(userId: number, data: { new_password: string }): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/users/${userId}/reset-password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteUserAccount(userId: number): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/users/${userId}`, { method: "DELETE" });
+}
+
+export async function changePassword(data: { current_password: string; new_password: string }): Promise<{ ok: boolean }> {
+  return fetchJson("/api/auth/change-password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
 // ... Router Types ...
 
 export type RouterProto = "rest" | "rest-http" | "api" | "api-plain";
@@ -85,10 +208,43 @@ export type RouterDTO = {
   port: number;
   username: string;
   tls_verify: boolean;
+  enabled: boolean;
+  ros_version: string;
+  ros_version_checked_at: string | null;
+  ros_supported: boolean;
 };
 
 // Aliases for backward compat
 export type Router = RouterDTO;
+
+export type RouterDeleteImpactDTO = {
+  router_id: number;
+  router_name: string;
+  dashboard_selected: boolean;
+  peer_count: number;
+  selected_peer_count: number;
+  usage_sample_rows: number;
+  usage_minute_rows: number;
+  usage_daily_rows: number;
+  usage_monthly_rows: number;
+  quota_count: number;
+  action_count: number;
+  telegram_binding_count: number;
+  telegram_log_count: number;
+  signup_token_count: number;
+  fair_usage_assignment_count: number;
+  fair_usage_state_count: number;
+  router_rule_count: number;
+  merge_ledger_count: number;
+  peer_setting_count: number;
+};
+
+export type RouterDeleteResultDTO = RouterDeleteImpactDTO & {
+  signup_tokens_updated: number;
+  signup_tokens_deleted: number;
+  backup_path?: string | null;
+  post_delete_quick_check?: string;
+};
 
 function applyRouterFilters(params: URLSearchParams, routerId?: number | null, routerIds?: number[] | null) {
   if (routerIds && routerIds.length > 0) {
@@ -100,9 +256,21 @@ function applyRouterFilters(params: URLSearchParams, routerId?: number | null, r
   if (routerId && routerId > 0) params.set("router_id", String(routerId));
 }
 
-export type RouterCreateDTO = Omit<RouterDTO, "id"> & {
-  password?: string;
+export type RouterCreateDTO = {
+  name: string;
+  host: string;
+  proto: RouterProto;
+  port: number;
+  username: string;
+  tls_verify: boolean;
+  password: string;
+  enabled?: boolean;
 };
+export type RouterUpdateDTO = Partial<Omit<RouterCreateDTO, "password">> & { password?: string };
+
+export async function setRouterEnabled(routerId: number, enabled: boolean): Promise<RouterDTO> {
+  return updateRouter(routerId, { enabled }) as Promise<RouterDTO>;
+}
 
 export async function listRouters(): Promise<RouterDTO[]> {
   return fetchJson("/api/routers");
@@ -117,7 +285,7 @@ export async function createRouter(dto: RouterCreateDTO): Promise<RouterDTO> {
 }
 
 // RESTORED: updateRouter
-export async function updateRouter(routerId: number, dto: Partial<RouterDTO>) {
+export async function updateRouter(routerId: number, dto: RouterUpdateDTO) {
   return fetchJson(`/api/routers/${routerId}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -125,8 +293,12 @@ export async function updateRouter(routerId: number, dto: Partial<RouterDTO>) {
   });
 }
 
-export async function deleteRouter(routerId: number) {
+export async function deleteRouter(routerId: number): Promise<RouterDeleteResultDTO> {
   return fetchJson(`/api/routers/${routerId}`, { method: "DELETE" });
+}
+
+export async function getRouterDeleteImpact(routerId: number): Promise<RouterDeleteImpactDTO> {
+  return fetchJson(`/api/routers/${routerId}/delete-impact`);
 }
 
 export async function listInterfaces(routerId: number): Promise<string[]> {
@@ -135,24 +307,12 @@ export async function listInterfaces(routerId: number): Promise<string[]> {
 export const routerInterfaces = listInterfaces; // Alias
 
 // RESTORED: routerInterfaceDetail
-export type WGInterfaceConfig = { name: string; public_key: string; listen_port: number; public_host: string };
+export type WGInterfaceConfig = { name: string; public_key: string; listen_port: number; public_host: string; addresses?: string[] };
 export async function routerInterfaceDetail(routerId: number, iface: string): Promise<WGInterfaceConfig> {
   return fetchJson(`/api/routers/${routerId}/interfaces/${encodeURIComponent(iface)}`);
 }
 
-export async function getActiveRouter(): Promise<{ router_id: number | null }> {
-  return fetchJson("/api/active_router");
-}
-
-export async function setActiveRouter(routerId: number): Promise<any> {
-  return fetchJson("/api/active_router", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ router_id: routerId }),
-  });
-}
-
-export async function testRouter(routerId: number): Promise<{ ok: boolean }> {
+export async function testRouter(routerId: number): Promise<{ ok: boolean; ros_version?: string; ros_version_checked_at?: string | null; ros_supported?: boolean }> {
   return fetchJson(`/api/routers/${routerId}/test`, { method: "POST" });
 }
 
@@ -166,9 +326,11 @@ export type PeerListDTO = {
   name: string;
   public_key: string;
   allowed_address: string;
-  comment: string;
   disabled: boolean;
   selected: boolean;
+  router_sync_status: "synced" | "missing" | "new";
+  router_sync_first_seen_at?: string | null;
+  router_sync_last_seen_at?: string | null;
   endpoint?: string;
   status: "online" | "offline";
   online: boolean;
@@ -227,11 +389,26 @@ export async function getPeer(id: number): Promise<PeerListDTO> {
 }
 
 // RESTORED: patchPeer
-export async function patchPeer(peerId: number, body: Partial<{ selected: boolean; disabled: boolean }>) {
-  return fetchJson(`/api/peers/${peerId}`, {
+export async function patchPeer(
+  peerId: number,
+  body: Partial<{ selected: boolean; disabled: boolean; name: string }>,
+): Promise<PeerListDTO> {
+  const p = await fetchJson(`/api/peers/${peerId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+  });
+  return normalizePeer(p);
+}
+
+export async function resolvePeerRouterSync(
+  peerId: number,
+  action: "hide" | "delete" | "accept",
+) {
+  return fetchJson(`/api/peers/${peerId}/router-sync/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action }),
   });
 }
 
@@ -264,8 +441,11 @@ export type DashboardLiveStatusDTO = {
 export type UsageMaintenanceStatusDTO = {
   running: boolean;
   phase: string;
+  phase_label?: string | null;
   started_at?: string | null;
   finished_at?: string | null;
+  updated_at?: string | null;
+  cancelled_at?: string | null;
   last_error?: string | null;
   last_completed_phase?: string | null;
   resume_cursor?: Record<string, unknown> | null;
@@ -281,6 +461,17 @@ export type UsageMaintenanceStatusDTO = {
   raw_prune_before?: string | null;
   minute_prune_before?: string | null;
   daily_prune_before?: string | null;
+  cancel_requested: boolean;
+  can_cancel: boolean;
+  trigger?: "manual" | "scheduled";
+  next_scheduled_run?: string | null;
+  last_auto_run?: string | null;
+  elapsed_seconds: number;
+  estimated_remaining_seconds?: number | null;
+  progress_percent: number;
+  phase_progress_percent: number;
+  processed_units: number;
+  total_units: number;
 };
 
 export async function getPeersSummary(opts: { seconds?: number; days?: number; routerId?: number | null; routerIds?: number[] | null; start?: string; end?: string; allTime?: boolean }): Promise<PeerUsageSummaryDTO[]> {
@@ -401,11 +592,12 @@ export async function reconcilePeer(peerId: number) {
 export type PeerCreateRouterDTO = {
   interface: string;
   name: string;
-  comment: string;
   public_key: string;
   allowed_address: string;
   private_key?: string;
   preshared_key?: string;
+  config_name?: string;
+  custom_endpoint?: string;
   disabled?: boolean;
 };
 
@@ -459,10 +651,6 @@ export async function importPeers(routerId: number, items: PeerImportItem[]) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(items),
   });
-}
-
-export async function syncRouter(routerId: number) {
-  return fetchJson(`/api/routers/${routerId}/sync`, { method: "POST" });
 }
 
 // ...
@@ -724,6 +912,9 @@ export async function getUsageMaintenanceStatus(): Promise<UsageMaintenanceStatu
 }
 export async function runUsageMaintenance(): Promise<UsageMaintenanceStatusDTO> {
   return fetchJson("/api/admin/usage_maintenance/run", { method: "POST" });
+}
+export async function cancelUsageMaintenance(): Promise<UsageMaintenanceStatusDTO> {
+  return fetchJson("/api/admin/usage_maintenance/cancel", { method: "POST" });
 }
 
 // ── Telegram Bot ────────────────────────────────────────────────────

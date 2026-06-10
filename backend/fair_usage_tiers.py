@@ -5,7 +5,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from .models import FairUsageTier
+from .models import FairUsageState, FairUsageTier
 
 
 def ordered_tiers_for_rule(db: Session, rule_id: int) -> list[FairUsageTier]:
@@ -36,7 +36,11 @@ def replace_rule_tiers(
     Replace all tiers for a rule. Each row:
     (sort_order, threshold_bytes, name, throttle_download_kbps, throttle_upload_kbps).
     """
-    db.query(FairUsageTier).filter(FairUsageTier.rule_id == rule_id).delete()
+    db.query(FairUsageState).filter(FairUsageState.rule_id == rule_id).update(
+        {FairUsageState.tier_id: None},
+        synchronize_session=False,
+    )
+    db.query(FairUsageTier).filter(FairUsageTier.rule_id == rule_id).delete(synchronize_session=False)
     for so, th, name, tdl, tul in tier_rows:
         db.add(
             FairUsageTier(

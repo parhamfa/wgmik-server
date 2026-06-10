@@ -4,12 +4,14 @@ import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
 
 import SettingsPage from "./pages/Settings";
 import PeerDetail from "./pages/PeerDetail";
-import DashboardPage from "./pages/Dashboard";
+import HomePage from "./pages/Home";
 import FairUsagePage from "./pages/FairUsage";
 import TelegramPage from "./pages/Telegram";
 import FairUsageRender from "./pages/FairUsageRender";
 import UsageChartRender from "./pages/UsageChartRender";
 import NotFound from "./pages/NotFound";
+import LoginPage from "./pages/Login";
+import InstallSetupPage from "./pages/InstallSetup";
 import "./styles.css";
 
 type ThemeMode = "light" | "dark";
@@ -82,8 +84,6 @@ function StatusPill({ online, last }: { online: boolean; last?: string }) {
   );
 }
 
-const Dashboard = DashboardPage;
-
 function Settings() {
   return (
     <div className="max-w-2xl mx-auto px-4 md:px-6 py-6">
@@ -106,6 +106,9 @@ function RequireAuth() {
   if (!user) {
     return <Navigate to="/login" state={{ from: location }} replace />;
   }
+  if (user.must_change_password && location.pathname !== "/settings") {
+    return <Navigate to="/settings" replace />;
+  }
   return <Outlet />;
 }
 
@@ -118,11 +121,12 @@ function App() {
         <Route path="*" element={
           <AuthProvider>
             <Routes>
-              <Route path="/login" element={<LoginSetup />} />
-              <Route path="/setup" element={<LoginSetup />} />
+              <Route path="/install" element={<InstallSetupPage />} />
+              <Route path="/login" element={<LoginPage />} />
 
               <Route element={<RequireAuth />}>
-                <Route path="/" element={<Dashboard />} />
+                <Route path="/" element={<HomePage />} />
+                <Route path="/setup" element={<LoginSetup />} />
                 <Route path="/settings" element={<SettingsPage />} />
                 <Route path="/fair-usage" element={<FairUsagePage />} />
                 <Route path="/peer/:id" element={<PeerDetail />} />
@@ -141,5 +145,3 @@ function App() {
 
 const root = createRoot(document.getElementById("root")!);
 root.render(<App />);
-
-

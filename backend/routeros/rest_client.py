@@ -2,6 +2,7 @@ import httpx
 from typing import List, Optional
 import re
 from ipaddress import ip_network
+from urllib.parse import quote
 from .client_base import RouterOSClient, WGPeer, WGInterfaceConfig
 
 
@@ -15,6 +16,7 @@ class RouterOSRestClient(RouterOSClient):
         tls_verify: bool = True,
         https: bool = True,
         allow_scheme_fallback: bool = True,
+        timeout: float = 10.0,
     ):
         self.host = host
         self.port = port
@@ -22,6 +24,7 @@ class RouterOSRestClient(RouterOSClient):
         self.allow_scheme_fallback = allow_scheme_fallback
         self.auth = (username, password)
         self.verify = tls_verify
+        self.timeout = timeout
 
     def _base(self, https: bool) -> str:
         return f"{'https' if https else 'http'}://{self.host}:{self.port}/rest"
@@ -29,7 +32,7 @@ class RouterOSRestClient(RouterOSClient):
     def _request(self, method: str, path: str, json: Optional[dict] = None):
         url = f"{self._base(self.https)}{path}"
         try:
-            with httpx.Client(verify=self.verify, timeout=10.0, auth=self.auth) as c:
+            with httpx.Client(verify=self.verify, timeout=self.timeout, auth=self.auth) as c:
                 r = c.request(method, url, json=json)
                 r.raise_for_status()
                 if r.headers.get("content-type", "").startswith("application/json"):
@@ -45,7 +48,7 @@ class RouterOSRestClient(RouterOSClient):
                 raise
             alt_https = not self.https
             alt_url = f"{self._base(alt_https)}{path}"
-            with httpx.Client(verify=self.verify, timeout=10.0, auth=self.auth) as c:
+            with httpx.Client(verify=self.verify, timeout=self.timeout, auth=self.auth) as c:
                 r = c.request(method, alt_url, json=json)
                 r.raise_for_status()
                 if r.headers.get("content-type", "").startswith("application/json"):
@@ -58,10 +61,35 @@ class RouterOSRestClient(RouterOSClient):
     def _put(self, path: str, json: dict):
         return self._request("PUT", path, json=json)
 
+    def get_system_version(self) -> str:
+        data = self._get("/system/resource")
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        if isinstance(data, dict):
+            return str(data.get("version") or "").strip()
+        return ""
+
     def list_wireguard_interfaces(self) -> List[str]:
         data = self._get("/interface/wireguard")
         names = [row.get("name") for row in data if row.get("name")]
         return names
+
+    def _interface_addresses(self, interface: str) -> List[str]:
+        try:
+            rows = self._get("/ip/address")
+        except Exception:
+            return []
+        out: List[str] = []
+        for row in rows:
+            if row.get("interface") != interface:
+                continue
+            disabled = str(row.get("disabled", "")).strip().lower()
+            if disabled in ("true", "yes", "1"):
+                continue
+            addr = (row.get("address") or "").strip()
+            if addr:
+                out.append(addr)
+        return out
 
     def get_wireguard_interface(self, interface: str) -> WGInterfaceConfig:
         data = self._get("/interface/wireguard")
@@ -71,6 +99,7 @@ class RouterOSRestClient(RouterOSClient):
                     name=row.get("name", interface),
                     public_key=row.get("public-key", ""),
                     listen_port=int(row.get("listen-port", 0) or 0),
+                    addresses=self._interface_addresses(interface),
                 )
         raise KeyError(f"wireguard interface '{interface}' not found")
 
@@ -160,7 +189,6 @@ class RouterOSRestClient(RouterOSClient):
                     client_endpoint=(
                         (row.get("client-endpoint") or row.get("clientEndpoint") or "") or ""
                     ).strip(),
-                    comment=(row.get("comment") or "").strip(),
                 )
             )
         return peers
@@ -189,11 +217,11 @@ class RouterOSRestClient(RouterOSClient):
             },
         )
 
-    def set_peer_comment(self, interface: str, ros_id: str, comment: str) -> None:
+    def set_peer_name(self, interface: str, ros_id: str, name: str) -> None:
         self._request(
             "POST",
             "/interface/wireguard/peers/set",
-            json={"numbers": ros_id, "comment": comment},
+            json={"numbers": ros_id, "name": name or ""},
         )
 
     def set_peer_client_endpoint(self, interface: str, ros_id: str, client_endpoint: Optional[str]) -> None:
@@ -237,9 +265,10 @@ class RouterOSRestClient(RouterOSClient):
         public_key: str,
         allowed_address: str,
         name: str = "",
-        comment: str = "",
         disabled: bool = False,
         private_key: Optional[str] = None,
+        preshared_key: Optional[str] = None,
+        client_endpoint: Optional[str] = None,
     ) -> str:
         # RouterOS REST add expects hyphenated keys and returns {"ret":"*XX"}
         payload = {
@@ -249,10 +278,12 @@ class RouterOSRestClient(RouterOSClient):
         }
         if private_key:
             payload["private-key"] = private_key
+        if preshared_key:
+            payload["preshared-key"] = preshared_key
+        if client_endpoint:
+            payload["client-endpoint"] = client_endpoint
         if name:
             payload["name"] = name
-        if comment:
-            payload["comment"] = comment
         if disabled:
             payload["disabled"] = "yes"
         res = self._request("POST", "/interface/wireguard/peers/add", json=payload)
@@ -267,9 +298,10 @@ class RouterOSRestClient(RouterOSClient):
         raise RuntimeError("RouterOS did not return peer id")
 
     def remove_wireguard_peer(self, interface: str, ros_id: str) -> None:
-        # RouterOS REST remove endpoint:
-        #   POST /rest/interface/wireguard/peers/remove  {"numbers":"*53"}
-        self._request("POST", "/interface/wireguard/peers/remove", json={"numbers": ros_id})
+        # RouterOS REST maps remove to HTTP DELETE against the record URL.
+        # RouterOS examples show star-prefixed ids directly in the URL; some versions
+        # return 500 when the "*" is percent-encoded as "%2A".
+        self._request("DELETE", f"/interface/wireguard/peers/{quote(ros_id, safe='*')}")
 
     # ── Simple Queue management ──────────────────────────────────────────
 
@@ -298,8 +330,15 @@ class RouterOSRestClient(RouterOSClient):
             json={"numbers": ros_id, "max-limit": f"{max_limit_up}/{max_limit_down}"},
         )
 
+    def set_simple_queue_name(self, ros_id: str, name: str) -> None:
+        self._request(
+            "POST",
+            "/queue/simple/set",
+            json={"numbers": ros_id, "name": name},
+        )
+
     def remove_simple_queue(self, ros_id: str) -> None:
-        self._request("POST", "/queue/simple/remove", json={"numbers": ros_id})
+        self._request("DELETE", f"/queue/simple/{quote(ros_id, safe='*')}")
 
     def list_simple_queues(self, name_prefix: str = "") -> List[dict]:
         data = self._get("/queue/simple")

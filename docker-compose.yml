@@ -4,13 +4,12 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     environment:
-      # Persist DB in a named volume (recommended for docker).
+      # Persist DB in the bind-mounted ./data dir.
       DATABASE_URL: ${DATABASE_URL:-sqlite:////data/wgmik.db}
-      # Used to encrypt RouterOS passwords in DB; override in your own .env.
-      SECRET_KEY: ${SECRET_KEY:-change-me}
-      # First-run admin user bootstrap (only used if DB has no users yet)
-      INITIAL_ADMIN_USERNAME: "${INITIAL_ADMIN_USERNAME:-admin}"
-      INITIAL_ADMIN_PASSWORD: "${INITIAL_ADMIN_PASSWORD:-}"
+      # Encrypts RouterOS passwords / WG keys / Telegram token and signs JWTs.
+      # Leave empty: the backend auto-generates one on first run and persists it
+      # to /data/secret_key. Only set this to pin a key (e.g. multi-instance).
+      SECRET_KEY: ${SECRET_KEY:-}
       DEBUG: ${DEBUG:-false}
     volumes:
       - ./data:/data
