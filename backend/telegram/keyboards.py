@@ -127,3 +127,58 @@ def notifications_menu(items: list[tuple[str, str]], lang: str = "en") -> Inline
     rows = [[InlineKeyboardButton(text=label, callback_data=f"settings:notif:{event_type}")] for event_type, label in items]
     rows.append([InlineKeyboardButton(text=t("btn_back", lang), callback_data="menu:settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=t("btn_today", lang), callback_data="adm:scope:today"),
+            InlineKeyboardButton(text=t("btn_this_month", lang), callback_data="adm:scope:month"),
+            InlineKeyboardButton(text=t("btn_all_time", lang), callback_data="adm:scope:alltime"),
+        ],
+        [InlineKeyboardButton(text=t("adm_btn_user_report", lang), callback_data="adm:users")],
+    ])
+
+
+def admin_user_list_keyboard(
+    user_ids: list[int],
+    labels: list[str],
+    page: int,
+    total_pages: int,
+    lang: str = "en",
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for user_id, label in zip(user_ids, labels):
+        rows.append([
+            InlineKeyboardButton(text=label, callback_data=f"adm:user:{user_id}"),
+        ])
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text=t("usagepick_prev", lang),
+                callback_data=f"adm:users:p:{page - 1}",
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            InlineKeyboardButton(
+                text=t("usagepick_next", lang),
+                callback_data=f"adm:users:p:{page + 1}",
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t("btn_back", lang), callback_data="adm:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_user_report_menu(user_id: int, lang: str = "en") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=t("btn_today", lang), callback_data=f"adm:usr:{user_id}:today"),
+            InlineKeyboardButton(text=t("btn_this_month", lang), callback_data=f"adm:usr:{user_id}:month"),
+            InlineKeyboardButton(text=t("btn_all_time", lang), callback_data=f"adm:usr:{user_id}:alltime"),
+        ],
+        [InlineKeyboardButton(text=t("btn_back", lang), callback_data="adm:users")],
+    ])

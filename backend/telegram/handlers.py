@@ -718,9 +718,9 @@ async def cb_peer_detail(cb: CallbackQuery):
     await cb.answer()
 
 
-@router.message(F.text)
+@router.message(F.text, ~F.text.startswith("/"))
 async def any_text_to_home(msg: types.Message):
-    """Any text not handled above (plain text, unknown /commands): same as /start / /home."""
+    """Plain text (not slash commands): same as /start / /home."""
     await cmd_start(msg)
 
 

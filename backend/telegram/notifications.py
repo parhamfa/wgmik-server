@@ -191,8 +191,8 @@ def _make_hash(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
 
-def _send_message_sync(chat_id: int, text: str) -> bool:
-    """Send a message via a one-shot Bot instance. Works whether the polling bot is running or not."""
+def _run_bot_coro(make_coro) -> bool:
+    """Run a one-shot bot coroutine on the polling bot's loop, or a throwaway one."""
     from .bot import _get_tg_settings, _decrypt_token
 
     cfg = _get_tg_settings()
@@ -205,7 +205,7 @@ def _send_message_sync(chat_id: int, text: str) -> bool:
         from aiogram import Bot
         bot = Bot(token=token)
         try:
-            await bot.send_message(chat_id, text)
+            await make_coro(bot)
             return True
         finally:
             await bot.session.close()
@@ -215,12 +215,84 @@ def _send_message_sync(chat_id: int, text: str) -> bool:
         from .bot import _bot_loop, _bot_running
         if _bot_running and _bot_loop and not _bot_loop.is_closed():
             future = asyncio.run_coroutine_threadsafe(_do_send(), _bot_loop)
-            return future.result(timeout=15)
+            return future.result(timeout=30)
         else:
             return asyncio.run(_do_send())
     except Exception:
-        logger.exception("Failed to send TG message to %s", chat_id)
+        logger.exception("Failed to send TG message")
         return False
+
+
+def _send_message_sync(chat_id: int, text: str) -> bool:
+    """Send a message via a one-shot Bot instance. Works whether the polling bot is running or not."""
+    return _run_bot_coro(lambda bot: bot.send_message(chat_id, text))
+
+
+def _send_photo_sync(chat_id: int, png: bytes, caption: str) -> bool:
+    """Send a photo (PNG bytes) with caption; same loop strategy as _send_message_sync."""
+    from aiogram.types import BufferedInputFile
+
+    return _run_bot_coro(
+        lambda bot: bot.send_photo(
+            chat_id,
+            BufferedInputFile(png, filename="card.png"),
+            caption=caption[:1024],
+        )
+    )
+
+
+def _fair_usage_card_png(db: Session, peer: Peer) -> Optional[bytes]:
+    """Fair-usage status card PNG for notification messages (sync; None on failure)."""
+    try:
+        from ..fair_usage_peer_status_dto import build_fair_usage_peer_status_dto
+        from .fair_usage_image import build_fair_usage_card_svg
+        from .svg_render import render_svg_to_png
+
+        dto = build_fair_usage_peer_status_dto(db, peer)
+        if not dto.rules:
+            return None
+        svg = build_fair_usage_card_svg(dto, peer.name or peer.public_key[:12])
+        return render_svg_to_png(svg)
+    except Exception:
+        logger.exception("Fair-usage card render failed for peer %s", peer.id)
+        return None
+
+
+def _summary_points(db: Session, peer_id: int, period: str, now: datetime) -> tuple[list[dict], str]:
+    from .usage_chart_image import usage_points_for_tg_menu, usage_points_for_week
+
+    if period == "weekly":
+        return usage_points_for_week(db, peer_id, now)
+    return usage_points_for_tg_menu(db, peer_id, "today", now)
+
+
+def _render_chart_png(name: str, scope_label: str, mode: str, points: list[dict]) -> Optional[bytes]:
+    """Usage chart PNG (sync; None when no data or on failure)."""
+    if not points:
+        return None
+    try:
+        from ..calendar_utils import app_date_calendar
+        from ..settings import settings as app_settings
+        from .svg_render import render_svg_to_png
+        from .usage_chart_image import build_usage_chart_svg
+
+        payload = {
+            "peerName": name,
+            "scopeLabel": scope_label,
+            "mode": mode,
+            "timezone": app_settings.timezone,
+            "dateCalendar": app_date_calendar(),
+            "points": points,
+        }
+        return render_svg_to_png(build_usage_chart_svg(payload))
+    except Exception:
+        logger.exception("Summary chart render failed for %s", name)
+        return None
+
+
+def _summary_chart_png(db: Session, peer: Peer, period: str, scope_label: str, now: datetime) -> Optional[bytes]:
+    points, mode = _summary_points(db, peer.id, period, now)
+    return _render_chart_png(peer.name or peer.public_key[:12], scope_label, mode, points)
 
 
 def _get_admin_chat_id(db: Session) -> Optional[int]:
@@ -337,6 +409,16 @@ def notify_quota_lifted(db: Session, peer: Peer) -> None:
     hours = _dedup_hours("quota_lifted")
     from .placeholder import get_internal_admin_log_user_id
 
+    card_png: Optional[bytes] = None
+
+    def _deliver(chat_id: int, text: str) -> bool:
+        nonlocal card_png
+        if card_png is None:
+            card_png = _fair_usage_card_png(db, peer) or b""
+        if card_png:
+            return _send_photo_sync(chat_id, card_png, text)
+        return _send_message_sync(chat_id, text)
+
     for b in bindings:
         tg_user = db.get(TelegramUser, b.telegram_user_id)
         if not tg_user:
@@ -348,7 +430,7 @@ def notify_quota_lifted(db: Session, peer: Peer) -> None:
             continue
         lang = tg_user.language or "en"
         text = t("notif_quota_lifted", lang, name=peer_name)
-        if _send_message_sync(tg_user.telegram_user_id, text):
+        if _deliver(tg_user.telegram_user_id, text):
             _record_sent(db, tg_user.id, peer.id, "quota_lifted", msg_hash)
 
     if notify_admin and admin_chat_id:
@@ -356,7 +438,7 @@ def notify_quota_lifted(db: Session, peer: Peer) -> None:
         msg_hash = _make_hash("quota_lifted", str(peer.id), "admin", "lift")
         if not _already_sent(db, aid, peer.id, "quota_lifted", msg_hash, within_hours=hours):
             text = t("notif_quota_lifted", "en", name=peer_name)
-            if _send_message_sync(admin_chat_id, f"[Admin] {text}"):
+            if _deliver(admin_chat_id, f"[Admin] {text}"):
                 _record_sent(db, aid, peer.id, "quota_lifted", msg_hash)
 
 
@@ -411,6 +493,16 @@ def _notify_event(
             rule=rule_name or "—",
         )
 
+    card_png: Optional[bytes] = None
+
+    def _deliver(chat_id: int, text: str) -> bool:
+        nonlocal card_png
+        if card_png is None:
+            card_png = _fair_usage_card_png(db, peer) or b""
+        if card_png:
+            return _send_photo_sync(chat_id, card_png, text)
+        return _send_message_sync(chat_id, text)
+
     for b in bindings:
         tg_user = db.get(TelegramUser, b.telegram_user_id)
         if not tg_user:
@@ -422,7 +514,7 @@ def _notify_event(
             continue
         lang = tg_user.language or "en"
         text = _message_for_user(lang)
-        if _send_message_sync(tg_user.telegram_user_id, text):
+        if _deliver(tg_user.telegram_user_id, text):
             _record_sent(db, tg_user.id, peer.id, event_type, msg_hash)
 
     if notify_admin and admin_chat_id:
@@ -431,13 +523,13 @@ def _notify_event(
         if _already_sent(db, aid, peer.id, event_type, msg_hash, within_hours=hours):
             return
         text = _message_for_user("en")
-        if _send_message_sync(admin_chat_id, f"[Admin] {text}"):
+        if _deliver(admin_chat_id, f"[Admin] {text}"):
             _record_sent(db, aid, peer.id, event_type, msg_hash)
 
 
-def send_daily_summary(db: Session) -> None:
-    """Send daily usage summary to all clients with bindings."""
-    cfg = _get_event_config(db, "daily_summary")
+def _send_periodic_summary(db: Session, *, event_type: str, period: str, scope_btn_key: str, admin_header: str) -> None:
+    """Shared daily/weekly summary: per-user text summary plus per-peer usage chart photos."""
+    cfg = _get_event_config(db, event_type)
     if not cfg or not cfg.enabled:
         return
     notify_admin = bool(cfg.notify_admin)
@@ -450,9 +542,18 @@ def send_daily_summary(db: Session) -> None:
     tg_users = db.query(TelegramUser).filter_by(is_blocked=False).all()
     admin_chat_id = _get_admin_chat_id(db)
     admin_lines = []
+    # Render each peer's chart once per scope label (label is baked into the image).
+    chart_cache: dict[tuple[int, str], bytes | None] = {}
 
+    def _chart_for(peer: Peer, scope_label: str) -> bytes | None:
+        key = (peer.id, scope_label)
+        if key not in chart_cache:
+            chart_cache[key] = _summary_chart_png(db, peer, period, scope_label, now)
+        return chart_cache[key]
+
+    admin_peers: list[Peer] = []
     for tg_user in tg_users:
-        if not effective_user_notification_enabled(db, tg_user.id, "daily_summary"):
+        if not effective_user_notification_enabled(db, tg_user.id, event_type):
             continue
         bindings = (
             db.query(TelegramPeerBinding)
@@ -463,71 +564,72 @@ def send_daily_summary(db: Session) -> None:
             continue
 
         lang = tg_user.language or "en"
-        lines = [t("usage_header", lang, scope=t("btn_today", lang))]
+        scope_label = t(scope_btn_key, lang)
+        lines = [t("usage_header", lang, scope=scope_label)]
+        user_peers: list[Peer] = []
         for b in bindings:
             peer = db.get(Peer, b.peer_id)
             if not peer:
                 continue
-            rx, tx = peer_scope_usage_bytes(peer.id, "daily", db, now)
+            rx, tx = peer_scope_usage_bytes(peer.id, period, db, now)
             name = peer.name or peer.public_key[:12]
             lines.append(f"  {name}: \u2b07{_fmt_bytes(rx)} \u2b06{_fmt_bytes(tx)}")
             fu_line = format_fair_usage_condensed(peer, db, lang, now)
             if fu_line:
                 lines.append(f"    {t('btn_limits', lang)}: {fu_line}")
             admin_lines.append(f"  {name} (@{tg_user.telegram_username}): \u2b07{_fmt_bytes(rx)} \u2b06{_fmt_bytes(tx)}")
+            user_peers.append(peer)
+            admin_peers.append(peer)
 
         if len(lines) > 1:
             _send_message_sync(tg_user.telegram_user_id, "\n".join(lines))
+            for peer in user_peers:
+                png = _chart_for(peer, scope_label)
+                if png:
+                    name = peer.name or peer.public_key[:12]
+                    caption = t("usage_chart_caption", lang, name=name, scope=scope_label)
+                    _send_photo_sync(tg_user.telegram_user_id, png, caption)
 
     if notify_admin and admin_chat_id and admin_lines:
-        header = "[Admin] Daily usage summary"
-        _send_message_sync(admin_chat_id, f"{header}\n" + "\n".join(admin_lines))
+        _send_message_sync(admin_chat_id, f"{admin_header}\n" + "\n".join(admin_lines))
+        # Admin gets one aggregate chart across all reported peers, not per-peer spam.
+        scope_label = t(scope_btn_key, "en")
+        from .usage_chart_image import merge_usage_points
+
+        series: list[list[dict]] = []
+        mode = "days"
+        seen: set[int] = set()
+        for peer in admin_peers:
+            if peer.id in seen:
+                continue
+            seen.add(peer.id)
+            points, mode = _summary_points(db, peer.id, period, now)
+            series.append(points)
+        agg_points = merge_usage_points(series)
+        name = t("adm_dashboard_chart_name", "en")
+        png = _render_chart_png(name, scope_label, mode, agg_points)
+        if png:
+            caption = t("usage_chart_caption", "en", name=name, scope=scope_label)
+            _send_photo_sync(admin_chat_id, png, caption)
+
+
+def send_daily_summary(db: Session) -> None:
+    """Send daily usage summary (text + per-peer charts) to all clients with bindings."""
+    _send_periodic_summary(
+        db,
+        event_type="daily_summary",
+        period="daily",
+        scope_btn_key="btn_today",
+        admin_header="[Admin] Daily usage summary",
+    )
 
 
 def send_weekly_summary(db: Session) -> None:
-    """Send weekly usage summary to all clients with bindings."""
-    cfg = _get_event_config(db, "weekly_summary")
-    if not cfg or not cfg.enabled:
-        return
-    notify_admin = bool(cfg.notify_admin)
-
-    from ..fair_usage_usage import peer_scope_usage_bytes
-    from .formatters import format_fair_usage_condensed
-
-    now = datetime.now(timezone.utc)
-
-    tg_users = db.query(TelegramUser).filter_by(is_blocked=False).all()
-    admin_chat_id = _get_admin_chat_id(db)
-    admin_lines = []
-
-    for tg_user in tg_users:
-        if not effective_user_notification_enabled(db, tg_user.id, "weekly_summary"):
-            continue
-        bindings = (
-            db.query(TelegramPeerBinding)
-            .filter_by(telegram_user_id=tg_user.id, visible=True)
-            .all()
-        )
-        if not bindings:
-            continue
-
-        lang = tg_user.language or "en"
-        lines = [t("usage_header", lang, scope=t("btn_this_week", lang))]
-        for b in bindings:
-            peer = db.get(Peer, b.peer_id)
-            if not peer:
-                continue
-            rx, tx = peer_scope_usage_bytes(peer.id, "weekly", db, now)
-            name = peer.name or peer.public_key[:12]
-            lines.append(f"  {name}: \u2b07{_fmt_bytes(rx)} \u2b06{_fmt_bytes(tx)}")
-            fu_line = format_fair_usage_condensed(peer, db, lang, now)
-            if fu_line:
-                lines.append(f"    {t('btn_limits', lang)}: {fu_line}")
-            admin_lines.append(f"  {name} (@{tg_user.telegram_username}): \u2b07{_fmt_bytes(rx)} \u2b06{_fmt_bytes(tx)}")
-
-        if len(lines) > 1:
-            _send_message_sync(tg_user.telegram_user_id, "\n".join(lines))
-
-    if notify_admin and admin_chat_id and admin_lines:
-        header = "[Admin] Weekly usage summary"
-        _send_message_sync(admin_chat_id, f"{header}\n" + "\n".join(admin_lines))
+    """Send weekly usage summary (text + per-peer charts) to all clients with bindings."""
+    _send_periodic_summary(
+        db,
+        event_type="weekly_summary",
+        period="weekly",
+        scope_btn_key="btn_this_week",
+        admin_header="[Admin] Weekly usage summary",
+    )

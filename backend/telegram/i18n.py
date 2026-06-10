@@ -410,6 +410,54 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "You are not registered. Ask your admin for a signup link.",
         "fa": "\u0634\u0645\u0627 \u062b\u0628\u062a\u200c\u0646\u0627\u0645 \u0646\u0634\u062f\u0647\u200c\u0627\u06cc\u062f. \u0627\u0632 \u0645\u062f\u06cc\u0631 \u0644\u06cc\u0646\u06a9 \u062b\u0628\u062a\u200c\u0646\u0627\u0645 \u0628\u06af\u06cc\u0631\u06cc\u062f.",
     },
+    "cmd_desc_admin": {
+        "en": "Admin reports menu",
+        "fa": "\u0645\u0646\u0648\u06cc \u06af\u0632\u0627\u0631\u0634\u200c\u0647\u0627\u06cc \u0645\u062f\u06cc\u0631",
+    },
+    "adm_menu_title": {
+        "en": "Admin reports — choose a report.",
+        "fa": "\u06af\u0632\u0627\u0631\u0634\u200c\u0647\u0627\u06cc \u0645\u062f\u06cc\u0631 \u2014 \u06cc\u06a9 \u06af\u0632\u0627\u0631\u0634 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f.",
+    },
+    "adm_btn_user_report": {
+        "en": "Per-user report",
+        "fa": "\u06af\u0632\u0627\u0631\u0634 \u0647\u0631 \u06a9\u0627\u0631\u0628\u0631",
+    },
+    "adm_usage_sending": {
+        "en": "Generating {scope} report for all peers…",
+        "fa": "\u062f\u0631 \u062d\u0627\u0644 \u062a\u0648\u0644\u06cc\u062f \u06af\u0632\u0627\u0631\u0634 {scope} \u0628\u0631\u0627\u06cc \u0647\u0645\u0647 \u067e\u06cc\u0631\u0647\u0627\u2026",
+    },
+    "adm_dashboard_chart_name": {
+        "en": "All peers",
+        "fa": "\u0647\u0645\u0647 \u067e\u06cc\u0631\u0647\u0627",
+    },
+    "adm_choose_user": {
+        "en": "Choose a user (page {page}/{total}):",
+        "fa": "\u06cc\u06a9 \u06a9\u0627\u0631\u0628\u0631 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f (\u0635\u0641\u062d\u0647 {page}/{total}):",
+    },
+    "adm_user_report_title": {
+        "en": "Report for {name} — choose a period.",
+        "fa": "\u06af\u0632\u0627\u0631\u0634 {name} \u2014 \u062f\u0648\u0631\u0647 \u0631\u0627 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f.",
+    },
+    "adm_no_users": {
+        "en": "No registered Telegram users yet.",
+        "fa": "\u0647\u0646\u0648\u0632 \u06a9\u0627\u0631\u0628\u0631 \u062a\u0644\u06af\u0631\u0627\u0645\u06cc \u062b\u0628\u062a\u200c\u0646\u0627\u0645 \u0646\u0634\u062f\u0647 \u0627\u0633\u062a.",
+    },
+    "adm_no_peers": {
+        "en": "No peers found.",
+        "fa": "\u067e\u06cc\u0631\u06cc \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.",
+    },
+    "adm_no_usage_data": {
+        "en": "No usage data for {scope}.",
+        "fa": "\u062f\u0627\u062f\u0647\u200c\u0627\u06cc \u0645\u0635\u0631\u0641\u06cc \u0628\u0631\u0627\u06cc {scope} \u0648\u062c\u0648\u062f \u0646\u062f\u0627\u0631\u062f.",
+    },
+    "adm_user_not_found": {
+        "en": "User not found.",
+        "fa": "\u06a9\u0627\u0631\u0628\u0631 \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.",
+    },
+    "adm_done": {
+        "en": "Report complete.",
+        "fa": "\u06af\u0632\u0627\u0631\u0634 \u062a\u0645\u0627\u0645 \u0634\u062f.",
+    },
 }
 
 

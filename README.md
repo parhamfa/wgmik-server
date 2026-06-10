@@ -40,8 +40,9 @@ It's built to be **simple to run** (one `docker compose up`), **robust** (encryp
 **Telegram bot (self-service for your users)**
 - Users link their peer via a one-time **deep-link signup token** — no accounts to hand out.
 - Commands: `/today`, `/monthly`, `/alltime`, `/calendar`, `/fair`, `/settings`.
-- Rendered usage **charts and images** delivered straight in chat.
-- Push **notifications**: quota warnings, daily and weekly summaries.
+- Rendered usage **charts and images** delivered straight in chat — generated in-process (SVG → PNG), no headless browser.
+- Push **notifications**: quota warnings and throttle alerts with fair-usage status cards, daily and weekly summaries with charts.
+- **Admin menu** (`/admin`): aggregate dashboard reports (today / month / all-time) and per-user reports.
 - **Multi-language** (i18n) and **Jalali / Gregorian** calendar support.
 
 **Admin & operations**
@@ -66,9 +67,9 @@ docker compose pull   # fetch prebuilt images from GHCR
 docker compose up -d
 ```
 
-That's it — no `.env` to edit, no secrets to generate, nothing to compile. The prebuilt images are published to GitHub Container Registry, so you only download what changed.
+That's it — no `.env` to edit, no secrets to generate, nothing to compile. The prebuilt image is published to GitHub Container Registry (`ghcr.io/parhamfa/wgmik-server`), so you only download what changed.
 
-> Prefer to **build from source** instead of pulling? Use `docker compose up --build` — same compose file, it just builds the images locally.
+> Prefer to **build from source** instead of pulling? Use `docker compose up --build` — same compose file, it just builds the image locally.
 
 - **Web UI:** http://localhost:5173
 - **API:** http://localhost:8000
@@ -108,7 +109,7 @@ Your data lives in `./data` (DB + encryption key) and is never touched by an upd
 cp -r data data.backup-$(date +%Y%m%d)
 
 git pull
-docker compose pull     # grab the new prebuilt images (only changed layers)
+docker compose pull     # grab the new prebuilt image (only changed layers)
 docker compose up -d
 ```
 
@@ -118,12 +119,14 @@ To pin a specific release instead of tracking the latest image, set `WGMIK_TAG` 
 
 ## Dev mode (hot reload)
 
+Single container — Vite and uvicorn run together with bind mounts for hot reload.
+
 ```bash
 docker compose -f docker-compose.dev.yml up --build
 ```
 
-- **Frontend** hot reload: http://localhost:5173
-- **Backend** hot reload: http://localhost:8000
+- **Web UI (Vite):** http://localhost:5173
+- **API (uvicorn --reload):** http://localhost:8000
 
 Stop:
 
@@ -133,9 +136,9 @@ docker compose -f docker-compose.dev.yml down
 
 ## Tech stack
 
-- **Backend:** FastAPI (Python), SQLAlchemy, APScheduler, SQLite.
+- **Backend:** FastAPI (Python), SQLAlchemy, APScheduler, SQLite. Telegram card/chart images are rendered with [resvg](https://github.com/baseplate-admin/resvg-py) (no Chromium/Playwright).
 - **Frontend:** React + Vite + TypeScript + Tailwind.
-- **Delivery:** Docker Compose with prebuilt images on GHCR (GitHub Actions CI), nginx serving the built frontend and proxying the API, healthchecks, and single-volume persistence.
+- **Delivery:** Docker Compose with a single prebuilt image on GHCR (GitHub Actions CI). FastAPI serves the built frontend and API on one port, healthchecks, and single-volume persistence.
 
 ## Verify after boot
 

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from backend.db import SessionLocal
 from backend.models import Peer, Router, UsageDaily
 from backend.telegram.formatters import format_usage_total_summary, usage_point_totals
-from backend.telegram.usage_chart_image import usage_points_for_tg_menu
+from backend.telegram.usage_chart_image import usage_points_for_tg_menu, usage_points_for_week
 
 
 @dataclass
@@ -120,6 +120,56 @@ def test_usage_points_for_tg_menu_alltime_returns_full_daily_history(client):
             {"day": "2026-04-10", "rx": 200, "tx": 75},
             {"day": "2026-04-22", "rx": 300, "tx": 125},
         ]
+    finally:
+        db.close()
+
+
+def test_usage_points_for_week_only_includes_current_week(client):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="r1",
+            host="127.0.0.1",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret",
+        )
+        db.add(router)
+        db.flush()
+
+        peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="peer-1",
+            public_key="pubkey-1",
+            allowed_address="10.0.0.2/32",
+        )
+        db.add(peer)
+        db.flush()
+
+        db.add_all(
+            [
+                # Previous week (before Monday 2026-06-08).
+                UsageDaily(peer_id=peer.id, day="2026-06-05", rx=999, tx=999),
+                # Current week.
+                UsageDaily(peer_id=peer.id, day="2026-06-08", rx=100, tx=50),
+                UsageDaily(peer_id=peer.id, day="2026-06-10", rx=200, tx=75),
+            ]
+        )
+        db.commit()
+
+        # Wednesday 2026-06-10; default week start is Monday.
+        points, mode = usage_points_for_week(
+            db, peer.id, datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+        )
+
+        assert mode == "days"
+        days = [p["day"] for p in points]
+        assert "2026-06-05" not in days
+        assert {"day": "2026-06-08", "rx": 100, "tx": 50} in points
+        assert {"day": "2026-06-10", "rx": 200, "tx": 75} in points
     finally:
         db.close()
 
