@@ -1,10 +1,63 @@
+<div align="center">
+
 # wgmik-server
 
-WireGuard accounting panel for MikroTik RouterOS (FastAPI + React/Vite).
+**A self-hosted WireGuard accounting & management panel for MikroTik RouterOS.**
+
+Track per-peer usage, enforce fair-usage quotas, manage peers across multiple routers, and let users check their own usage from Telegram — all from one clean, modern panel.
+
+<img src="assets/wgmik-intro.gif" alt="wgmik-server dashboard" width="100%" />
+
+</div>
+
+---
+
+## Why
+
+RouterOS gives you WireGuard, but no real visibility: no history, no quotas, no per-peer accounting, no way to hand usage info to your users. `wgmik-server` sits next to your router(s), polls them on a schedule, and turns raw interface counters into a usable panel — without touching your router config beyond what you ask it to.
+
+It's built to be **simple to run** (one `docker compose up`), **robust** (encrypted secrets, DB recovery tooling, crash-safe maintenance), and **nice to look at** (modern React UI, light/dark, live charts).
+
+## Features
+
+**Routers & peers**
+- Manage **multiple RouterOS routers** from one panel (REST or legacy API, with version auto-detection).
+- Import existing WireGuard peers, add new ones, edit, rename, delete, and renew keys.
+- Generate and export ready-to-use client configs, with per-peer export preferences.
+- Live online/offline status with a configurable "online" threshold.
+
+**Usage accounting**
+- Background polling turns interface counters into real **per-peer usage history**.
+- Today / monthly / all-time views, monthly summaries, and per-router breakdowns.
+- Live traffic **charts** (TX/RX) on the dashboard and per peer.
+- Configurable monthly reset day and timezone.
+
+**Fair usage & quotas**
+- Define **fair-usage rules and tiers**, assign them to peers, and let the panel enforce quotas automatically.
+- Quota warnings at 80% / 90%, quota-hit and quota-lifted events.
+- Per-peer quota status and one-click reset.
+
+**Telegram bot (self-service for your users)**
+- Users link their peer via a one-time **deep-link signup token** — no accounts to hand out.
+- Commands: `/today`, `/monthly`, `/alltime`, `/calendar`, `/fair`, `/settings`.
+- Rendered usage **charts and images** delivered straight in chat.
+- Push **notifications**: quota warnings, daily and weekly summaries.
+- **Multi-language** (i18n) and **Jalali / Gregorian** calendar support.
+
+**Admin & operations**
+- Multiple admin users, password resets, forced password change on first login.
+- Scheduled background jobs (polling, daily/weekly summaries, automated usage maintenance) with hot-reloadable intervals.
+- An **exclusive-operation gate** that safely locks the app during destructive/maintenance work instead of corrupting data.
+- DB recovery and diagnostic tooling in `bin/` for when things go wrong.
+
+**Built-in by default**
+- Secrets at rest (RouterOS passwords, WireGuard keys, Telegram token) are **encrypted**.
+- No admin password in logs, no secrets in config files.
+- Light/dark theme that follows your OS.
 
 ## Quickstart
 
-**Prereqs:** Docker Desktop (or Docker Engine) + docker compose.
+**Requirements:** Docker + Docker Compose.
 
 ```bash
 git clone https://github.com/parhamfa/wgmik-server.git
@@ -19,21 +72,31 @@ That's it — no `.env` to edit, no secrets to generate.
 
 ### First run
 
-1. Open http://localhost:5173. On a fresh install you're sent to the **Create admin account** screen.
-2. Choose a username and password (min 12 characters). You're logged in immediately.
-3. The router setup wizard walks you through connecting a RouterOS profile and importing peers.
+1. Open http://localhost:5173 — on a fresh install you land on **Create admin account**.
+2. Pick a username and a password (min 12 characters). You're logged in immediately.
+3. The setup wizard walks you through connecting a RouterOS profile and importing peers.
 
-There is no admin password in the logs and nothing to copy out of a config file.
+Your SQLite database and the auto-generated encryption key are persisted in `./data` (bind-mounted), so everything survives restarts.
 
-Stop:
+Stop the stack:
 
 ```bash
 docker compose down
 ```
 
-The SQLite DB and the encryption key are persisted in `./data` (bind-mounted into the container), so your data and sessions survive restarts.
+## Configuration (all optional)
 
-## Dev mode (hot reload for backend + frontend)
+A fresh install needs no configuration. To override a default, copy `env.example` to `.env` and uncomment what you need.
+
+| Variable | Purpose |
+|---|---|
+| `SECRET_KEY` | Signs login sessions **and** derives the key that encrypts stored RouterOS/WireGuard/Telegram secrets. Left unset, a strong key is generated on first boot and persisted to `/data/secret_key`. Set a fixed value only for advanced/multi-instance deployments. |
+| `DATABASE_URL` | Defaults to the SQLite DB in the data volume. |
+| `DEBUG` | FastAPI debug + verbose logs. |
+
+> **Do not change `SECRET_KEY` on an existing install.** It encrypts stored secrets — changing it makes previously saved RouterOS/WireGuard/Telegram credentials undecryptable, and they'd need to be re-entered.
+
+## Dev mode (hot reload)
 
 ```bash
 docker compose -f docker-compose.dev.yml up --build
@@ -48,24 +111,16 @@ Stop:
 docker compose -f docker-compose.dev.yml down
 ```
 
-## Configuration (all optional)
+## Tech stack
 
-A fresh install needs no configuration. To override a default, copy `env.example` to `.env` and uncomment what you need.
+- **Backend:** FastAPI (Python), SQLAlchemy, APScheduler, SQLite.
+- **Frontend:** React + Vite + TypeScript + Tailwind.
+- **Delivery:** Docker Compose (nginx serves the built frontend and proxies the API), with healthchecks and single-volume persistence.
 
-- **`SECRET_KEY`** — signs login sessions (JWTs) **and** derives the key that encrypts RouterOS passwords, WireGuard private/preshared keys, and the Telegram token. If left unset, the backend generates a strong key on first boot and persists it to `/data/secret_key` (reused on every restart). Set a fixed value only for advanced/multi-instance deployments that must share a key.
-- **`DATABASE_URL`** — defaults to the SQLite DB in the data volume.
-- **`DEBUG`** — FastAPI debug + verbose logs.
+## Verify after boot
 
-> Because `SECRET_KEY` encrypts stored secrets, never change it on an existing install — doing so makes previously stored RouterOS/WireGuard/Telegram credentials undecryptable and they'd need to be re-entered.
-
-### Upgrading from an older version
-
-Earlier versions used a default `SECRET_KEY=change-me` and an `INITIAL_ADMIN_PASSWORD` env/log-based admin bootstrap; both are gone. If your old deployment relied on the literal `change-me` default, the new auto-generated key won't match the old one and stored router/WG/Telegram secrets will need to be re-entered. If you had set a real `SECRET_KEY`, keep setting it and nothing changes.
-
-## What to test after boot
-
-- **First run:** http://localhost:5173 shows the Create admin account screen; after submitting you land in the router setup wizard.
-- **Restart:** `docker compose down && docker compose up` keeps your admin account and skips the setup screen.
-- **API health:** http://localhost:8000/health returns `{"status": "ok"}`.
-- **Router actions:** Settings → Connection profiles → Test returns OK (or a clear error).
+- **Health:** http://localhost:8000/health returns `{"status": "ok"}`.
+- **First run:** the web UI shows the Create admin account screen, then the router setup wizard.
+- **Restart:** `docker compose down && docker compose up` keeps your admin account and skips setup.
+- **Router test:** Settings → Connection profiles → Test returns OK (or a clear error).
 - **No secrets in logs:** `docker compose logs api` contains no admin password.
