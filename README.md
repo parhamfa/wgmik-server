@@ -62,10 +62,13 @@ It's built to be **simple to run** (one `docker compose up`), **robust** (encryp
 ```bash
 git clone https://github.com/parhamfa/wgmik-server.git
 cd wgmik-server
-docker compose up --build
+docker compose pull   # fetch prebuilt images from GHCR
+docker compose up -d
 ```
 
-That's it — no `.env` to edit, no secrets to generate.
+That's it — no `.env` to edit, no secrets to generate, nothing to compile. The prebuilt images are published to GitHub Container Registry, so you only download what changed.
+
+> Prefer to **build from source** instead of pulling? Use `docker compose up --build` — same compose file, it just builds the images locally.
 
 - **Web UI:** http://localhost:5173
 - **API:** http://localhost:8000
@@ -96,6 +99,23 @@ A fresh install needs no configuration. To override a default, copy `env.example
 
 > **Do not change `SECRET_KEY` on an existing install.** It encrypts stored secrets — changing it makes previously saved RouterOS/WireGuard/Telegram credentials undecryptable, and they'd need to be re-entered.
 
+## Updating
+
+Your data lives in `./data` (DB + encryption key) and is never touched by an update. Schema changes are applied automatically on startup, so there's no manual migration step.
+
+```bash
+# Optional but recommended: back up your data first
+cp -r data data.backup-$(date +%Y%m%d)
+
+git pull
+docker compose pull     # grab the new prebuilt images (only changed layers)
+docker compose up -d
+```
+
+Building from source instead? Replace the pull with `docker compose up --build -d`. Docker's layer cache means packages are only re-downloaded when `package-lock.json` / `requirements.txt` actually change — avoid `--no-cache` for routine updates.
+
+To pin a specific release instead of tracking the latest image, set `WGMIK_TAG` (e.g. `WGMIK_TAG=v1.0.0 docker compose up -d`).
+
 ## Dev mode (hot reload)
 
 ```bash
@@ -115,7 +135,7 @@ docker compose -f docker-compose.dev.yml down
 
 - **Backend:** FastAPI (Python), SQLAlchemy, APScheduler, SQLite.
 - **Frontend:** React + Vite + TypeScript + Tailwind.
-- **Delivery:** Docker Compose (nginx serves the built frontend and proxies the API), with healthchecks and single-volume persistence.
+- **Delivery:** Docker Compose with prebuilt images on GHCR (GitHub Actions CI), nginx serving the built frontend and proxying the API, healthchecks, and single-volume persistence.
 
 ## Verify after boot
 

@@ -1,5 +1,8 @@
 services:
   api:
+    # Prebuilt image from GHCR. `docker compose pull` fetches it; running
+    # `docker compose up --build` instead builds locally and tags it the same.
+    image: ghcr.io/parhamfa/wgmik-server-api:${WGMIK_TAG:-latest}
     build:
       context: .
       dockerfile: backend/Dockerfile
@@ -29,6 +32,7 @@ services:
       retries: 10
 
   web:
+    image: ghcr.io/parhamfa/wgmik-server-web:${WGMIK_TAG:-latest}
     build:
       context: ./frontend
       dockerfile: Dockerfile
