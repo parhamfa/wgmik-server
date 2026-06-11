@@ -17,10 +17,24 @@
 #
 # If your router has too little internal storage, edit those paths to a mounted
 # disk first (for example usb1/containers/wgmik and usb1/wgmik-server.tar.gz).
-# Default asset is amd64 for CHR/x86_64. On ARM64 routers, change amd64 to arm64
-# in the fetch URL before importing.
+# The script detects x86_64 vs arm64 and downloads the matching release tarball.
 
-/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-amd64.tar.gz" dst-path=wgmik-server.tar.gz
+:local arch [/system/resource/get architecture-name]
+:local assetArch ""
+
+:if ($arch = "x86_64") do={
+  :set assetArch "amd64"
+}
+:if ($arch = "arm64") do={
+  :set assetArch "arm64"
+}
+:if ($assetArch = "") do={
+  :error ("Unsupported architecture: " . $arch . " (supported: x86_64, arm64)")
+}
+
+:local imageUrl ("https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-" . $assetArch . ".tar.gz")
+:put ("Downloading wgmik-server image for " . $arch . " from " . $imageUrl)
+/tool fetch url=$imageUrl dst-path=wgmik-server.tar.gz
 /interface/veth/add name=veth-wgmik address=10.99.0.2/24 gateway=10.99.0.1
 /interface/bridge/add name=wgmik-net
 /ip/address/add address=10.99.0.1/24 interface=wgmik-net

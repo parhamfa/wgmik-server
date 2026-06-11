@@ -150,7 +150,7 @@ Fetch and import the install script:
 /import wgmik-container.rsc
 ```
 
-The script downloads the **amd64** release tarball, sets up networking, imports the image, and starts the container. Watch progress with `/container print` — a few minutes on a decent connection. On ARM64 routers, edit the script URL from `amd64` to `arm64` before import, or use the manual commands below.
+The script detects the router architecture (`x86_64` or `arm64`), downloads the matching release tarball, sets up networking, imports the image, and starts the container. Watch progress with `/container print` — a few minutes on a decent connection.
 
 Or run the commands manually:
 
@@ -166,7 +166,7 @@ Or run the commands manually:
 /container/start [find name=wgmik]
 ```
 
-Download the matching release asset:
+Manual install: download the matching release asset:
 
 - CHR / x86_64: `wgmik-server-linux-amd64.tar.gz`
 - ARM64 routers: `wgmik-server-linux-arm64.tar.gz`
