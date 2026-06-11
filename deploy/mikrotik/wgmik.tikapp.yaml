@@ -1,9 +1,10 @@
 # RouterOS /app definition for wgmik-server (RouterOS 7.23+).
 #
 # Install:
-#   1. Upload this file to the router (Files menu or scp).
-#   2. /app add yaml=[/file get wgmik.tikapp.yaml contents]
-#   3. /app start [find name=wgmik-server]
+#   1. One-time storage setup: /app setup  (or /app/settings set disk=usb1)
+#   2. Upload this file to the router (Files menu or scp).
+#   3. /app add yaml=[/file get wgmik.tikapp.yaml contents]
+#   4. /app start [find name=wgmik-server]
 #
 # This is the RouterOS /app YAML dialect, NOT docker-compose.
 # Port notation uses the 7.23+ colon style (host:container[:label][:proto]).

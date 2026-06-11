@@ -135,18 +135,18 @@ Then power-cycle or press the reset button within 5 minutes to confirm.
 
 **Install**
 
-1. Upload [`deploy/mikrotik/wgmik.tikapp.yaml`](deploy/mikrotik/wgmik.tikapp.yaml) to the router (Files menu, WinBox drag-and-drop, or `scp`).
-2. Create and start the app, pointing its root directory at your external storage:
+1. Run the App setup wizard once (`/app setup` or the Setup button in WinBox/WebFig) to pick the storage disk and LAN bridge. Or set it directly: `/app/settings set disk=usb1` (storage is a global App setting, not per-app).
+2. Upload [`deploy/mikrotik/wgmik.tikapp.yaml`](deploy/mikrotik/wgmik.tikapp.yaml) to the router (Files menu, WinBox drag-and-drop, or `scp`).
+3. Create and start the app:
 
 ```
 /app add yaml=[/file get wgmik.tikapp.yaml contents]
-/app set [find name=wgmik-server] root-dir=usb1/wgmik
 /app start [find name=wgmik-server]
 ```
 
 (Alternatively: `/app add network=lan`, then `/app edit app yaml` and paste the YAML into the editor, save with Ctrl+O.)
 
-3. Open `http://<router-ip>:6574` and follow the normal first-run setup.
+4. Open `http://<router-ip>:6574` and follow the normal first-run setup.
 
 RouterOS automatically creates the veth interface, NAT, and port-forward rules — no manual container networking needed.
 
