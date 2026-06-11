@@ -122,7 +122,7 @@ Besides normal Docker hosting, wgmik-server can run **directly on a container-ca
 
 The default install uses ordinary RouterOS relative paths:
 
-- `containers/pull` for temporary image pull/extract files.
+- `wgmik-server.tar.gz` for the downloaded image tarball.
 - `containers/wgmik` as the container `root-dir`.
 
 That matches the usual raw-container workflow. You only need a disk name like `usb1/...` if the router's local storage is too small. Container network: `10.99.0.0/24` (gateway `10.99.0.1`, container `10.99.0.2`).
@@ -150,40 +150,36 @@ Fetch and import the install script:
 /import wgmik-container.rsc
 ```
 
-The script sets up networking, pulls the image from `ghcr.io`, and starts the container. Watch progress with `/container print` — a few minutes on a decent connection.
+The script downloads the **amd64** release tarball, sets up networking, imports the image, and starts the container. Watch progress with `/container print` — a few minutes on a decent connection. On ARM64 routers, edit the script URL from `amd64` to `arm64` before import, or use the manual commands below.
 
 Or run the commands manually:
 
 ```
-/container/config/set registry-url=https://ghcr.io tmpdir=containers/pull
+/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-amd64.tar.gz" dst-path=wgmik-server.tar.gz
 /interface/veth/add name=veth-wgmik address=10.99.0.2/24 gateway=10.99.0.1
 /interface/bridge/add name=wgmik-net
 /ip/address/add address=10.99.0.1/24 interface=wgmik-net
 /interface/bridge/port/add bridge=wgmik-net interface=veth-wgmik
 /ip/firewall/nat/add chain=srcnat action=masquerade src-address=10.99.0.0/24 comment=wgmik
 /ip/firewall/nat/add chain=dstnat action=dst-nat dst-port=6574 protocol=tcp to-addresses=10.99.0.2 to-ports=6574 comment=wgmik
-/container/add remote-image=parhamfa/wgmik-server:latest interface=veth-wgmik root-dir=containers/wgmik name=wgmik start-on-boot=yes logging=yes
+/container/add file=wgmik-server.tar.gz interface=veth-wgmik root-dir=containers/wgmik name=wgmik start-on-boot=yes logging=yes
 /container/start [find name=wgmik]
 ```
 
-### Install from uploaded image tarball
-
-If the router cannot pull from GHCR, download the matching release asset and use `file=` instead of `remote-image=`:
+Download the matching release asset:
 
 - CHR / x86_64: `wgmik-server-linux-amd64.tar.gz`
 - ARM64 routers: `wgmik-server-linux-arm64.tar.gz`
 
 ```
-/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-amd64.tar.gz" dst-path=wgmik-server.tar.gz
-/container/add file=wgmik-server.tar.gz interface=veth-wgmik root-dir=containers/wgmik name=wgmik start-on-boot=yes logging=yes
-/container/start [find name=wgmik]
+/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-arm64.tar.gz" dst-path=wgmik-server.tar.gz
 ```
 
-Use the same veth/bridge/firewall commands above. Swap the URL to the `arm64` asset for ARM64 hardware.
+Use the same veth/bridge/firewall and `/container/add file=...` commands above.
 
 ### External storage fallback
 
-If the pull fails because the router's local storage is too small, use a mounted disk for the pull directory and root-dir:
+If the download/import fails because the router's local storage is too small, use a mounted disk for the tarball and root-dir:
 
 ```
 /disk print
@@ -193,11 +189,11 @@ If the pull fails because the router's local storage is too small, use a mounted
 Then edit the script before import, or run the install commands with paths like:
 
 ```
-/container/config/set registry-url=https://ghcr.io tmpdir=<slot>/containers/pull
-/container/add remote-image=parhamfa/wgmik-server:latest interface=veth-wgmik root-dir=<slot>/containers/wgmik name=wgmik start-on-boot=yes logging=yes
+/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-amd64.tar.gz" dst-path=<slot>/wgmik-server.tar.gz
+/container/add file=<slot>/wgmik-server.tar.gz interface=veth-wgmik root-dir=<slot>/containers/wgmik name=wgmik start-on-boot=yes logging=yes
 ```
 
-For example: `usb1/containers/pull` and `usb1/containers/wgmik`.
+For example: `usb1/wgmik-server.tar.gz` and `usb1/containers/wgmik`.
 
 ### Step 3 — First-run setup
 
@@ -222,7 +218,7 @@ Data (SQLite DB, encryption key) lives inside the container rootfs at `root-dir`
 
 | Symptom                                | Fix                                                                                                                        |
 | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Container won't pull image             | `/container/config print` — `registry-url` must be `https://ghcr.io`; if storage is full, move `tmpdir` to external storage |
+| Container won't import image           | Check the tarball matches your CPU architecture; if storage is full, download the tarball and root-dir to external storage |
 | `no matching manifest`                 | Device architecture isn't amd64/arm64 (armv7 not supported)                                                                |
 | Can't reach UI on port 6574            | Check dst-nat rule exists: `/ip/firewall/nat print where comment=wgmik`; container running: `/container print`             |
 | Out of memory / container killed       | Too little free RAM; 512 MB is the floor, 1 GB+ recommended. Set limits: `/container/set wgmik memory-high=200M`           |
