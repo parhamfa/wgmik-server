@@ -16,7 +16,7 @@ Track per-peer usage, enforce fair-usage quotas, manage peers across multiple ro
 
 RouterOS gives you WireGuard, but no real visibility: no history, no quotas, no per-peer accounting, no way to hand usage info to your users. `wgmik-server` sits next to your router(s), polls them on a schedule, and turns raw interface counters into a usable panel — without touching your router config beyond what you ask it to.
 
-It's built to be **simple to run** (one `docker compose up` — or [directly on the router itself](#run-on-a-mikrotik-router-routeros-723) via RouterOS Apps), **robust** (encrypted secrets, DB recovery tooling, crash-safe maintenance), and **nice to look at** (modern React UI, light/dark, live charts).
+It's built to be **simple to run** (one `docker compose up` — or [directly on the router itself](#run-on-a-mikrotik-router-routeros-715) as a RouterOS container), **robust** (encrypted secrets, DB recovery tooling, crash-safe maintenance), and **nice to look at** (modern React UI, light/dark, live charts).
 
 ## Features
 
@@ -116,17 +116,17 @@ Building from source instead? Replace the pull with `docker compose up --build -
 
 To pin a specific release instead of tracking the latest image, set `WGMIK_TAG` (e.g. `WGMIK_TAG=v1.0.0 docker compose up -d`).
 
-## Run on a MikroTik router (RouterOS 7.23+)
+## Run on a MikroTik router (RouterOS 7.15+)
 
-Besides normal Docker hosting, wgmik-server can run **directly on a container-capable MikroTik router** using the RouterOS [Apps](https://help.mikrotik.com/docs/spaces/ROS/pages/343244823/Apps) feature. The published image is multi-arch (`amd64` + `arm64`), so it works on ARM64 MikroTik hardware.
+Besides normal Docker hosting, wgmik-server can run **directly on a container-capable MikroTik router** using the standard [`/container`](https://help.mikrotik.com/docs/spaces/ROS/pages/84901929/Container) feature. No Apps YAML, no env vars, no mounts — just a veth, a bridge, and `root-dir`. The published image is multi-arch (`amd64` + `arm64`).
 
-This procedure was validated end-to-end on a RouterOS 7.23.1 CHR. Every command below is copy-pasteable into the RouterOS terminal.
+Validated on RouterOS 7.23.1 CHR. Container network: `10.99.0.0/24` (gateway `10.99.0.1`, container `10.99.0.2`).
 
 ### Prerequisites
 
-- RouterOS **7.23 or newer** with the `container` package installed (check with `/system package print` — install it from the Extra packages zip for your architecture if missing).
-- An ARM64 or x86/CHR device that supports containers — e.g. RB5009, CCR2004/2116, hAP ax series. **≥1 GB RAM recommended** (runs on 512 MB, but with little headroom).
-- A storage disk with ~500 MB free: USB / NVMe / SATA, or a second virtual disk on CHR. The image alone is ~250 MB on disk.
+- RouterOS **7.15 or newer** with the `container` package installed (`/system package print`).
+- An ARM64 or x86/CHR device — e.g. RB5009, CCR2004/2116, hAP ax series. **≥1 GB RAM recommended** (512 MB works but is tight).
+- A formatted storage disk with ~500 MB free (USB / NVMe / SATA / virtual disk on CHR). The image is ~250 MB on disk.
 
 ### Step 1 — Enable container support (one-time)
 
@@ -134,80 +134,72 @@ This procedure was validated end-to-end on a RouterOS 7.23.1 CHR. Every command 
 /system/device-mode update container=yes
 ```
 
-On physical routers, confirm by power-cycling or pressing the reset button **within 5 minutes**. On CHR, a reboot is enough. Verify afterwards: `/system/device-mode print` should show `container: yes`.
+On physical routers, confirm by power-cycling or pressing the reset button **within 5 minutes**. On CHR, a reboot is enough. Verify: `/system/device-mode print` should show `container: yes`.
 
 ### Step 2 — Prepare storage
 
-Find your disk and format it if it has no filesystem (`FS` column empty in `/disk print`):
-
 ```
 /disk print
-/disk format <slot> file-system=ext4     # e.g. /disk format usb1 file-system=ext4 — ERASES the disk!
+/disk format <slot> file-system=ext4     # e.g. usb1 — ERASES the disk!
 ```
 
-Then tell the App system to use it (storage is a global App setting, not per-app):
+The disk must show flag `M` (mounted) in `/disk print` before continuing.
+
+### Step 3 — Install
+
+Fetch and import the install script (replace `disk1` in the script with your disk slot if different — e.g. `usb1`, `pcie1`):
 
 ```
-/app/settings set disk=<slot>
+/tool fetch url="https://raw.githubusercontent.com/parhamfa/wgmik-server/main/deploy/mikrotik/wgmik-container.rsc" dst-path=wgmik-container.rsc
+/import wgmik-container.rsc
 ```
 
-Alternatively, run the interactive wizard `/app setup` (or the Setup button in WinBox/WebFig), which walks through disk and bridge selection.
+The script sets up networking, pulls the image from `ghcr.io`, and starts the container. Watch progress with `/container print` — a few minutes on a decent connection.
 
-### Step 3 — Add the app
-
-Fetch the app definition straight from this repo and register it:
+Or run the commands manually (replace `disk1` with your slot):
 
 ```
-/tool fetch url="https://raw.githubusercontent.com/parhamfa/wgmik-server/main/deploy/mikrotik/wgmik.tikapp.yaml" dst-path=wgmik.tikapp.yaml
-/app add yaml=[/file get wgmik.tikapp.yaml contents]
+/container/config/set registry-url=https://ghcr.io tmpdir=disk1/tmp
+/interface/veth/add name=veth-wgmik address=10.99.0.2/24 gateway=10.99.0.1
+/interface/bridge/add name=wgmik-net
+/ip/address/add address=10.99.0.1/24 interface=wgmik-net
+/interface/bridge/port/add bridge=wgmik-net interface=veth-wgmik
+/ip/firewall/nat/add chain=srcnat action=masquerade src-address=10.99.0.0/24 comment=wgmik
+/ip/firewall/nat/add chain=dstnat action=dst-nat dst-port=6574 protocol=tcp to-addresses=10.99.0.2 to-ports=6574 comment=wgmik
+/container/add remote-image=parhamfa/wgmik-server:latest interface=veth-wgmik root-dir=disk1/wgmik name=wgmik start-on-boot=yes logging=yes
+/container/start [find name=wgmik]
 ```
 
-No file transfer tools needed. (If your router has no internet access to GitHub, upload the file via WinBox/scp first — the `/app add` line is the same.)
-
-### Step 4 — Enable it
-
-If your router doesn't use MikroTik cloud services (or you just don't want the cloud reverse-proxy URL), turn off HTTPS for the app first — otherwise it can hang at status `wait for reverse proxy`:
-
-```
-/app set [find name="wgmik-server"] use-https=no
-/app enable wgmik-server
-```
-
-Note: the lifecycle commands are `enable` / `disable` — there is no `start`.
-
-Watch progress — it pulls ~100 MB from `ghcr.io` and extracts it:
-
-```
-/app print
-```
-
-Status goes `downloading/extracting` → running (flag `R`). A few minutes on a decent connection.
-
-### Step 5 — First-run setup
+### Step 4 — First-run setup
 
 Open `http://<router-ip>:6574` and create your admin account as usual.
 
-When the setup wizard asks for the RouterOS connection, remember the panel runs *inside* the router now:
+When the setup wizard asks for the RouterOS connection:
 
-- Use the **router's own LAN/bridge IP** as the host — never `localhost` (the container has its own network namespace).
+- Use the **router's own LAN/bridge IP** as the host — never `localhost` or `10.99.0.2`.
 - Make sure the API or REST service is enabled in `/ip service` for the chosen protocol.
 
-RouterOS handles the veth interface, NAT, and the 6574 port-forward automatically — no manual container networking.
+### Data and updates
+
+Data (SQLite DB, encryption key) lives inside the container rootfs at `root-dir` — it survives restarts and reboots, but **`/container repull` or an image update recreates the rootfs and wipes it**. Back up through the panel before updating, or add an optional `/data` mount for update-safe persistence:
+
+```
+/container/mounts/add list=MOUNT_WGMIK src=disk1/wgmik/data dst=/data
+/container/set [find name=wgmik] mountlists=MOUNT_WGMIK
+```
 
 ### Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `bad parameter` on `/app add file=...` | There is no `file=` parameter — use `yaml=[/file get <name> contents]` |
-| Status stuck at `wait for reverse proxy` | `/app set [find name="wgmik-server"] use-https=no`, then disable/enable |
-| App won't enable, storage errors | `/app/settings print` — `disk` must be set; the disk must be formatted and mounted (`/disk print` shows flag `M`) |
-| `no matching manifest` on pull | Your RouterOS architecture isn't amd64/arm64 (armv7 devices are not supported) |
-| Out of memory / app killed | Device has too little free RAM; 512 MB is the floor, 1 GB+ recommended |
+| Container won't pull image | `/container/config print` — `registry-url` must be `https://ghcr.io`; `tmpdir` must point to your disk, not internal flash |
+| `no matching manifest` | Device architecture isn't amd64/arm64 (armv7 not supported) |
+| Can't reach UI on port 6574 | Check dst-nat rule exists: `/ip/firewall/nat print where comment=wgmik`; container running: `/container print` |
+| Out of memory / container killed | Too little free RAM; 512 MB is the floor, 1 GB+ recommended. Set limits: `/container/set wgmik memory-high=200M` |
+| `registry-url` breaks other containers | It's global — change it back to your other registry after pulling wgmik |
 
-### Data and lifecycle
+### Caveats
 
-- Your data (SQLite DB, encryption key, backups) lives in the `wgmik/data` directory on the app disk and survives restarts and image updates (`/app update`).
-- **`/app cleanup wgmik-server` permanently deletes all app data** — copy `wgmik/data` off the router first if you need a backup.
 - The Let's Encrypt TLS wizard inside the panel needs public TCP/80 reachable on the router; the self-signed option works without it.
 - Be careful with firewall changes made through the panel: a bad rule can cut the panel off from the router it runs on.
 
@@ -232,7 +224,7 @@ docker compose -f docker-compose.dev.yml down
 
 - **Backend:** FastAPI (Python), SQLAlchemy, APScheduler, SQLite. Telegram card/chart images are rendered with [resvg](https://github.com/baseplate-admin/resvg-py) (no Chromium/Playwright).
 - **Frontend:** React + Vite + TypeScript + Tailwind.
-- **Delivery:** Docker Compose with a single prebuilt multi-arch image (`amd64` + `arm64`) on GHCR (GitHub Actions CI). FastAPI serves the built frontend and API on one port (6574), healthchecks, and single-volume persistence. The same image runs on container-capable MikroTik routers via RouterOS Apps.
+- **Delivery:** Docker Compose with a single prebuilt multi-arch image (`amd64` + `arm64`) on GHCR (GitHub Actions CI). FastAPI serves the built frontend and API on one port (6574), healthchecks, and single-volume persistence. The same image runs on container-capable MikroTik routers via raw `/container`.
 
 ## Verify after boot
 
