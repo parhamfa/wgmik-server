@@ -120,13 +120,18 @@ To pin a specific release instead of tracking the latest image, set `WGMIK_TAG` 
 
 Besides normal Docker hosting, wgmik-server can run **directly on a container-capable MikroTik router** using the standard [`/container`](https://help.mikrotik.com/docs/spaces/ROS/pages/84901929/Container) feature. No Apps YAML, no env vars, no mounts — just a veth, a bridge, and `root-dir`. The published image is multi-arch (`amd64` + `arm64`).
 
-Validated on RouterOS 7.23.1 CHR. Container network: `10.99.0.0/24` (gateway `10.99.0.1`, container `10.99.0.2`).
+The default install uses ordinary RouterOS relative paths:
+
+- `containers/pull` for temporary image pull/extract files.
+- `containers/wgmik` as the container `root-dir`.
+
+That matches the usual raw-container workflow. You only need a disk name like `usb1/...` if the router's local storage is too small. Container network: `10.99.0.0/24` (gateway `10.99.0.1`, container `10.99.0.2`).
 
 ### Prerequisites
 
 - RouterOS **7.15 or newer** with the `container` package installed (`/system package print`).
 - An ARM64 or x86/CHR device — e.g. RB5009, CCR2004/2116, hAP ax series. **≥1 GB RAM recommended** (512 MB works but is tight).
-- A formatted storage disk with ~500 MB free (USB / NVMe / SATA / virtual disk on CHR). The image is ~250 MB on disk.
+- Enough storage for the image and runtime data. The image is ~250 MB on disk; low-flash devices should use external storage.
 
 ### Step 1 — Enable container support (one-time)
 
@@ -136,18 +141,9 @@ Validated on RouterOS 7.23.1 CHR. Container network: `10.99.0.0/24` (gateway `10
 
 On physical routers, confirm by power-cycling or pressing the reset button **within 5 minutes**. On CHR, a reboot is enough. Verify: `/system/device-mode print` should show `container: yes`.
 
-### Step 2 — Prepare storage
+### Step 2 — Install
 
-```
-/disk print
-/disk format <slot> file-system=ext4     # e.g. usb1 — ERASES the disk!
-```
-
-The disk must show flag `M` (mounted) in `/disk print` before continuing.
-
-### Step 3 — Install
-
-Fetch and import the install script (replace `disk1` in the script with your disk slot if different — e.g. `usb1`, `pcie1`):
+Fetch and import the install script:
 
 ```
 /tool fetch url="https://raw.githubusercontent.com/parhamfa/wgmik-server/main/deploy/mikrotik/wgmik-container.rsc" dst-path=wgmik-container.rsc
@@ -156,21 +152,39 @@ Fetch and import the install script (replace `disk1` in the script with your dis
 
 The script sets up networking, pulls the image from `ghcr.io`, and starts the container. Watch progress with `/container print` — a few minutes on a decent connection.
 
-Or run the commands manually (replace `disk1` with your slot):
+Or run the commands manually:
 
 ```
-/container/config/set registry-url=https://ghcr.io tmpdir=disk1/tmp
+/container/config/set registry-url=https://ghcr.io tmpdir=containers/pull
 /interface/veth/add name=veth-wgmik address=10.99.0.2/24 gateway=10.99.0.1
 /interface/bridge/add name=wgmik-net
 /ip/address/add address=10.99.0.1/24 interface=wgmik-net
 /interface/bridge/port/add bridge=wgmik-net interface=veth-wgmik
 /ip/firewall/nat/add chain=srcnat action=masquerade src-address=10.99.0.0/24 comment=wgmik
 /ip/firewall/nat/add chain=dstnat action=dst-nat dst-port=6574 protocol=tcp to-addresses=10.99.0.2 to-ports=6574 comment=wgmik
-/container/add remote-image=parhamfa/wgmik-server:latest interface=veth-wgmik root-dir=disk1/wgmik name=wgmik start-on-boot=yes logging=yes
+/container/add remote-image=parhamfa/wgmik-server:latest interface=veth-wgmik root-dir=containers/wgmik name=wgmik start-on-boot=yes logging=yes
 /container/start [find name=wgmik]
 ```
 
-### Step 4 — First-run setup
+### External storage fallback
+
+If the pull fails because the router's local storage is too small, use a mounted disk for the pull directory and root-dir:
+
+```
+/disk print
+/disk format <slot> file-system=ext4     # only if the disk is empty/unformatted; ERASES it
+```
+
+Then edit the script before import, or run the install commands with paths like:
+
+```
+/container/config/set registry-url=https://ghcr.io tmpdir=<slot>/containers/pull
+/container/add remote-image=parhamfa/wgmik-server:latest interface=veth-wgmik root-dir=<slot>/containers/wgmik name=wgmik start-on-boot=yes logging=yes
+```
+
+For example: `usb1/containers/pull` and `usb1/containers/wgmik`.
+
+### Step 3 — First-run setup
 
 Open `http://<router-ip>:6574` and create your admin account as usual.
 
@@ -181,22 +195,24 @@ When the setup wizard asks for the RouterOS connection:
 
 ### Data and updates
 
-Data (SQLite DB, encryption key) lives inside the container rootfs at `root-dir` — it survives restarts and reboots, but **`/container repull` or an image update recreates the rootfs and wipes it**. Back up through the panel before updating, or add an optional `/data` mount for update-safe persistence:
+Data (SQLite DB, encryption key) lives inside the container rootfs at `root-dir` — by default `containers/wgmik`. It survives restarts and reboots, but **`/container repull` or an image update recreates the rootfs and wipes it**. Back up through the panel before updating, or add an optional `/data` mount for update-safe persistence:
 
 ```
-/container/mounts/add list=MOUNT_WGMIK src=disk1/wgmik/data dst=/data
+/container/mounts/add list=MOUNT_WGMIK src=containers/wgmik-data dst=/data
 /container/set [find name=wgmik] mountlists=MOUNT_WGMIK
 ```
 
 ### Troubleshooting
 
-| Symptom | Fix |
-|---|---|
-| Container won't pull image | `/container/config print` — `registry-url` must be `https://ghcr.io`; `tmpdir` must point to your disk, not internal flash |
-| `no matching manifest` | Device architecture isn't amd64/arm64 (armv7 not supported) |
-| Can't reach UI on port 6574 | Check dst-nat rule exists: `/ip/firewall/nat print where comment=wgmik`; container running: `/container print` |
-| Out of memory / container killed | Too little free RAM; 512 MB is the floor, 1 GB+ recommended. Set limits: `/container/set wgmik memory-high=200M` |
-| `registry-url` breaks other containers | It's global — change it back to your other registry after pulling wgmik |
+
+| Symptom                                | Fix                                                                                                                        |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Container won't pull image             | `/container/config print` — `registry-url` must be `https://ghcr.io`; if storage is full, move `tmpdir` to external storage |
+| `no matching manifest`                 | Device architecture isn't amd64/arm64 (armv7 not supported)                                                                |
+| Can't reach UI on port 6574            | Check dst-nat rule exists: `/ip/firewall/nat print where comment=wgmik`; container running: `/container print`             |
+| Out of memory / container killed       | Too little free RAM; 512 MB is the floor, 1 GB+ recommended. Set limits: `/container/set wgmik memory-high=200M`           |
+| `registry-url` breaks other containers | It's global — change it back to your other registry after pulling wgmik                                                    |
+
 
 ### Caveats
 
