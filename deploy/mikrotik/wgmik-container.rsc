@@ -41,6 +41,6 @@
 /interface/bridge/port/add bridge=wgmik-net interface=veth-wgmik
 /ip/firewall/nat/add chain=srcnat action=masquerade src-address=10.99.0.0/24 comment=wgmik
 /ip/firewall/nat/add chain=dstnat action=dst-nat dst-port=6574 protocol=tcp to-addresses=10.99.0.2 to-ports=6574 comment=wgmik
-/container/add name=wgmik file=wgmik-server.tar.gz interface=veth-wgmik root-dir="containers/wgmik"
-/container/set [find name=wgmik] start-on-boot=yes logging=yes
-/container/start [find name=wgmik]
+/container/add comment=wgmik file=wgmik-server.tar.gz interface=veth-wgmik root-dir="containers/wgmik"
+/container/set [find comment=wgmik] start-on-boot=yes logging=yes
+/container/start [find comment=wgmik]

@@ -162,9 +162,9 @@ Or run the commands manually:
 /interface/bridge/port/add bridge=wgmik-net interface=veth-wgmik
 /ip/firewall/nat/add chain=srcnat action=masquerade src-address=10.99.0.0/24 comment=wgmik
 /ip/firewall/nat/add chain=dstnat action=dst-nat dst-port=6574 protocol=tcp to-addresses=10.99.0.2 to-ports=6574 comment=wgmik
-/container/add name=wgmik file=wgmik-server.tar.gz interface=veth-wgmik root-dir="containers/wgmik"
-/container/set [find name=wgmik] start-on-boot=yes logging=yes
-/container/start [find name=wgmik]
+/container/add comment=wgmik file=wgmik-server.tar.gz interface=veth-wgmik root-dir="containers/wgmik"
+/container/set [find comment=wgmik] start-on-boot=yes logging=yes
+/container/start [find comment=wgmik]
 ```
 
 Manual install: download the matching release asset:
@@ -191,8 +191,8 @@ Then edit the script before import, or run the install commands with paths like:
 
 ```
 /tool fetch url="https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-amd64.tar.gz" dst-path=<slot>/wgmik-server.tar.gz
-/container/add name=wgmik file=<slot>/wgmik-server.tar.gz interface=veth-wgmik root-dir="<slot>/containers/wgmik"
-/container/set [find name=wgmik] start-on-boot=yes logging=yes
+/container/add comment=wgmik file=<slot>/wgmik-server.tar.gz interface=veth-wgmik root-dir="<slot>/containers/wgmik"
+/container/set [find comment=wgmik] start-on-boot=yes logging=yes
 ```
 
 For example: `usb1/wgmik-server.tar.gz` and `usb1/containers/wgmik`.
