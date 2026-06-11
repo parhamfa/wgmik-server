@@ -120,41 +120,95 @@ To pin a specific release instead of tracking the latest image, set `WGMIK_TAG` 
 
 Besides normal Docker hosting, wgmik-server can run **directly on a container-capable MikroTik router** using the RouterOS [Apps](https://help.mikrotik.com/docs/spaces/ROS/pages/343244823/Apps) feature. The published image is multi-arch (`amd64` + `arm64`), so it works on ARM64 MikroTik hardware.
 
-**Prerequisites**
+This procedure was validated end-to-end on a RouterOS 7.23.1 CHR. Every command below is copy-pasteable into the RouterOS terminal.
 
-- RouterOS **7.23 or newer** with the `container` package installed (custom apps exist since 7.22, but the app YAML uses the newer 7.23 port syntax).
-- An ARM64 or x86 device that supports containers — e.g. RB5009, CCR2004/2116, hAP ax series. **≥1 GB RAM recommended.**
-- External storage (USB / NVMe / SATA) — the image is roughly 250 MB uncompressed, too large for internal flash on most devices.
-- Container device-mode enabled (one-time, requires physical access):
+### Prerequisites
+
+- RouterOS **7.23 or newer** with the `container` package installed (check with `/system package print` — install it from the Extra packages zip for your architecture if missing).
+- An ARM64 or x86/CHR device that supports containers — e.g. RB5009, CCR2004/2116, hAP ax series. **≥1 GB RAM recommended** (runs on 512 MB, but with little headroom).
+- A storage disk with ~500 MB free: USB / NVMe / SATA, or a second virtual disk on CHR. The image alone is ~250 MB on disk.
+
+### Step 1 — Enable container support (one-time)
 
 ```
 /system/device-mode update container=yes
 ```
 
-Then power-cycle or press the reset button within 5 minutes to confirm.
+On physical routers, confirm by power-cycling or pressing the reset button **within 5 minutes**. On CHR, a reboot is enough. Verify afterwards: `/system/device-mode print` should show `container: yes`.
 
-**Install**
+### Step 2 — Prepare storage
 
-1. Run the App setup wizard once (`/app setup` or the Setup button in WinBox/WebFig) to pick the storage disk and LAN bridge. Or set it directly: `/app/settings set disk=usb1` (storage is a global App setting, not per-app).
-2. Upload [`deploy/mikrotik/wgmik.tikapp.yaml`](deploy/mikrotik/wgmik.tikapp.yaml) to the router (Files menu, WinBox drag-and-drop, or `scp`).
-3. Create and start the app:
+Find your disk and format it if it has no filesystem (`FS` column empty in `/disk print`):
 
 ```
+/disk print
+/disk format <slot> file-system=ext4     # e.g. /disk format usb1 file-system=ext4 — ERASES the disk!
+```
+
+Then tell the App system to use it (storage is a global App setting, not per-app):
+
+```
+/app/settings set disk=<slot>
+```
+
+Alternatively, run the interactive wizard `/app setup` (or the Setup button in WinBox/WebFig), which walks through disk and bridge selection.
+
+### Step 3 — Add the app
+
+Fetch the app definition straight from this repo and register it:
+
+```
+/tool fetch url="https://raw.githubusercontent.com/parhamfa/wgmik-server/main/deploy/mikrotik/wgmik.tikapp.yaml" dst-path=wgmik.tikapp.yaml
 /app add yaml=[/file get wgmik.tikapp.yaml contents]
-/app start [find name=wgmik-server]
 ```
 
-(Alternatively: `/app add network=lan`, then `/app edit app yaml` and paste the YAML into the editor, save with Ctrl+O.)
+No file transfer tools needed. (If your router has no internet access to GitHub, upload the file via WinBox/scp first — the `/app add` line is the same.)
 
-4. Open `http://<router-ip>:6574` and follow the normal first-run setup.
+### Step 4 — Enable it
 
-RouterOS automatically creates the veth interface, NAT, and port-forward rules — no manual container networking needed.
+If your router doesn't use MikroTik cloud services (or you just don't want the cloud reverse-proxy URL), turn off HTTPS for the app first — otherwise it can hang at status `wait for reverse proxy`:
 
-**Caveats when self-hosting on the router it manages**
+```
+/app set [find name="wgmik-server"] use-https=no
+/app enable wgmik-server
+```
 
-- When adding the router in the setup wizard, use the **router's bridge/LAN IP** as the host — not `localhost` (the container has its own network namespace).
-- The Let's Encrypt TLS wizard needs public TCP/80 reachable on the router; the self-signed option works without it.
-- Your data (SQLite DB, encryption key, backups) lives under the app's mount on router storage and survives restarts and updates. **`Cleanup` in `/app` deletes it** — copy the `wgmik/data` directory off the router first if you want a backup.
+Note: the lifecycle commands are `enable` / `disable` — there is no `start`.
+
+Watch progress — it pulls ~100 MB from `ghcr.io` and extracts it:
+
+```
+/app print
+```
+
+Status goes `downloading/extracting` → running (flag `R`). A few minutes on a decent connection.
+
+### Step 5 — First-run setup
+
+Open `http://<router-ip>:6574` and create your admin account as usual.
+
+When the setup wizard asks for the RouterOS connection, remember the panel runs *inside* the router now:
+
+- Use the **router's own LAN/bridge IP** as the host — never `localhost` (the container has its own network namespace).
+- Make sure the API or REST service is enabled in `/ip service` for the chosen protocol.
+
+RouterOS handles the veth interface, NAT, and the 6574 port-forward automatically — no manual container networking.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `bad parameter` on `/app add file=...` | There is no `file=` parameter — use `yaml=[/file get <name> contents]` |
+| Status stuck at `wait for reverse proxy` | `/app set [find name="wgmik-server"] use-https=no`, then disable/enable |
+| App won't enable, storage errors | `/app/settings print` — `disk` must be set; the disk must be formatted and mounted (`/disk print` shows flag `M`) |
+| `no matching manifest` on pull | Your RouterOS architecture isn't amd64/arm64 (armv7 devices are not supported) |
+| Out of memory / app killed | Device has too little free RAM; 512 MB is the floor, 1 GB+ recommended |
+
+### Data and lifecycle
+
+- Your data (SQLite DB, encryption key, backups) lives in the `wgmik/data` directory on the app disk and survives restarts and image updates (`/app update`).
+- **`/app cleanup wgmik-server` permanently deletes all app data** — copy `wgmik/data` off the router first if you need a backup.
+- The Let's Encrypt TLS wizard inside the panel needs public TCP/80 reachable on the router; the self-signed option works without it.
 - Be careful with firewall changes made through the panel: a bad rule can cut the panel off from the router it runs on.
 
 ## Dev mode (hot reload)

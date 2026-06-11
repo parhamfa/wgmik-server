@@ -1,10 +1,12 @@
 # RouterOS /app definition for wgmik-server (RouterOS 7.23+).
 #
-# Install:
-#   1. One-time storage setup: /app setup  (or /app/settings set disk=usb1)
-#   2. Upload this file to the router (Files menu or scp).
+# Install (full guide in README "Run on a MikroTik router"):
+#   1. One-time storage setup: /app setup  (or /app/settings set disk=<slot>)
+#   2. Get this file onto the router, e.g.:
+#      /tool fetch url="https://raw.githubusercontent.com/parhamfa/wgmik-server/main/deploy/mikrotik/wgmik.tikapp.yaml" dst-path=wgmik.tikapp.yaml
 #   3. /app add yaml=[/file get wgmik.tikapp.yaml contents]
-#   4. /app start [find name=wgmik-server]
+#   4. /app set [find name="wgmik-server"] use-https=no   (skip cloud reverse-proxy)
+#   5. /app enable wgmik-server                           (lifecycle is enable/disable, no "start")
 #
 # This is the RouterOS /app YAML dialect, NOT docker-compose.
 # Port notation uses the 7.23+ colon style (host:container[:label][:proto]).
