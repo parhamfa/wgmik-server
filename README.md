@@ -163,9 +163,9 @@ Or run the commands manually:
 /ip/firewall/nat/add chain=srcnat action=masquerade src-address=10.99.0.0/24 comment=wgmik
 /ip/firewall/nat/add chain=dstnat action=dst-nat dst-port=6574 protocol=tcp to-addresses=10.99.0.2 to-ports=6574 comment=wgmik
 /container/add comment=wgmik file=wgmik-server.tar.gz interface=veth-wgmik root-dir="containers/wgmik"
-:while ([/container/get [find comment=wgmik] status] = "extracting") do={ :delay 5s }
 /container/set [find comment=wgmik] cmd="uvicorn backend.main:app --host 0.0.0.0 --port 6574" start-on-boot=yes logging=yes
-/container/start [find comment=wgmik]
+:local started false
+:for i from=1 to=12 do={ :if (!$started) do={ :do { /container/start [find comment=wgmik]; :set started true } on-error={ :delay 5s } } }
 ```
 
 Manual install: download the matching release asset:
@@ -193,8 +193,9 @@ Then edit the script before import, or run the install commands with paths like:
 ```
 /tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-amd64.tar.gz" dst-path=<slot>/wgmik-server.tar.gz http-max-redirect-count=5
 /container/add comment=wgmik file=<slot>/wgmik-server.tar.gz interface=veth-wgmik root-dir="<slot>/containers/wgmik"
-:while ([/container/get [find comment=wgmik] status] = "extracting") do={ :delay 5s }
 /container/set [find comment=wgmik] cmd="uvicorn backend.main:app --host 0.0.0.0 --port 6574" start-on-boot=yes logging=yes
+:local started false
+:for i from=1 to=12 do={ :if (!$started) do={ :do { /container/start [find comment=wgmik]; :set started true } on-error={ :delay 5s } } }
 ```
 
 For example: `usb1/wgmik-server.tar.gz` and `usb1/containers/wgmik`.
