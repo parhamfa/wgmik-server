@@ -166,6 +166,21 @@ Or run the commands manually:
 /container/start [find name=wgmik]
 ```
 
+### Install from uploaded image tarball
+
+If the router cannot pull from GHCR, download the matching release asset and use `file=` instead of `remote-image=`:
+
+- CHR / x86_64: `wgmik-server-linux-amd64.tar.gz`
+- ARM64 routers: `wgmik-server-linux-arm64.tar.gz`
+
+```
+/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-amd64.tar.gz" dst-path=wgmik-server.tar.gz
+/container/add file=wgmik-server.tar.gz interface=veth-wgmik root-dir=containers/wgmik name=wgmik start-on-boot=yes logging=yes
+/container/start [find name=wgmik]
+```
+
+Use the same veth/bridge/firewall commands above. Swap the URL to the `arm64` asset for ARM64 hardware.
+
 ### External storage fallback
 
 If the pull fails because the router's local storage is too small, use a mounted disk for the pull directory and root-dir:
