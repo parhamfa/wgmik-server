@@ -155,7 +155,7 @@ The script detects the router architecture (`x86_64` or `arm64`), downloads the 
 Or run the commands manually:
 
 ```
-/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-amd64.tar.gz" dst-path=wgmik-server.tar.gz
+/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-amd64.tar.gz" dst-path=wgmik-server.tar.gz
 /interface/veth/add name=veth-wgmik address=10.99.0.2/24 gateway=10.99.0.1
 /interface/bridge/add name=wgmik-net
 /ip/address/add address=10.99.0.1/24 interface=wgmik-net
@@ -173,7 +173,7 @@ Manual install: download the matching release asset:
 - ARM64 routers: `wgmik-server-linux-arm64.tar.gz`
 
 ```
-/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-arm64.tar.gz" dst-path=wgmik-server.tar.gz
+/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-arm64.tar.gz" dst-path=wgmik-server.tar.gz
 ```
 
 Use the same veth/bridge/firewall and `/container/add file=...` commands above.
@@ -190,7 +190,7 @@ If the download/import fails because the router's local storage is too small, us
 Then edit the script before import, or run the install commands with paths like:
 
 ```
-/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-amd64.tar.gz" dst-path=<slot>/wgmik-server.tar.gz
+/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-amd64.tar.gz" dst-path=<slot>/wgmik-server.tar.gz
 /container/add comment=wgmik file=<slot>/wgmik-server.tar.gz interface=veth-wgmik root-dir="<slot>/containers/wgmik"
 /container/set [find comment=wgmik] start-on-boot=yes logging=yes
 ```

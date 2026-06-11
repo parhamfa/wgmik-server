@@ -32,7 +32,7 @@
   :error ("Unsupported architecture: " . $arch . " (supported: x86_64, arm64)")
 }
 
-:local imageUrl ("https://github.com/parhamfa/wgmik-server/releases/latest/download/wgmik-server-linux-" . $assetArch . ".tar.gz")
+:local imageUrl ("https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-" . $assetArch . ".tar.gz")
 :put ("Downloading wgmik-server image for " . $arch . " from " . $imageUrl)
 /tool fetch url=$imageUrl dst-path=wgmik-server.tar.gz
 /interface/veth/add name=veth-wgmik address=10.99.0.2/24 gateway=10.99.0.1
