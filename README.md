@@ -125,7 +125,7 @@ The default install uses ordinary RouterOS relative paths:
 - `wgmik-server.tar.gz` for the downloaded image tarball.
 - `containers/wgmik` as the container `root-dir`.
 
-That matches the usual raw-container workflow. You only need a disk name like `usb1/...` if the router's local storage is too small. Container network: `10.99.0.0/24` (gateway `10.99.0.1`, container `10.99.0.2`).
+If internal storage has less than ~500 MiB free, the install script automatically switches to the first mounted disk (`usb1`, `pcie1`, ...) instead. Container network: `10.99.0.0/24` (gateway `10.99.0.1`, container `10.99.0.2`).
 
 ### Prerequisites
 
@@ -150,7 +150,9 @@ Fetch and import the install script:
 /import wgmik-container.rsc
 ```
 
-The script detects the router architecture (`x86_64` or `arm64`), downloads the matching release tarball, sets up networking, imports the image, and starts the container. Watch progress with `/container print` — a few minutes on a decent connection.
+The script detects the router architecture (`x86_64` or `arm64`), picks a storage location, downloads the matching release tarball, sets up networking, imports the image, and starts the container. It is **idempotent** — if anything fails halfway (network drop, full disk), fix the cause and just `/import` it again; finished steps are skipped.
+
+> **RouterOS 7.15–7.17:** `/tool fetch` on these versions can't follow GitHub's download redirects. Download the tarball on a PC ([release page](https://github.com/parhamfa/wgmik-server/releases/tag/mikrotik-container-images-2026-06-11)), upload it to the router as `wgmik-server.tar.gz`, then run `/import wgmik-container.rsc` — the script skips the download when the file is already there.
 
 Or run the commands manually:
 
@@ -168,37 +170,14 @@ Or run the commands manually:
 :for i from=1 to=12 do={ :if (!$started) do={ :do { /container/start [find comment=wgmik]; :set started true } on-error={ :delay 5s } } }
 ```
 
-Manual install: download the matching release asset:
+Release assets (swap the URL for ARM64 routers):
 
 - CHR / x86_64: `wgmik-server-linux-amd64.tar.gz`
 - ARM64 routers: `wgmik-server-linux-arm64.tar.gz`
 
-```
-/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-arm64.tar.gz" dst-path=wgmik-server.tar.gz http-max-redirect-count=5
-```
+### External storage
 
-Use the same veth/bridge/firewall and `/container/add file=...` commands above.
-
-### External storage fallback
-
-If the download/import fails because the router's local storage is too small, use a mounted disk for the tarball and root-dir:
-
-```
-/disk print
-/disk format <slot> file-system=ext4     # only if the disk is empty/unformatted; ERASES it
-```
-
-Then edit the script before import, or run the install commands with paths like:
-
-```
-/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-amd64.tar.gz" dst-path=<slot>/wgmik-server.tar.gz http-max-redirect-count=5
-/container/add comment=wgmik file=<slot>/wgmik-server.tar.gz interface=veth-wgmik root-dir="<slot>/containers/wgmik"
-/container/set [find comment=wgmik] cmd="uvicorn backend.main:app --host 0.0.0.0 --port 6574" start-on-boot=yes logging=yes
-:local started false
-:for i from=1 to=12 do={ :if (!$started) do={ :do { /container/start [find comment=wgmik]; :set started true } on-error={ :delay 5s } } }
-```
-
-For example: `usb1/wgmik-server.tar.gz` and `usb1/containers/wgmik`.
+The script handles this automatically: when internal free space is under ~500 MiB it stores the tarball and `root-dir` on the first mounted disk. If you install manually, prefix the paths yourself (e.g. `usb1/wgmik-server.tar.gz` and `root-dir="usb1/containers/wgmik"`). Format an empty disk first if needed: `/disk format-drive <slot> file-system=ext4` (**erases it**).
 
 ### Step 3 — First-run setup
 
@@ -215,7 +194,7 @@ Data (SQLite DB, encryption key) lives inside the container rootfs at `root-dir`
 
 ```
 /container/mounts/add list=MOUNT_WGMIK src=containers/wgmik-data dst=/data
-/container/set [find name=wgmik] mountlists=MOUNT_WGMIK
+/container/set [find comment=wgmik] mountlists=MOUNT_WGMIK
 ```
 
 ### Troubleshooting
@@ -223,11 +202,11 @@ Data (SQLite DB, encryption key) lives inside the container rootfs at `root-dir`
 
 | Symptom                                | Fix                                                                                                                        |
 | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Container won't import image           | Check the tarball matches your CPU architecture; if storage is full, download the tarball and root-dir to external storage |
-| `no matching manifest`                 | Device architecture isn't amd64/arm64 (armv7 not supported)                                                                |
+| Download fails on RouterOS 7.15–7.17   | `/tool fetch` can't follow GitHub redirects on those versions — upload the tarball manually, then re-import the script     |
+| Container won't import image           | Check the tarball matches your CPU architecture; if storage is full, attach a disk and re-import (the script will use it)  |
 | Can't reach UI on port 6574            | Check dst-nat rule exists: `/ip/firewall/nat print where comment=wgmik`; container running: `/container print`             |
-| Out of memory / container killed       | Too little free RAM; 512 MB is the floor, 1 GB+ recommended. Set limits: `/container/set wgmik memory-high=200M`           |
-| `registry-url` breaks other containers | It's global — change it back to your other registry after pulling wgmik                                                    |
+| Container stuck `stopped`              | Wait for extraction to finish, then `/container/start [find comment=wgmik]`; logs: `/log print where topics~"container"`   |
+| Out of memory / container killed       | Too little free RAM; 512 MB is the floor, 1 GB+ recommended. Set limits: `/container/set [find comment=wgmik] memory-high=200M` |
 
 
 ### Caveats
