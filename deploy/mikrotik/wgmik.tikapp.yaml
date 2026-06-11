@@ -2,7 +2,7 @@
 #
 # Install:
 #   1. Upload this file to the router (Files menu or scp).
-#   2. /app add file=wgmik.tikapp.yaml
+#   2. /app add yaml=[/file get wgmik.tikapp.yaml contents]
 #   3. /app start [find name=wgmik-server]
 #
 # This is the RouterOS /app YAML dialect, NOT docker-compose.

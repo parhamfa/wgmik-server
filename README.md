@@ -139,10 +139,12 @@ Then power-cycle or press the reset button within 5 minutes to confirm.
 2. Create and start the app, pointing its root directory at your external storage:
 
 ```
-/app add file=wgmik.tikapp.yaml
+/app add yaml=[/file get wgmik.tikapp.yaml contents]
 /app set [find name=wgmik-server] root-dir=usb1/wgmik
 /app start [find name=wgmik-server]
 ```
+
+(Alternatively: `/app add network=lan`, then `/app edit app yaml` and paste the YAML into the editor, save with Ctrl+O.)
 
 3. Open `http://<router-ip>:6574` and follow the normal first-run setup.
 
