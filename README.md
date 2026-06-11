@@ -155,7 +155,7 @@ The script detects the router architecture (`x86_64` or `arm64`), downloads the 
 Or run the commands manually:
 
 ```
-/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-amd64.tar.gz" dst-path=wgmik-server.tar.gz
+/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-amd64.tar.gz" dst-path=wgmik-server.tar.gz http-max-redirect-count=5
 /interface/veth/add name=veth-wgmik address=10.99.0.2/24 gateway=10.99.0.1
 /interface/bridge/add name=wgmik-net
 /ip/address/add address=10.99.0.1/24 interface=wgmik-net
@@ -163,7 +163,8 @@ Or run the commands manually:
 /ip/firewall/nat/add chain=srcnat action=masquerade src-address=10.99.0.0/24 comment=wgmik
 /ip/firewall/nat/add chain=dstnat action=dst-nat dst-port=6574 protocol=tcp to-addresses=10.99.0.2 to-ports=6574 comment=wgmik
 /container/add comment=wgmik file=wgmik-server.tar.gz interface=veth-wgmik root-dir="containers/wgmik"
-/container/set [find comment=wgmik] start-on-boot=yes logging=yes
+:while ([/container/get [find comment=wgmik] status] = "extracting") do={ :delay 5s }
+/container/set [find comment=wgmik] cmd="uvicorn backend.main:app --host 0.0.0.0 --port 6574" start-on-boot=yes logging=yes
 /container/start [find comment=wgmik]
 ```
 
@@ -173,7 +174,7 @@ Manual install: download the matching release asset:
 - ARM64 routers: `wgmik-server-linux-arm64.tar.gz`
 
 ```
-/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-arm64.tar.gz" dst-path=wgmik-server.tar.gz
+/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-arm64.tar.gz" dst-path=wgmik-server.tar.gz http-max-redirect-count=5
 ```
 
 Use the same veth/bridge/firewall and `/container/add file=...` commands above.
@@ -190,9 +191,10 @@ If the download/import fails because the router's local storage is too small, us
 Then edit the script before import, or run the install commands with paths like:
 
 ```
-/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-amd64.tar.gz" dst-path=<slot>/wgmik-server.tar.gz
+/tool fetch url="https://github.com/parhamfa/wgmik-server/releases/download/mikrotik-container-images-2026-06-11/wgmik-server-linux-amd64.tar.gz" dst-path=<slot>/wgmik-server.tar.gz http-max-redirect-count=5
 /container/add comment=wgmik file=<slot>/wgmik-server.tar.gz interface=veth-wgmik root-dir="<slot>/containers/wgmik"
-/container/set [find comment=wgmik] start-on-boot=yes logging=yes
+:while ([/container/get [find comment=wgmik] status] = "extracting") do={ :delay 5s }
+/container/set [find comment=wgmik] cmd="uvicorn backend.main:app --host 0.0.0.0 --port 6574" start-on-boot=yes logging=yes
 ```
 
 For example: `usb1/wgmik-server.tar.gz` and `usb1/containers/wgmik`.
