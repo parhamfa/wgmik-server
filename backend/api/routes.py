@@ -53,6 +53,7 @@ from ..fair_usage_peer_status_dto import (
     build_fair_usage_peer_status_dto,
 )
 from ..fair_usage_tiers import ordered_tiers_for_rule, replace_rule_tiers
+from ..usage_deltas import CounterQuarantineState, counter_day_key, counter_delta, guarded_delta_sql, near_32bit_drop_sql
 from ..usage_bucketing import aggregate_rows_to_local_buckets, aggregate_router_rows_to_local_buckets
 from ..calendar_utils import (
     app_date_calendar,
@@ -280,6 +281,7 @@ def _query_raw_peer_summaries(
     ),
     filtered_samples AS (
         SELECT 
+            u.id,
             u.peer_id,
             u.ts,
             u.rx,
@@ -291,27 +293,54 @@ def _query_raw_peer_summaries(
     ),
     deltas AS (
         SELECT
+            id,
             peer_id,
             ts,
             rx,
             tx,
-            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_rx,
-            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_tx
+            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_rx,
+            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_tx
         FROM filtered_samples
+    ),
+    marked AS (
+        SELECT
+            id,
+            peer_id,
+            ts,
+            rx,
+            tx,
+            prev_rx,
+            prev_tx,
+            {near_32bit_drop_sql("rx", "prev_rx")} AS rx_near_32bit_drop,
+            {near_32bit_drop_sql("tx", "prev_tx")} AS tx_near_32bit_drop
+        FROM deltas
+    ),
+    guarded AS (
+        SELECT
+            id,
+            peer_id,
+            ts,
+            rx,
+            tx,
+            prev_rx,
+            prev_tx,
+            SUM(rx_near_32bit_drop) OVER (
+                PARTITION BY peer_id, substr(ts, 1, 10)
+                ORDER BY ts, id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS rx_unstable,
+            SUM(tx_near_32bit_drop) OVER (
+                PARTITION BY peer_id, substr(ts, 1, 10)
+                ORDER BY ts, id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS tx_unstable
+        FROM marked
     )
     SELECT
         peer_id,
-        SUM(CASE 
-            WHEN prev_rx IS NULL THEN 0
-            WHEN rx < prev_rx THEN rx
-            ELSE rx - prev_rx 
-        END) as total_rx,
-        SUM(CASE 
-            WHEN prev_tx IS NULL THEN 0
-            WHEN tx < prev_tx THEN tx
-            ELSE tx - prev_tx 
-        END) as total_tx
-    FROM deltas
+        SUM({guarded_delta_sql("rx", "prev_rx", "rx_unstable")}) as total_rx,
+        SUM({guarded_delta_sql("tx", "prev_tx", "tx_unstable")}) as total_tx
+    FROM guarded
     WHERE prev_rx IS NOT NULL
     GROUP BY peer_id
     """)
@@ -339,6 +368,7 @@ def _query_raw_sample_delta_rows(
     ),
     filtered_samples AS (
         SELECT
+            u.id,
             u.peer_id,
             u.ts,
             u.rx,
@@ -350,25 +380,54 @@ def _query_raw_sample_delta_rows(
     ),
     deltas AS (
         SELECT
+            id,
             peer_id,
             ts,
             rx,
             tx,
-            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_rx,
-            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_tx
+            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_rx,
+            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_tx
         FROM filtered_samples
+    ),
+    marked AS (
+        SELECT
+            id,
+            peer_id,
+            ts,
+            rx,
+            tx,
+            prev_rx,
+            prev_tx,
+            {near_32bit_drop_sql("rx", "prev_rx")} AS rx_near_32bit_drop,
+            {near_32bit_drop_sql("tx", "prev_tx")} AS tx_near_32bit_drop
+        FROM deltas
+    ),
+    guarded AS (
+        SELECT
+            id,
+            peer_id,
+            ts,
+            rx,
+            tx,
+            prev_rx,
+            prev_tx,
+            SUM(rx_near_32bit_drop) OVER (
+                PARTITION BY peer_id, substr(ts, 1, 10)
+                ORDER BY ts, id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS rx_unstable,
+            SUM(tx_near_32bit_drop) OVER (
+                PARTITION BY peer_id, substr(ts, 1, 10)
+                ORDER BY ts, id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS tx_unstable
+        FROM marked
     )
     SELECT
         ts,
-        CASE
-            WHEN rx < prev_rx THEN rx
-            ELSE rx - prev_rx
-        END as d_rx,
-        CASE
-            WHEN tx < prev_tx THEN tx
-            ELSE tx - prev_tx
-        END as d_tx
-    FROM deltas
+        {guarded_delta_sql("rx", "prev_rx", "rx_unstable")} as d_rx,
+        {guarded_delta_sql("tx", "prev_tx", "tx_unstable")} as d_tx
+    FROM guarded
     WHERE prev_rx IS NOT NULL
     ORDER BY ts
     """)
@@ -402,6 +461,7 @@ def _query_raw_router_sample_delta_rows(
     ),
     filtered_samples AS (
         SELECT
+            u.id,
             fp.router_id,
             u.peer_id,
             u.ts,
@@ -414,27 +474,58 @@ def _query_raw_router_sample_delta_rows(
     ),
     deltas AS (
         SELECT
+            id,
             router_id,
             peer_id,
             ts,
             rx,
             tx,
-            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_rx,
-            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts) as prev_tx
+            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_rx,
+            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_tx
         FROM filtered_samples
+    ),
+    marked AS (
+        SELECT
+            id,
+            router_id,
+            peer_id,
+            ts,
+            rx,
+            tx,
+            prev_rx,
+            prev_tx,
+            {near_32bit_drop_sql("rx", "prev_rx")} AS rx_near_32bit_drop,
+            {near_32bit_drop_sql("tx", "prev_tx")} AS tx_near_32bit_drop
+        FROM deltas
+    ),
+    guarded AS (
+        SELECT
+            id,
+            router_id,
+            peer_id,
+            ts,
+            rx,
+            tx,
+            prev_rx,
+            prev_tx,
+            SUM(rx_near_32bit_drop) OVER (
+                PARTITION BY peer_id, substr(ts, 1, 10)
+                ORDER BY ts, id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS rx_unstable,
+            SUM(tx_near_32bit_drop) OVER (
+                PARTITION BY peer_id, substr(ts, 1, 10)
+                ORDER BY ts, id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS tx_unstable
+        FROM marked
     )
     SELECT
         router_id,
         ts,
-        CASE
-            WHEN rx < prev_rx THEN rx
-            ELSE rx - prev_rx
-        END as d_rx,
-        CASE
-            WHEN tx < prev_tx THEN tx
-            ELSE tx - prev_tx
-        END as d_tx
-    FROM deltas
+        {guarded_delta_sql("rx", "prev_rx", "rx_unstable")} as d_rx,
+        {guarded_delta_sql("tx", "prev_tx", "tx_unstable")} as d_tx
+    FROM guarded
     WHERE prev_rx IS NOT NULL
     ORDER BY router_id, ts
     """)
@@ -3029,16 +3120,18 @@ def compute_peer_usage_points(
         )
         delta_rows: list[tuple[datetime, int, int]] = []
         prev: Optional[UsageSample] = None
+        quarantine = CounterQuarantineState()
         for s in samples:
             if prev is None:
                 prev = s
                 continue
-            drx = s.rx if s.rx < prev.rx else s.rx - prev.rx
-            dtx = s.tx if s.tx < prev.tx else s.tx - prev.tx
+            ts_naive = s.ts.replace(tzinfo=None) if s.ts.tzinfo else s.ts
+            day_key = counter_day_key(ts_naive, tz)
+            drx = quarantine.apply("rx", counter_delta(prev.rx, s.rx), day_key)
+            dtx = quarantine.apply("tx", counter_delta(prev.tx, s.tx), day_key)
             prev = s
             if drx <= 0 and dtx <= 0:
                 continue
-            ts_naive = s.ts.replace(tzinfo=None) if s.ts.tzinfo else s.ts
             delta_rows.append((ts_naive, int(drx or 0), int(dtx or 0)))
         aggregated = aggregate_rows_to_local_buckets(delta_rows, resolved_interval, tz)
         return [

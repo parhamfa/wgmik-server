@@ -1136,8 +1136,107 @@ def test_scheduler_upserts_usage_minute_with_counter_resets(client, monkeypatch)
     try:
         rows = db.query(UsageMinute).filter(UsageMinute.peer_id == peer_id).all()
         assert len(rows) == 1
-        assert rows[0].rx == 120
-        assert rows[0].tx == 70
+        assert rows[0].rx == 80
+        assert rows[0].tx == 50
+    finally:
+        db.close()
+
+
+def test_scheduler_quarantines_near_32bit_drop_direction_for_local_day(client, monkeypatch):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Router A",
+            host="10.0.0.1",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret-a",
+            tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
+        )
+        db.add(router)
+        db.flush()
+        peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="peer-a",
+            public_key="pub-a",
+            allowed_address="10.0.0.10/32",
+            disabled=False,
+            selected=True,
+        )
+        db.add(peer)
+        db.flush()
+        base_time = datetime(2026, 6, 16, 12, 0, 0, tzinfo=timezone.utc)
+        db.add(
+            UsageSample(
+                peer_id=peer.id,
+                ts=(base_time - timedelta(seconds=5)).replace(tzinfo=None),
+                rx=100,
+                tx=4_200_000_000,
+                endpoint="",
+            )
+        )
+        db.commit()
+        peer_id = peer.id
+    finally:
+        db.close()
+
+    live_values = iter([(150, 12_000_000), (200, 20_000_000)])
+
+    class FakeDateTime:
+        current = base_time
+
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.current.replace(tzinfo=None)
+            return cls.current.astimezone(tz)
+
+    class StubClient:
+        def list_all_wireguard_peers(self):
+            rx, tx = next(live_values)
+            return [
+                SimpleNamespace(
+                    interface="wg0",
+                    public_key="pub-a",
+                    ros_id="*1",
+                    name="peer-a",
+                    allowed_address="10.0.0.10/32",
+                    disabled=False,
+                    rx_bytes=rx,
+                    tx_bytes=tx,
+                    endpoint="",
+                )
+            ]
+
+        def set_peer_disabled(self, iface, ros_id, disabled):
+            return None
+
+    monkeypatch.setattr("backend.scheduler.make_client", lambda router: StubClient())
+    monkeypatch.setattr(scheduler_module, "datetime", FakeDateTime)
+
+    for second in (0, 5):
+        FakeDateTime.current = base_time + timedelta(seconds=second)
+        scheduler_module._poll_once()
+
+    db = SessionLocal()
+    try:
+        rows = db.query(UsageMinute).filter(UsageMinute.peer_id == peer_id).all()
+        assert len(rows) == 1
+        assert rows[0].rx == 100
+        assert rows[0].tx == 0
+        assert db.query(UsageSample).filter(UsageSample.peer_id == peer_id).count() == 3
+        anomaly = (
+            db.query(Action)
+            .filter(Action.peer_id == peer_id, Action.action == "usage_anomaly")
+            .all()
+        )
+        assert len(anomaly) == 1
+        assert "Quarantined tx usage" in anomaly[0].note
     finally:
         db.close()
 
@@ -1209,6 +1308,62 @@ def test_summary_endpoints_fall_back_when_minute_data_starts_after_cutoff(client
     assert len(peer_usage.json()) == 1
     assert peer_usage.json()[0]["rx"] == 600
     assert peer_usage.json()[0]["tx"] == 400
+
+
+def test_raw_fallbacks_quarantine_near_32bit_wireguard_spikes(client):
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Router A",
+            host="10.0.0.1",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret-a",
+            tls_verify=True,
+        )
+        db.add(router)
+        db.flush()
+        peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="peer-a",
+            public_key="pub-a",
+            allowed_address="10.0.0.10/32",
+            disabled=False,
+            selected=True,
+        )
+        db.add(peer)
+        db.flush()
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        db.add_all(
+            [
+                UsageSample(peer_id=peer.id, ts=(now - timedelta(minutes=3)).replace(tzinfo=None), rx=100, tx=4_200_000_000, endpoint=""),
+                UsageSample(peer_id=peer.id, ts=(now - timedelta(minutes=2)).replace(tzinfo=None), rx=150, tx=12_000_000, endpoint=""),
+                UsageSample(peer_id=peer.id, ts=(now - timedelta(minutes=1)).replace(tzinfo=None), rx=200, tx=1_500_000_000, endpoint=""),
+            ]
+        )
+        db.commit()
+        peer_id = peer.id
+    finally:
+        db.close()
+
+    peers = client.get("/api/summary/peers?seconds=600")
+    assert peers.status_code == 200, peers.text
+    peer_row = next(row for row in peers.json() if row["peer_id"] == peer_id)
+    assert peer_row["rx"] == 100
+    assert peer_row["tx"] == 0
+
+    raw = client.get("/api/summary/raw?seconds=600&interval=60")
+    assert raw.status_code == 200, raw.text
+    assert sum(row["rx"] for row in raw.json()) == 100
+    assert sum(row["tx"] for row in raw.json()) == 0
+
+    peer_usage = client.get(f"/api/peers/{peer_id}/usage?window=raw&seconds=600&interval=60")
+    assert peer_usage.status_code == 200, peer_usage.text
+    assert sum(row["rx"] for row in peer_usage.json()) == 100
+    assert sum(row["tx"] for row in peer_usage.json()) == 0
 
 
 def test_reset_and_purge_include_usage_minute(client):

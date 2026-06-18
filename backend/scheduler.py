@@ -14,10 +14,55 @@ from .models import Router, Peer, UsageSample, UsageMinute, UsageDaily, UsageMon
 from .fair_usage_sync import apply_fair_usage_policy, get_applicable_fair_usage_rules
 from .routeros.factory import make_client
 from .routeros.version import is_routeros_supported
+from .usage_deltas import counter_day_key, counter_delta
 from .usage_storage import floor_to_minute_utc, upsert_usage_minute
 
 
 _scheduler: Optional[BackgroundScheduler] = None
+
+
+def _counter_quarantine_key(peer_id: int, direction: str, day_key: str) -> str:
+    return f"usage_counter_unstable:{peer_id}:{direction}:{day_key}"
+
+
+def _counter_anomaly_log_key(peer_id: int, direction: str, day_key: str) -> str:
+    return f"usage_anomaly_logged:{peer_id}:{direction}:{day_key}"
+
+
+def _is_counter_quarantined(db: Session, peer_id: int, direction: str, day_key: str) -> bool:
+    return db.get(SettingsKV, _counter_quarantine_key(peer_id, direction, day_key)) is not None
+
+
+def _mark_counter_quarantined(
+    db: Session,
+    *,
+    peer_id: int,
+    direction: str,
+    day_key: str,
+    previous: int,
+    current: int,
+    now_utc: datetime,
+) -> None:
+    key = _counter_quarantine_key(peer_id, direction, day_key)
+    if db.get(SettingsKV, key) is None:
+        db.add(SettingsKV(key=key, value=now_utc.isoformat()))
+
+    log_key = _counter_anomaly_log_key(peer_id, direction, day_key)
+    if db.get(SettingsKV, log_key) is not None:
+        return
+    db.add(SettingsKV(key=log_key, value=now_utc.isoformat()))
+    db.add(
+        Action(
+            peer_id=peer_id,
+            ts=now_utc,
+            action="usage_anomaly",
+            note=(
+                f"Quarantined {direction} usage for local day {day_key} after near-32-bit "
+                f"counter drop: {previous}->{current}. Raw samples are kept, but this "
+                "direction's deltas are ignored for the rest of the local day."
+            ),
+        )
+    )
 
 
 def _enforce_fair_usage(db: Session, peer: Peer, client, now_utc: datetime):
@@ -214,22 +259,40 @@ def _poll_once():
                     )
                     db.add(sample)
 
-                    # Compute deltas (guard against counter resets)
+                    # Compute deltas. RouterOS WireGuard peer counters can drop or wrap
+                    # near 32-bit values; never count a drop transition as usage.
                     delta_rx = 0
                     delta_tx = 0
                     if last_sample is not None:
-                        reset_rx = lp.rx_bytes < last_sample.rx
-                        reset_tx = lp.tx_bytes < last_sample.tx
-                        if reset_rx:
-                            # Counter reset/recreate: best-effort count since reset
-                            delta_rx = lp.rx_bytes
-                        else:
-                            delta_rx = lp.rx_bytes - last_sample.rx
-                        if reset_tx:
-                            delta_tx = lp.tx_bytes
-                        else:
-                            delta_tx = lp.tx_bytes - last_sample.tx
-                        if reset_rx or reset_tx:
+                        rx_result = counter_delta(last_sample.rx, lp.rx_bytes)
+                        tx_result = counter_delta(last_sample.tx, lp.tx_bytes)
+                        local_day_key = counter_day_key(now_utc, tz)
+
+                        if rx_result.near_32bit_drop:
+                            _mark_counter_quarantined(
+                                db,
+                                peer_id=peer.id,
+                                direction="rx",
+                                day_key=local_day_key,
+                                previous=last_sample.rx,
+                                current=lp.rx_bytes,
+                                now_utc=now_utc,
+                            )
+                        if tx_result.near_32bit_drop:
+                            _mark_counter_quarantined(
+                                db,
+                                peer_id=peer.id,
+                                direction="tx",
+                                day_key=local_day_key,
+                                previous=last_sample.tx,
+                                current=lp.tx_bytes,
+                                now_utc=now_utc,
+                            )
+
+                        delta_rx = 0 if _is_counter_quarantined(db, peer.id, "rx", local_day_key) else rx_result.delta
+                        delta_tx = 0 if _is_counter_quarantined(db, peer.id, "tx", local_day_key) else tx_result.delta
+
+                        if rx_result.dropped or tx_result.dropped:
                             db.add(
                                 Action(
                                     peer_id=peer.id,

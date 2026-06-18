@@ -107,7 +107,7 @@ def test_sqlite_backfill_uses_precutoff_sample_and_counter_reset(tmp_path, clien
     ).fetchall()
     conn.close()
     assert rows == [
-        (1, "2026-01-01 00:01:00.000000", 60, 45),
+        (1, "2026-01-01 00:01:00.000000", 50, 40),
         (1, "2026-01-01 00:02:00.000000", 15, 10),
     ]
     conn = sqlite3.connect(db_path)
@@ -116,7 +116,43 @@ def test_sqlite_backfill_uses_precutoff_sample_and_counter_reset(tmp_path, clien
         ("2026-01-01 00:01:00.000000",),
     ).fetchone()
     conn.close()
-    assert lower_bound_total == (75, 55)
+    assert lower_bound_total == (65, 50)
+
+
+def test_sqlite_backfill_quarantines_near_32bit_counter_spike(tmp_path, client):
+    db_path = tmp_path / "usage.db"
+    conn = _create_usage_db(db_path)
+    conn.executemany(
+        "INSERT INTO usage_samples (id, peer_id, ts, rx, tx, endpoint) VALUES (?, ?, ?, ?, ?, '')",
+        [
+            (1, 1, "2026-06-16 00:00:00.000000", 100, 4_200_000_000),
+            (2, 1, "2026-06-16 00:01:05.000000", 150, 12_000_000),
+            (3, 1, "2026-06-16 00:02:00.000000", 200, 1_500_000_000),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    cutoff = _dt("2026-06-16 00:01:00").replace(tzinfo=timezone.utc)
+    _seed_status(
+        phase="backfill",
+        backfill_cutoff=cutoff.isoformat(),
+        backfill_peer_counts=[[1, 2]],
+        backfill_samples_total=2,
+        total_units=2,
+    )
+
+    _phase_backfill(str(db_path))
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT peer_id, minute_ts, rx, tx FROM usage_minute ORDER BY minute_ts"
+    ).fetchall()
+    conn.close()
+    assert rows == [
+        (1, "2026-06-16 00:01:00.000000", 50, 0),
+        (1, "2026-06-16 00:02:00.000000", 50, 0),
+    ]
 
 
 def test_prune_uses_retention_cutoff_and_preserves_newer_rows(tmp_path, client):

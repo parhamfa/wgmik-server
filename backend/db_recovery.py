@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from backend.usage_deltas import guarded_delta_sql, near_32bit_drop_sql
+
 
 DEFAULT_RETENTION = {
     "raw_sample_retention_hours": 24,
@@ -189,25 +191,50 @@ def _rebuild_usage_rollups(target_conn: sqlite3.Connection, *, minute_cutoff: da
             SELECT
                 peer_id,
                 ts,
-                CASE
-                    WHEN prev_rx IS NULL THEN 0
-                    WHEN rx < prev_rx THEN rx
-                    ELSE rx - prev_rx
-                END AS delta_rx,
-                CASE
-                    WHEN prev_tx IS NULL THEN 0
-                    WHEN tx < prev_tx THEN tx
-                    ELSE tx - prev_tx
-                END AS delta_tx
+                {guarded_delta_sql("rx", "prev_rx", "rx_unstable")} AS delta_rx,
+                {guarded_delta_sql("tx", "prev_tx", "tx_unstable")} AS delta_tx
             FROM (
                 SELECT
                     peer_id,
+                    id,
                     ts,
                     rx,
                     tx,
-                    LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts, id) AS prev_rx,
-                    LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts, id) AS prev_tx
-                FROM usage_samples INDEXED BY {USAGE_SAMPLE_INDEX_NAME}
+                    prev_rx,
+                    prev_tx,
+                    SUM(rx_near_32bit_drop) OVER (
+                        PARTITION BY peer_id, substr(ts, 1, 10)
+                        ORDER BY ts, id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS rx_unstable,
+                    SUM(tx_near_32bit_drop) OVER (
+                        PARTITION BY peer_id, substr(ts, 1, 10)
+                        ORDER BY ts, id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS tx_unstable
+                FROM (
+                    SELECT
+                        peer_id,
+                        id,
+                        ts,
+                        rx,
+                        tx,
+                        prev_rx,
+                        prev_tx,
+                        {near_32bit_drop_sql("rx", "prev_rx")} AS rx_near_32bit_drop,
+                        {near_32bit_drop_sql("tx", "prev_tx")} AS tx_near_32bit_drop
+                    FROM (
+                        SELECT
+                            peer_id,
+                            id,
+                            ts,
+                            rx,
+                            tx,
+                            LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts, id) AS prev_rx,
+                            LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts, id) AS prev_tx
+                        FROM usage_samples INDEXED BY {USAGE_SAMPLE_INDEX_NAME}
+                    )
+                )
             )
         )
         WHERE delta_rx <> 0 OR delta_tx <> 0

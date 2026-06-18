@@ -3,7 +3,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from backend.db_recovery import recover_database
+from backend.db_recovery import _rebuild_usage_rollups, recover_database
 
 
 SCHEMA_SQL = """
@@ -152,6 +152,39 @@ def _create_backup_db(path: Path, now: datetime) -> None:
         conn.commit()
 
 
+def test_rebuild_usage_rollups_quarantines_near_32bit_counter_spike(tmp_path):
+    db_path = tmp_path / "rollups.db"
+    with _connect(db_path) as conn:
+        conn.executescript(SCHEMA_SQL)
+        conn.execute(
+            "INSERT INTO routers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, "Router A", "10.0.0.1", "rest", 443, "admin", "secret", 1),
+        )
+        conn.execute(
+            "INSERT INTO peers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, 1, "wg0", "*1", "peer-a", "pub-a", "10.0.0.10/32", "", 0, 1),
+        )
+        conn.executemany(
+            "INSERT INTO usage_samples (id, peer_id, ts, rx, tx, endpoint) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (1, 1, "2026-06-16 00:00:00", 100, 4_200_000_000, ""),
+                (2, 1, "2026-06-16 00:01:00", 150, 12_000_000, ""),
+                (3, 1, "2026-06-16 00:02:00", 200, 1_500_000_000, ""),
+            ],
+        )
+        conn.commit()
+
+        _rebuild_usage_rollups(conn, minute_cutoff=datetime(2026, 6, 16, tzinfo=timezone.utc))
+
+        daily = conn.execute("SELECT rx, tx FROM usage_daily").fetchone()
+        monthly = conn.execute("SELECT rx, tx FROM usage_monthly").fetchone()
+        minute = conn.execute("SELECT COALESCE(SUM(rx), 0) AS rx, COALESCE(SUM(tx), 0) AS tx FROM usage_minute").fetchone()
+
+    assert (daily["rx"], daily["tx"]) == (100, 0)
+    assert (monthly["rx"], monthly["tx"]) == (100, 0)
+    assert (minute["rx"], minute["tx"]) == (100, 0)
+
+
 def test_recover_database_salvages_delta_rebuilds_rollups_and_prunes_raw(tmp_path):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     clean_backup = tmp_path / "clean.db"
@@ -205,13 +238,13 @@ def test_recover_database_salvages_delta_rebuilds_rollups_and_prunes_raw(tmp_pat
             "SELECT day, rx, tx FROM usage_daily ORDER BY day"
         ).fetchall()
         assert len(daily_rows) == 2
-        assert [(row["rx"], row["tx"]) for row in daily_rows] == [(80, 60), (140, 105)]
+        assert [(row["rx"], row["tx"]) for row in daily_rows] == [(80, 60), (120, 100)]
 
         monthly_rows = conn.execute(
             "SELECT month_key, rx, tx FROM usage_monthly ORDER BY month_key"
         ).fetchall()
         assert len(monthly_rows) == 1
-        assert (monthly_rows[0]["rx"], monthly_rows[0]["tx"]) == (220, 165)
+        assert (monthly_rows[0]["rx"], monthly_rows[0]["tx"]) == (200, 160)
 
         minute_rows = conn.execute(
             "SELECT COUNT(*) AS count, MIN(minute_ts) AS min_ts, MAX(minute_ts) AS max_ts FROM usage_minute"

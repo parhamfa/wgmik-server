@@ -14,8 +14,10 @@ from sqlalchemy.orm import Session
 
 from .db import SessionLocal, engine, prepare_sqlite_database, sqlite_database_path
 from .destructive_ops import exclusive_operation_gate
+from .fair_usage_usage import app_zoneinfo
 from .models import Peer, SettingsKV, UsageDaily, UsageMinute, UsageSample
 from .scheduler import pause_scheduler, resume_scheduler
+from .usage_deltas import CounterQuarantineState, counter_day_key, counter_delta, guarded_delta_sql, near_32bit_drop_sql
 from .usage_storage import floor_to_minute_utc
 
 
@@ -888,44 +890,69 @@ def _phase_backfill(db_path: str) -> None:
                 or 0
             )
             conn.execute(
-                """
+                f"""
                 INSERT INTO usage_minute (peer_id, minute_ts, rx, tx)
                 SELECT peer_id, minute_ts, SUM(delta_rx), SUM(delta_tx)
                 FROM (
                     SELECT
                         peer_id,
                         strftime('%Y-%m-%d %H:%M:00.000000', ts) AS minute_ts,
-                        CASE
-                            WHEN prev_rx IS NULL THEN 0
-                            WHEN rx < prev_rx THEN rx
-                            ELSE rx - prev_rx
-                        END AS delta_rx,
-                        CASE
-                            WHEN prev_tx IS NULL THEN 0
-                            WHEN tx < prev_tx THEN tx
-                            ELSE tx - prev_tx
-                        END AS delta_tx,
+                        {guarded_delta_sql("rx", "prev_rx", "rx_unstable")} AS delta_rx,
+                        {guarded_delta_sql("tx", "prev_tx", "tx_unstable")} AS delta_tx,
                         ts
                     FROM (
                         SELECT
                             peer_id,
+                            id,
                             ts,
                             rx,
                             tx,
-                            LAG(rx) OVER (ORDER BY ts, id) AS prev_rx,
-                            LAG(tx) OVER (ORDER BY ts, id) AS prev_tx
-                        FROM usage_samples INDEXED BY ix_usage_samples_peer_id_ts
-                        WHERE peer_id = ?
-                          AND (
-                            ts >= ?
-                            OR id = (
-                                SELECT id
+                            prev_rx,
+                            prev_tx,
+                            SUM(rx_near_32bit_drop) OVER (
+                                PARTITION BY peer_id, substr(ts, 1, 10)
+                                ORDER BY ts, id
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                            ) AS rx_unstable,
+                            SUM(tx_near_32bit_drop) OVER (
+                                PARTITION BY peer_id, substr(ts, 1, 10)
+                                ORDER BY ts, id
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                            ) AS tx_unstable
+                        FROM (
+                            SELECT
+                                peer_id,
+                                id,
+                                ts,
+                                rx,
+                                tx,
+                                prev_rx,
+                                prev_tx,
+                                {near_32bit_drop_sql("rx", "prev_rx")} AS rx_near_32bit_drop,
+                                {near_32bit_drop_sql("tx", "prev_tx")} AS tx_near_32bit_drop
+                            FROM (
+                                SELECT
+                                    peer_id,
+                                    id,
+                                    ts,
+                                    rx,
+                                    tx,
+                                    LAG(rx) OVER (ORDER BY ts, id) AS prev_rx,
+                                    LAG(tx) OVER (ORDER BY ts, id) AS prev_tx
                                 FROM usage_samples INDEXED BY ix_usage_samples_peer_id_ts
-                                WHERE peer_id = ? AND ts < ?
-                                ORDER BY ts DESC, id DESC
-                                LIMIT 1
+                                WHERE peer_id = ?
+                                  AND (
+                                    ts >= ?
+                                    OR id = (
+                                        SELECT id
+                                        FROM usage_samples INDEXED BY ix_usage_samples_peer_id_ts
+                                        WHERE peer_id = ? AND ts < ?
+                                        ORDER BY ts DESC, id DESC
+                                        LIMIT 1
+                                    )
+                                  )
                             )
-                          )
+                        )
                     )
                 )
                 WHERE ts >= ? AND (delta_rx <> 0 OR delta_tx <> 0)
@@ -1341,12 +1368,16 @@ def _raw_peer_total_range(
     rx = 0
     tx = 0
     current_prev = prev
+    quarantine = CounterQuarantineState()
+    tz = app_zoneinfo()
     for row in rows:
         if current_prev is None:
             current_prev = row
             continue
-        rx += row.rx if row.rx < current_prev.rx else row.rx - current_prev.rx
-        tx += row.tx if row.tx < current_prev.tx else row.tx - current_prev.tx
+        ts_naive = row.ts.replace(tzinfo=None) if row.ts.tzinfo else row.ts
+        day_key = counter_day_key(ts_naive, tz)
+        rx += quarantine.apply("rx", counter_delta(current_prev.rx, row.rx), day_key)
+        tx += quarantine.apply("tx", counter_delta(current_prev.tx, row.tx), day_key)
         current_prev = row
     return int(rx), int(tx)
 
