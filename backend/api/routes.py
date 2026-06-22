@@ -32,7 +32,8 @@ from ..backup_restore import (
     get_backup_status,
     is_backup_running,
     resolve_backup_download,
-    restore_backup_from_upload,
+    restore_backup_from_upload_path,
+    store_backup_upload_to_temp,
     start_backup,
 )
 from ..fair_usage_sync import (
@@ -4106,15 +4107,23 @@ async def restore_manual_backup(
     current_user: User = Depends(get_current_user),
 ):
     _require_admin(current_user)
-    payload = await file.read()
-    if not payload:
-        raise HTTPException(status_code=400, detail="Backup file is empty")
+    upload_path = ""
     try:
-        result = restore_backup_from_upload(payload, key)
+        upload_path, size = store_backup_upload_to_temp(file.file)
+        if size <= 0:
+            raise HTTPException(status_code=400, detail="Backup file is empty")
+        result = restore_backup_from_upload_path(upload_path, key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    finally:
+        if upload_path:
+            try:
+                os.remove(upload_path)
+            except OSError:
+                pass
+        await file.close()
     return BackupRestoreResultDTO(**result)
 
 

@@ -625,7 +625,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA temp_store=FILE")
     return conn
 
 

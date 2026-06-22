@@ -45,7 +45,7 @@ if db_url.startswith("sqlite:"):
         try:
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA busy_timeout=30000")
-            cursor.execute("PRAGMA temp_store=MEMORY")
+            cursor.execute("PRAGMA temp_store=FILE")
         finally:
             cursor.close()
 
