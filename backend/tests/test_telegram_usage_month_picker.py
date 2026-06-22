@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from backend.db import SessionLocal
 from backend.models import Peer, Router, UsageDaily
+from backend.settings import settings
 from backend.telegram.usage_chart_image import usage_points_for_selected_calendar_month
 from backend.telegram.usage_month_picker import distinct_calendar_months_with_usage
 
@@ -132,6 +133,58 @@ def test_usage_points_for_selected_calendar_month_filters_range(client):
         assert points == [
             {"day": "2026-04-01", "rx": 100, "tx": 50},
             {"day": "2026-04-10", "rx": 200, "tx": 75},
+        ]
+    finally:
+        db.close()
+
+
+def test_usage_points_for_selected_persian_month_excludes_previous_month_last_day(client, monkeypatch):
+    monkeypatch.setattr(settings, "timezone", "Asia/Tehran")
+    monkeypatch.setattr(settings, "date_calendar", "persian")
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="r1",
+            host="127.0.0.1",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret",
+        )
+        db.add(router)
+        db.flush()
+        peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="peer-1",
+            public_key="pubkey-1",
+            allowed_address="10.0.0.2/32",
+        )
+        db.add(peer)
+        db.flush()
+        db.add_all(
+            [
+                UsageDaily(peer_id=peer.id, day="2026-04-20", rx=9, tx=9),
+                UsageDaily(peer_id=peer.id, day="2026-04-21", rx=100, tx=50),
+                UsageDaily(peer_id=peer.id, day="2026-05-21", rx=200, tx=75),
+                UsageDaily(peer_id=peer.id, day="2026-05-22", rx=8, tx=8),
+            ]
+        )
+        db.commit()
+
+        points, mode = usage_points_for_selected_calendar_month(
+            db,
+            peer.id,
+            1405,
+            2,
+            datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc),
+        )
+
+        assert mode == "days"
+        assert points == [
+            {"day": "2026-04-21", "rx": 100, "tx": 50},
+            {"day": "2026-05-21", "rx": 200, "tx": 75},
         ]
     finally:
         db.close()

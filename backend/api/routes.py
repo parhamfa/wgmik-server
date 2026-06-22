@@ -14,7 +14,7 @@ from ..scheduler import (
     get_usage_maintenance_next_run,
 )
 from ..security import SecretBox
-from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User, UserSecurityEvent, FairUsageRule, FairUsageAssignment, FairUsageState, FairUsageTier, PeerTotalsMerge, TelegramPeerBinding, TelegramSignupToken, TelegramNotificationLog
+from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User, UserSecurityEvent, FairUsageRule, FairUsageAssignment, FairUsageState, FairUsageTier, PeerTotalsMerge, TelegramBroadcast, TelegramBroadcastRecipient, TelegramPeerBinding, TelegramSignupToken, TelegramNotificationLog
 from ..auth import verify_password, get_password_hash, create_access_token, verify_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from ..routeros.factory import make_client
 from ..routeros import tls_setup as router_tls_setup
@@ -59,9 +59,11 @@ from ..calendar_utils import (
     app_date_calendar,
     normalize_date_calendar,
     selected_month_bounds_utc,
+    utc_range_to_local_day_bounds,
 )
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
+from pathlib import Path
 import traceback
 from ipaddress import ip_network
 import os
@@ -213,6 +215,227 @@ def _ts_cell_to_utc_naive(val: object) -> datetime:
             return datetime.fromisoformat(s + "T00:00:00")
         return datetime.fromisoformat(s.replace(" ", "T", 1))
     raise TypeError(f"expected datetime-like, got {type(val)}")
+
+
+def _local_day_key(ts_utc_naive: datetime, tz: ZoneInfo) -> str:
+    return ts_utc_naive.replace(tzinfo=timezone.utc).astimezone(tz).date().strftime("%Y-%m-%d")
+
+
+def _apply_usage_daily_range(q, start_utc: Optional[datetime], end_utc: Optional[datetime]):
+    if start_utc is not None and end_utc is not None and end_utc <= start_utc:
+        return q.filter(False)
+    start_day, end_day = utc_range_to_local_day_bounds(start_utc, end_utc, app_zoneinfo())
+    if start_day is not None:
+        q = q.filter(UsageDaily.day >= start_day)
+    if end_day is not None:
+        q = q.filter(UsageDaily.day <= end_day)
+    return q
+
+
+def _daily_keys_for_recent_days(days: int) -> list[str]:
+    today = datetime.now(timezone.utc).astimezone(app_zoneinfo()).date()
+    return [(today - timedelta(days=o)).strftime("%Y-%m-%d") for o in range(days)]
+
+
+def _minute_window(start_utc: Optional[datetime], end_utc: Optional[datetime]) -> Optional[tuple[datetime, datetime]]:
+    if start_utc is None or end_utc is None or end_utc <= start_utc:
+        return None
+    return start_utc.replace(tzinfo=None), end_utc.replace(tzinfo=None)
+
+
+def _minute_coverage_covers_selected_peers_window_start(
+    db: Session,
+    *,
+    router_id: Optional[int],
+    router_ids: Optional[List[int]],
+    cutoff: datetime,
+) -> bool:
+    peer_q = db.query(Peer.id).filter(Peer.selected == True)
+    peer_q = _apply_router_filter(peer_q, router_id, router_ids)
+    peer_ids = [int(row[0]) for row in peer_q.all()]
+    if not peer_ids:
+        return True
+    rows = (
+        db.query(UsageMinute.peer_id, func.min(UsageMinute.minute_ts))
+        .filter(UsageMinute.peer_id.in_(peer_ids))
+        .group_by(UsageMinute.peer_id)
+        .all()
+    )
+    earliest_by_peer = {int(peer_id): earliest for peer_id, earliest in rows if earliest is not None}
+    cutoff_floor = _floor_to_minute_utc_naive(cutoff)
+    return all(earliest_by_peer.get(peer_id) is not None and earliest_by_peer[peer_id] <= cutoff_floor for peer_id in peer_ids)
+
+
+def _peer_daily_points_from_minutes(
+    db: Session,
+    *,
+    peer_id: int,
+    start_utc: Optional[datetime],
+    end_utc: Optional[datetime],
+) -> Optional[List["UsagePointDTO"]]:
+    window = _minute_window(start_utc, end_utc)
+    if window is None:
+        return [] if start_utc is not None and end_utc is not None and end_utc <= start_utc else None
+    start_naive, end_naive = window
+    if not _minute_coverage_covers_window_start(
+        db,
+        peer_id=peer_id,
+        selected_only=False,
+        cutoff=start_utc,
+        end_dt=end_utc,
+    ):
+        return None
+    rows = (
+        db.query(UsageMinute.minute_ts, UsageMinute.rx, UsageMinute.tx)
+        .filter(
+            UsageMinute.peer_id == peer_id,
+            UsageMinute.minute_ts >= start_naive,
+            UsageMinute.minute_ts < end_naive,
+        )
+        .order_by(UsageMinute.minute_ts.asc())
+        .all()
+    )
+    tz = app_zoneinfo()
+    by_day: dict[str, list[int]] = {}
+    for minute_ts, rx, tx in rows:
+        day = _local_day_key(_ts_cell_to_utc_naive(minute_ts), tz)
+        acc = by_day.setdefault(day, [0, 0])
+        acc[0] += int(rx or 0)
+        acc[1] += int(tx or 0)
+    return [UsagePointDTO(day=day, rx=rx, tx=tx) for day, (rx, tx) in sorted(by_day.items())]
+
+
+def _summary_daily_points_from_minutes(
+    db: Session,
+    *,
+    start_utc: Optional[datetime],
+    end_utc: Optional[datetime],
+    router_id: Optional[int],
+    router_ids: Optional[List[int]],
+) -> Optional[List["MonthlySummaryPointDTO"]]:
+    window = _minute_window(start_utc, end_utc)
+    if window is None:
+        return [] if start_utc is not None and end_utc is not None and end_utc <= start_utc else None
+    if not _minute_coverage_covers_selected_peers_window_start(
+        db,
+        router_id=router_id,
+        router_ids=router_ids,
+        cutoff=start_utc,
+    ):
+        return None
+    start_naive, end_naive = window
+    q = (
+        db.query(UsageMinute.minute_ts, UsageMinute.rx, UsageMinute.tx)
+        .join(Peer, Peer.id == UsageMinute.peer_id)
+        .filter(
+            Peer.selected == True,
+            UsageMinute.minute_ts >= start_naive,
+            UsageMinute.minute_ts < end_naive,
+        )
+    )
+    q = _apply_router_filter(q, router_id, router_ids)
+    tz = app_zoneinfo()
+    by_day: dict[str, list[int]] = {}
+    for minute_ts, rx, tx in q.all():
+        day = _local_day_key(_ts_cell_to_utc_naive(minute_ts), tz)
+        acc = by_day.setdefault(day, [0, 0])
+        acc[0] += int(rx or 0)
+        acc[1] += int(tx or 0)
+    return [MonthlySummaryPointDTO(day=day, rx=rx, tx=tx) for day, (rx, tx) in sorted(by_day.items())]
+
+
+def _router_daily_points_from_minutes(
+    db: Session,
+    *,
+    start_utc: Optional[datetime],
+    end_utc: Optional[datetime],
+    router_id: Optional[int],
+    router_ids: Optional[List[int]],
+) -> Optional[List["RouterMonthlySummaryPointDTO"]]:
+    window = _minute_window(start_utc, end_utc)
+    if window is None:
+        return [] if start_utc is not None and end_utc is not None and end_utc <= start_utc else None
+    if not _minute_coverage_covers_selected_peers_window_start(
+        db,
+        router_id=router_id,
+        router_ids=router_ids,
+        cutoff=start_utc,
+    ):
+        return None
+    start_naive, end_naive = window
+    q = (
+        db.query(Peer.router_id, UsageMinute.minute_ts, UsageMinute.rx, UsageMinute.tx)
+        .join(Peer, Peer.id == UsageMinute.peer_id)
+        .filter(
+            Peer.selected == True,
+            UsageMinute.minute_ts >= start_naive,
+            UsageMinute.minute_ts < end_naive,
+        )
+    )
+    q = _apply_router_filter(q, router_id, router_ids)
+    tz = app_zoneinfo()
+    by_key: dict[tuple[int, str], list[int]] = {}
+    for rid, minute_ts, rx, tx in q.all():
+        day = _local_day_key(_ts_cell_to_utc_naive(minute_ts), tz)
+        acc = by_key.setdefault((int(rid), day), [0, 0])
+        acc[0] += int(rx or 0)
+        acc[1] += int(tx or 0)
+    return [
+        RouterMonthlySummaryPointDTO(router_id=rid, day=day, rx=rx, tx=tx)
+        for (rid, day), (rx, tx) in sorted(by_key.items())
+    ]
+
+
+def _peer_summaries_from_minutes(
+    db: Session,
+    *,
+    start_utc: Optional[datetime],
+    end_utc: Optional[datetime],
+    router_id: Optional[int],
+    router_ids: Optional[List[int]],
+) -> Optional[dict[int, dict[str, int]]]:
+    window = _minute_window(start_utc, end_utc)
+    if window is None:
+        return {} if start_utc is not None and end_utc is not None and end_utc <= start_utc else None
+    if not _minute_coverage_covers_selected_peers_window_start(
+        db,
+        router_id=router_id,
+        router_ids=router_ids,
+        cutoff=start_utc,
+    ):
+        return None
+    start_naive, end_naive = window
+    q = (
+        db.query(
+            UsageMinute.peer_id.label("peer_id"),
+            func.coalesce(func.sum(UsageMinute.rx), 0).label("rx"),
+            func.coalesce(func.sum(UsageMinute.tx), 0).label("tx"),
+        )
+        .join(Peer, Peer.id == UsageMinute.peer_id)
+        .filter(
+            Peer.selected == True,
+            UsageMinute.minute_ts >= start_naive,
+            UsageMinute.minute_ts < end_naive,
+        )
+    )
+    q = _apply_router_filter(q, router_id, router_ids)
+    return {
+        int(row.peer_id): {"rx": int(row.rx or 0), "tx": int(row.tx or 0)}
+        for row in q.group_by(UsageMinute.peer_id).all()
+    }
+
+
+def _peer_total_from_minutes(
+    db: Session,
+    *,
+    peer_id: int,
+    start_utc: Optional[datetime],
+    end_utc: Optional[datetime],
+) -> Optional[tuple[int, int]]:
+    points = _peer_daily_points_from_minutes(db, peer_id=peer_id, start_utc=start_utc, end_utc=end_utc)
+    if points is None:
+        return None
+    return sum(p.rx for p in points), sum(p.tx for p in points)
 
 
 def _minute_coverage_covers_window_start(
@@ -3054,12 +3277,18 @@ def compute_peer_usage_points(
     start_utc, end_utc = _normalize_time_range(start, end)
 
     if window == "daily":
+        if not all_time and (start_utc is not None or end_utc is not None):
+            minute_points = _peer_daily_points_from_minutes(
+                db,
+                peer_id=peer_id,
+                start_utc=start_utc,
+                end_utc=end_utc,
+            )
+            if minute_points is not None:
+                return minute_points
         q = db.query(UsageDaily).filter(UsageDaily.peer_id == peer_id)
         if not all_time and (start_utc is not None or end_utc is not None):
-            if start_utc is not None:
-                q = q.filter(UsageDaily.day >= start_utc.date().strftime("%Y-%m-%d"))
-            if end_utc is not None:
-                q = q.filter(UsageDaily.day <= end_utc.date().strftime("%Y-%m-%d"))
+            q = _apply_usage_daily_range(q, start_utc, end_utc)
         rows = q.order_by(UsageDaily.day.asc()).all()
         return [UsagePointDTO(day=r.day, rx=r.rx, tx=r.tx) for r in rows]
 
@@ -3212,22 +3441,33 @@ def get_peer_quota(peer_id: int, db: Session = Depends(get_db), current_user: Us
     vu = db.get(SettingsKV, f"quota_valid_until:{peer_id}")
     valid_from = vf.value if vf else None
     valid_until = vu.value if vu else None
-    # Usage in the selected calendar month. Daily rollups are still stored with Gregorian
-    # keys, so use the selected calendar boundary converted back to UTC/Gregorian dates.
+    # Usage in the selected app-calendar month.
     start_month_utc, end_month_utc = selected_month_bounds_utc(
         datetime.now(timezone.utc),
         app_zoneinfo(),
         app_date_calendar(),
     )
-    rows = (
-        db.query(UsageDaily)
-        .filter(
-            UsageDaily.peer_id == peer_id,
-            UsageDaily.day >= start_month_utc.date().strftime("%Y-%m-%d"),
-            UsageDaily.day <= end_month_utc.date().strftime("%Y-%m-%d"),
-        )
-        .all()
+    minute_total = _peer_total_from_minutes(
+        db,
+        peer_id=peer_id,
+        start_utc=start_month_utc,
+        end_utc=end_month_utc,
     )
+    if minute_total is not None:
+        used_rx, used_tx = minute_total
+        return QuotaDTO(
+            monthly_limit_bytes=monthly_limit_bytes,
+            reset_day=reset_day_val,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            used_rx=used_rx,
+            used_tx=used_tx,
+        )
+    rows = _apply_usage_daily_range(
+        db.query(UsageDaily).filter(UsageDaily.peer_id == peer_id),
+        start_month_utc,
+        end_month_utc,
+    ).all()
     used_rx = sum(r.rx for r in rows)
     used_tx = sum(r.tx for r in rows)
     return QuotaDTO(
@@ -3317,11 +3557,18 @@ def get_monthly_summary(
     base = _apply_router_filter(base, router_id, router_ids)
 
     if all_time or start_utc is not None or end_utc is not None:
+        if not all_time:
+            minute_rows = _summary_daily_points_from_minutes(
+                db,
+                start_utc=start_utc,
+                end_utc=end_utc,
+                router_id=router_id,
+                router_ids=router_ids,
+            )
+            if minute_rows is not None:
+                return minute_rows
         q = base
-        if start_utc is not None:
-            q = q.filter(UsageDaily.day >= start_utc.date().strftime("%Y-%m-%d"))
-        if end_utc is not None:
-            q = q.filter(UsageDaily.day <= end_utc.date().strftime("%Y-%m-%d"))
+        q = _apply_usage_daily_range(q, start_utc, end_utc)
         rows = q.group_by(UsageDaily.day).order_by(UsageDaily.day.asc()).all()
         return [MonthlySummaryPointDTO(day=r.day, rx=int(r.rx or 0), tx=int(r.tx or 0)) for r in rows]
 
@@ -3330,8 +3577,7 @@ def get_monthly_summary(
     except Exception:
         days = 14
     days = max(1, min(180, days))
-    today = datetime.utcnow().date()
-    day_keys = [(today - timedelta(days=o)).strftime("%Y-%m-%d") for o in range(days)]
+    day_keys = _daily_keys_for_recent_days(days)
 
     rows = (
         base.filter(UsageDaily.day.in_(day_keys))
@@ -3381,11 +3627,18 @@ def get_monthly_summary_by_router(
     base = _apply_router_filter(base, router_id, router_ids)
 
     if all_time or start_utc is not None or end_utc is not None:
+        if not all_time:
+            minute_rows = _router_daily_points_from_minutes(
+                db,
+                start_utc=start_utc,
+                end_utc=end_utc,
+                router_id=router_id,
+                router_ids=router_ids,
+            )
+            if minute_rows is not None:
+                return minute_rows
         q = base
-        if start_utc is not None:
-            q = q.filter(UsageDaily.day >= start_utc.date().strftime("%Y-%m-%d"))
-        if end_utc is not None:
-            q = q.filter(UsageDaily.day <= end_utc.date().strftime("%Y-%m-%d"))
+        q = _apply_usage_daily_range(q, start_utc, end_utc)
         rows = (
             q.group_by(Peer.router_id, UsageDaily.day)
             .order_by(Peer.router_id.asc(), UsageDaily.day.asc())
@@ -3401,8 +3654,7 @@ def get_monthly_summary_by_router(
     except Exception:
         days = 14
     days = max(1, min(180, days))
-    today = datetime.utcnow().date()
-    day_keys = [(today - timedelta(days=o)).strftime("%Y-%m-%d") for o in range(days)]
+    day_keys = _daily_keys_for_recent_days(days)
 
     rows = (
         base.filter(UsageDaily.day.in_(day_keys))
@@ -3505,19 +3757,29 @@ def get_peers_summary(
         )
         q = _apply_router_filter(q, router_id, router_ids)
         if not all_time:
-            if start_utc is not None:
-                q = q.filter(UsageDaily.day >= start_utc.date().strftime("%Y-%m-%d"))
-            if end_utc is not None:
-                q = q.filter(UsageDaily.day <= end_utc.date().strftime("%Y-%m-%d"))
-            if start_utc is None and end_utc is None:
+            if start_utc is not None or end_utc is not None:
+                minute_summary = _peer_summaries_from_minutes(
+                    db,
+                    start_utc=start_utc,
+                    end_utc=end_utc,
+                    router_id=router_id,
+                    router_ids=router_ids,
+                )
+                if minute_summary is not None:
+                    summary.update(minute_summary)
+                    q = None
+                else:
+                    q = _apply_usage_daily_range(q, start_utc, end_utc)
+            else:
                 d = days if days and days > 0 else 1
                 d = max(1, min(180, int(d)))
-                start_day = (datetime.utcnow().date() - timedelta(days=d - 1)).strftime("%Y-%m-%d")
+                start_day = _daily_keys_for_recent_days(d)[-1]
                 q = q.filter(UsageDaily.day >= start_day)
 
-        rows = q.group_by(UsageDaily.peer_id).all()
-        for r in rows:
-            summary[int(r.peer_id)] = {"rx": int(r.rx or 0), "tx": int(r.tx or 0)}
+        if q is not None:
+            rows = q.group_by(UsageDaily.peer_id).all()
+            for r in rows:
+                summary[int(r.peer_id)] = {"rx": int(r.rx or 0), "tx": int(r.tx or 0)}
 
     # Peers with no usage in this window were omitted above; include them so clients can show
     # fair-usage flags and "0 B" totals for never-connected / idle peers.
@@ -4735,6 +4997,235 @@ def update_notification_config(payload: NotifConfigUpdate, db: Session = Depends
             cfg.enabled = bool(item["enabled"])
     db.commit()
     return {"ok": True}
+
+
+_BROADCAST_PHOTO_MIME_EXT = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+_BROADCAST_PHOTO_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _iso_or_none(dt: Optional[datetime]) -> Optional[str]:
+    return dt.isoformat() if dt else None
+
+
+def _broadcast_dict(b: TelegramBroadcast) -> dict:
+    return {
+        "id": b.id,
+        "body": b.body,
+        "body_preview": (b.body or "")[:140],
+        "has_photo": bool(b.photo_path),
+        "photo_filename": b.photo_filename,
+        "photo_mime": b.photo_mime,
+        "recipient_mode": b.recipient_mode,
+        "status": b.status,
+        "total_count": b.total_count,
+        "sent_count": b.sent_count,
+        "failed_count": b.failed_count,
+        "acknowledged_count": b.acknowledged_count,
+        "created_at": _iso_or_none(b.created_at),
+        "started_at": _iso_or_none(b.started_at),
+        "finished_at": _iso_or_none(b.finished_at),
+    }
+
+
+def _broadcast_recipient_dict(r: TelegramBroadcastRecipient) -> dict:
+    return {
+        "id": r.id,
+        "telegram_user_id": r.telegram_user_id,
+        "chat_id": r.chat_id,
+        "display_name": r.display_name,
+        "status": r.status,
+        "telegram_message_id": r.telegram_message_id,
+        "error_code": r.error_code,
+        "error_message": r.error_message,
+        "sent_at": _iso_or_none(r.sent_at),
+        "acknowledged_at": _iso_or_none(r.acknowledged_at),
+    }
+
+
+def _parse_selected_telegram_user_ids(raw: str) -> list[int]:
+    try:
+        parsed = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="recipient_ids must be a JSON array")
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=400, detail="recipient_ids must be a JSON array")
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in parsed:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0 or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+@router.post("/telegram/broadcasts")
+async def create_telegram_broadcast(
+    text: str = Form(...),
+    recipient_mode: str = Form("all"),
+    recipient_ids: str = Form("[]"),
+    photo: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    from ..telegram.outbox import (
+        broadcast_media_root,
+        dispatch_broadcast_async,
+        recalculate_broadcast_counts,
+        telegram_user_label,
+    )
+
+    body = (text or "").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="Message text is required")
+
+    recipient_mode = (recipient_mode or "all").strip().lower()
+    if recipient_mode not in {"all", "selected"}:
+        raise HTTPException(status_code=400, detail="recipient_mode must be all or selected")
+
+    selected_ids = _parse_selected_telegram_user_ids(recipient_ids)
+    q = db.query(TelegramUser).filter(TelegramUser.is_blocked == False)
+    if recipient_mode == "selected":
+        if not selected_ids:
+            raise HTTPException(status_code=400, detail="Select at least one recipient")
+        q = q.filter(TelegramUser.id.in_(selected_ids))
+    users = q.order_by(TelegramUser.created_at.asc(), TelegramUser.id.asc()).all()
+    if not users:
+        raise HTTPException(status_code=400, detail="No eligible Telegram users found")
+
+    photo_bytes: bytes | None = None
+    photo_ext = ""
+    photo_mime = ""
+    photo_name = ""
+    if photo is not None and photo.filename:
+        photo_mime = (photo.content_type or "").split(";", 1)[0].strip().lower()
+        photo_ext = _BROADCAST_PHOTO_MIME_EXT.get(photo_mime, "")
+        if not photo_ext:
+            raise HTTPException(status_code=400, detail="Only JPEG, PNG, or WebP photos are supported")
+        photo_bytes = await photo.read()
+        if not photo_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded photo is empty")
+        if len(photo_bytes) > _BROADCAST_PHOTO_MAX_BYTES:
+            raise HTTPException(status_code=400, detail="Photo must be 10 MB or smaller")
+        if len(body) > 1024:
+            raise HTTPException(status_code=400, detail="Photo captions must be 1024 characters or less")
+        photo_name = Path(photo.filename).name[:255]
+    elif len(body) > 4096:
+        raise HTTPException(status_code=400, detail="Text messages must be 4096 characters or less")
+
+    broadcast = TelegramBroadcast(
+        created_by_user_id=current_user.id,
+        body=body,
+        recipient_mode=recipient_mode,
+        status="queued",
+    )
+    db.add(broadcast)
+    db.flush()
+
+    if photo_bytes is not None:
+        media_dir = broadcast_media_root() / str(broadcast.id)
+        media_dir.mkdir(parents=True, exist_ok=True)
+        photo_path = media_dir / f"photo{photo_ext}"
+        photo_path.write_bytes(photo_bytes)
+        broadcast.photo_path = str(photo_path)
+        broadcast.photo_filename = photo_name or photo_path.name
+        broadcast.photo_mime = photo_mime
+        broadcast.photo_size_bytes = len(photo_bytes)
+
+    for user in users:
+        db.add(
+            TelegramBroadcastRecipient(
+                broadcast_id=broadcast.id,
+                telegram_user_id=user.id,
+                chat_id=user.telegram_user_id,
+                display_name=telegram_user_label(user),
+                status="pending",
+            )
+        )
+    recalculate_broadcast_counts(db, broadcast)
+    db.commit()
+    db.refresh(broadcast)
+    dispatch_broadcast_async(broadcast.id)
+    return _broadcast_dict(broadcast)
+
+
+@router.get("/telegram/broadcasts")
+def list_telegram_broadcasts(
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    total = db.query(TelegramBroadcast).count()
+    rows = (
+        db.query(TelegramBroadcast)
+        .order_by(TelegramBroadcast.created_at.desc(), TelegramBroadcast.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return {"items": [_broadcast_dict(row) for row in rows], "total": total}
+
+
+@router.get("/telegram/broadcasts/{broadcast_id}")
+def get_telegram_broadcast(
+    broadcast_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    broadcast = db.get(TelegramBroadcast, broadcast_id)
+    if not broadcast:
+        raise HTTPException(status_code=404, detail="broadcast not found")
+    recipients = (
+        db.query(TelegramBroadcastRecipient)
+        .filter_by(broadcast_id=broadcast.id)
+        .order_by(TelegramBroadcastRecipient.id.asc())
+        .all()
+    )
+    return {**_broadcast_dict(broadcast), "recipients": [_broadcast_recipient_dict(r) for r in recipients]}
+
+
+@router.post("/telegram/broadcasts/{broadcast_id}/retry-failed")
+def retry_failed_telegram_broadcast(
+    broadcast_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    from ..telegram.outbox import dispatch_broadcast_async, recalculate_broadcast_counts
+
+    broadcast = db.get(TelegramBroadcast, broadcast_id)
+    if not broadcast:
+        raise HTTPException(status_code=404, detail="broadcast not found")
+    failed = (
+        db.query(TelegramBroadcastRecipient)
+        .filter_by(broadcast_id=broadcast.id, status="failed")
+        .all()
+    )
+    for recipient in failed:
+        recipient.status = "pending"
+        recipient.error_code = ""
+        recipient.error_message = ""
+        recipient.sent_at = None
+        recipient.telegram_message_id = None
+    if failed:
+        broadcast.status = "queued"
+        broadcast.finished_at = None
+        recalculate_broadcast_counts(db, broadcast)
+        db.commit()
+        dispatch_broadcast_async(broadcast.id)
+    return {"ok": True, "queued": len(failed)}
 
 
 @router.post("/telegram/test-notify")

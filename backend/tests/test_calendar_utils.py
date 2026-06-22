@@ -8,6 +8,7 @@ from backend.calendar_utils import (
     selected_calendar_month_bounds_utc,
     selected_month_bounds_utc,
     selected_month_cycle_bounds_utc,
+    utc_range_to_local_day_bounds,
 )
 
 
@@ -47,6 +48,16 @@ def test_explicit_persian_month_bounds_matches_current_month_window():
     from_explicit, to_explicit = selected_calendar_month_bounds_utc(1405, 2, tehran, "persian")
     assert from_explicit == from_bounds
     assert to_explicit == to_bounds
+
+
+def test_persian_month_utc_bounds_map_to_local_daily_keys():
+    tehran = ZoneInfo("Asia/Tehran")
+    start, end = selected_calendar_month_bounds_utc(1405, 2, tehran, "persian")
+
+    start_day, end_day = utc_range_to_local_day_bounds(start, end, tehran)
+
+    assert start_day == "2026-04-21"
+    assert end_day == "2026-05-21"
 
 
 def test_selected_persian_month_cycle_honors_reset_day():

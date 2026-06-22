@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from calendar import monthrange
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from .settings import settings
@@ -245,6 +245,35 @@ def selected_calendar_month_bounds_utc(
     start_local = datetime.combine(start_date, time.min).replace(tzinfo=tz)
     end_local = datetime.combine(end_date, time.min).replace(tzinfo=tz)
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def utc_range_to_local_day_bounds(
+    start_utc: datetime | None,
+    end_utc: datetime | None,
+    tz: ZoneInfo,
+) -> tuple[str | None, str | None]:
+    """
+    Inclusive local day-key bounds for a UTC [start, end) window.
+
+    UsageDaily.day stores app-local Gregorian dates. A local midnight in positive
+    UTC offsets can be the previous UTC date, so callers must not use
+    ``start_utc.date()`` / ``end_utc.date()`` for daily rollup filters.
+    """
+    start_day: str | None = None
+    end_day: str | None = None
+    if start_utc is not None:
+        if start_utc.tzinfo is None:
+            start_utc = start_utc.replace(tzinfo=timezone.utc)
+        else:
+            start_utc = start_utc.astimezone(timezone.utc)
+        start_day = start_utc.astimezone(tz).date().strftime("%Y-%m-%d")
+    if end_utc is not None:
+        if end_utc.tzinfo is None:
+            end_utc = end_utc.replace(tzinfo=timezone.utc)
+        else:
+            end_utc = end_utc.astimezone(timezone.utc)
+        end_day = (end_utc.astimezone(tz) - timedelta(microseconds=1)).date().strftime("%Y-%m-%d")
+    return start_day, end_day
 
 
 def format_app_datetime(dt_utc: datetime, *, include_time: bool = True, calendar: str | None = None) -> str:

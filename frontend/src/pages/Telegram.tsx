@@ -14,6 +14,10 @@ import {
   setTelegramUserPeers,
   getTelegramNotifConfig,
   updateTelegramNotifConfig,
+  createTelegramBroadcast,
+  listTelegramBroadcasts,
+  getTelegramBroadcast,
+  retryFailedTelegramBroadcast,
   testTelegramNotify,
   testTelegramNotifyEvent,
   listRouters,
@@ -24,6 +28,8 @@ import {
   type TelegramTokenDTO,
   type TelegramUserDTO,
   type TelegramNotifConfigDTO,
+  type TelegramBroadcastDTO,
+  type TelegramBroadcastDetailDTO,
   type PeerListDTO,
   type Router,
   type SettingsDTO,
@@ -44,6 +50,26 @@ const EVENT_LABELS: Record<string, string> = {
   daily_summary: "Daily Summary",
   weekly_summary: "Weekly Summary",
 };
+
+const BROADCAST_STATUS_LABELS: Record<string, string> = {
+  pending: "Pending",
+  queued: "Queued",
+  sending: "Sending",
+  sent: "Sent",
+  acknowledged: "Acknowledged",
+  partial_failed: "Partial failure",
+  failed: "Failed",
+};
+
+function broadcastStatusLabel(status: string) {
+  return BROADCAST_STATUS_LABELS[status] || status;
+}
+
+function telegramUserLabel(user: TelegramUserDTO) {
+  if (user.telegram_username) return `@${user.telegram_username}`;
+  const name = `${user.first_name || ""} ${user.last_name || ""}`.trim();
+  return name || `User #${user.id}`;
+}
 
 function filterPeers(peers: PeerListDTO[], search: string, routerById: Record<number, Router>) {
   if (!search.trim()) return peers;
@@ -148,6 +174,19 @@ export default function TelegramPage() {
   const [userPeerDraft, setUserPeerDraft] = React.useState<Record<number, number[]>>({});
   const [savingUserPeers, setSavingUserPeers] = React.useState<number | null>(null);
 
+  // Broadcasts
+  const [broadcasts, setBroadcasts] = React.useState<TelegramBroadcastDTO[]>([]);
+  const [broadcastTotal, setBroadcastTotal] = React.useState(0);
+  const [broadcastText, setBroadcastText] = React.useState("");
+  const [broadcastMode, setBroadcastMode] = React.useState<"all" | "selected">("all");
+  const [broadcastRecipientIds, setBroadcastRecipientIds] = React.useState<number[]>([]);
+  const [broadcastUserSearch, setBroadcastUserSearch] = React.useState("");
+  const [broadcastPhoto, setBroadcastPhoto] = React.useState<File | null>(null);
+  const [sendingBroadcast, setSendingBroadcast] = React.useState(false);
+  const [broadcastDetail, setBroadcastDetail] = React.useState<TelegramBroadcastDetailDTO | null>(null);
+  const [loadingBroadcastDetail, setLoadingBroadcastDetail] = React.useState(false);
+  const [retryingBroadcastId, setRetryingBroadcastId] = React.useState<number | null>(null);
+
   // Peers + Routers for token creation
   const [peers, setPeers] = React.useState<PeerListDTO[]>([]);
   const [routers, setRouters] = React.useState<Router[]>([]);
@@ -161,7 +200,7 @@ export default function TelegramPage() {
 
   const load = React.useCallback(async () => {
     try {
-      const [cfg, st, toks, usrs, nc, rts, prs, appSettings] = await Promise.all([
+      const [cfg, st, toks, usrs, nc, rts, prs, appSettings, bcasts] = await Promise.all([
         getTelegramConfig(),
         getTelegramStatus(),
         listTelegramTokens(),
@@ -170,6 +209,7 @@ export default function TelegramPage() {
         listRouters(),
         listSavedPeers(),
         getSettings(),
+        listTelegramBroadcasts({ limit: 25 }),
       ]);
       setConfig(cfg);
       setBotStatus(st);
@@ -179,6 +219,8 @@ export default function TelegramPage() {
       setRouters(rts);
       setPeers(prs);
       setSettings(appSettings);
+      setBroadcasts(bcasts.items);
+      setBroadcastTotal(bcasts.total);
       const token = cfg.tg_bot_token || "";
       setTokenInput(token);
       savedTokenRef.current = token;
@@ -285,6 +327,98 @@ export default function TelegramPage() {
       u.peers.some(p => p.peer_name.toLowerCase().includes(q))
     );
   }, [users, userSearch]);
+
+  const eligibleBroadcastUsers = React.useMemo(() => users.filter(u => !u.is_blocked), [users]);
+
+  const filteredBroadcastUsers = React.useMemo(() => {
+    const q = broadcastUserSearch.trim().toLowerCase();
+    const selected = new Set(broadcastRecipientIds);
+    const matched = !q
+      ? eligibleBroadcastUsers
+      : eligibleBroadcastUsers.filter(u =>
+          telegramUserLabel(u).toLowerCase().includes(q) ||
+          u.peers.some(p => p.peer_name.toLowerCase().includes(q))
+        );
+    return [...matched].sort((a, b) => {
+      const aSelected = selected.has(a.id);
+      const bSelected = selected.has(b.id);
+      if (aSelected !== bSelected) return aSelected ? -1 : 1;
+      return telegramUserLabel(a).localeCompare(telegramUserLabel(b), undefined, { sensitivity: "base" });
+    });
+  }, [eligibleBroadcastUsers, broadcastRecipientIds, broadcastUserSearch]);
+
+  const broadcastTargetCount = broadcastMode === "all" ? eligibleBroadcastUsers.length : broadcastRecipientIds.length;
+
+  const toggleBroadcastRecipient = (userId: number, checked: boolean) => {
+    setBroadcastRecipientIds(prev => {
+      if (checked) return prev.includes(userId) ? prev : [...prev, userId];
+      return prev.filter(id => id !== userId);
+    });
+  };
+
+  const refreshBroadcasts = async () => {
+    const rows = await listTelegramBroadcasts({ limit: 25 });
+    setBroadcasts(rows.items);
+    setBroadcastTotal(rows.total);
+  };
+
+  const handleSendBroadcast = async () => {
+    const text = broadcastText.trim();
+    if (!text) { setErr("Message text is required"); return; }
+    if (broadcastMode === "selected" && broadcastRecipientIds.length === 0) { setErr("Select at least one recipient"); return; }
+    if (broadcastTargetCount === 0) { setErr("No eligible recipients"); return; }
+    if (broadcastPhoto && broadcastPhoto.size > 10 * 1024 * 1024) { setErr("Photo must be 10 MB or smaller"); return; }
+    if (broadcastPhoto && text.length > 1024) { setErr("Photo captions must be 1024 characters or less"); return; }
+    if (!broadcastPhoto && text.length > 4096) { setErr("Text messages must be 4096 characters or less"); return; }
+    if (!confirm(`Send this broadcast to ${broadcastTargetCount} user(s)?`)) return;
+    setErr("");
+    setSendingBroadcast(true);
+    try {
+      await createTelegramBroadcast({
+        text,
+        recipient_mode: broadcastMode,
+        recipient_ids: broadcastMode === "selected" ? broadcastRecipientIds : [],
+        photo: broadcastPhoto,
+      });
+      setBroadcastText("");
+      setBroadcastPhoto(null);
+      setBroadcastRecipientIds([]);
+      setBroadcastMode("all");
+      await refreshBroadcasts();
+      flash("Broadcast queued");
+    } catch (e: any) {
+      setErr(e?.message || "Broadcast failed");
+    } finally {
+      setSendingBroadcast(false);
+    }
+  };
+
+  const openBroadcastDetail = async (id: number) => {
+    setErr("");
+    setLoadingBroadcastDetail(true);
+    try {
+      setBroadcastDetail(await getTelegramBroadcast(id));
+    } catch (e: any) {
+      setErr(e?.message || "Failed to load broadcast");
+    } finally {
+      setLoadingBroadcastDetail(false);
+    }
+  };
+
+  const handleRetryBroadcast = async (id: number) => {
+    setErr("");
+    setRetryingBroadcastId(id);
+    try {
+      const res = await retryFailedTelegramBroadcast(id);
+      flash(res.queued ? `Retry queued for ${res.queued} recipient(s)` : "No failed recipients to retry");
+      await refreshBroadcasts();
+      if (broadcastDetail?.id === id) setBroadcastDetail(await getTelegramBroadcast(id));
+    } catch (e: any) {
+      setErr(e?.message || "Retry failed");
+    } finally {
+      setRetryingBroadcastId(null);
+    }
+  };
 
   const toggleUserPeerDraft = (userId: number, peerId: number, checked: boolean) => {
     setUserPeerDraft(prev => {
@@ -498,6 +632,156 @@ export default function TelegramPage() {
           </div>
         </Card>
 
+        {/* ── Broadcasts ── */}
+        <Card className="p-5 md:p-6 !hover:shadow-md !hover:-translate-y-0">
+          <div className="flex items-center justify-between gap-3 mb-4">
+            <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">Broadcasts</div>
+            <button
+              type="button"
+              onClick={refreshBroadcasts}
+              className="rounded-full bg-white text-gray-700 px-3 py-1 text-xs ring-1 ring-gray-200 shadow-sm hover:ring-gray-300 dark:bg-gray-800 dark:text-gray-200 dark:ring-gray-700"
+            >
+              Refresh
+            </button>
+          </div>
+
+          <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(280px,360px)]">
+            <div className="grid gap-3">
+              <div className="grid gap-1">
+                <label className="text-xs text-gray-500 dark:text-gray-400">Message</label>
+                <textarea
+                  value={broadcastText}
+                  onChange={e => setBroadcastText(e.target.value)}
+                  rows={5}
+                  placeholder="Message text"
+                  className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm resize-y focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                />
+                <div className={`text-[11px] ${broadcastPhoto && broadcastText.trim().length > 1024 ? "text-red-500" : "text-gray-400 dark:text-gray-500"}`}>
+                  {broadcastText.trim().length}/{broadcastPhoto ? 1024 : 4096}
+                </div>
+              </div>
+
+              <div className="grid gap-1">
+                <label className="text-xs text-gray-500 dark:text-gray-400">Photo</label>
+                <input
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  onChange={e => setBroadcastPhoto(e.target.files?.[0] || null)}
+                  className="block w-full text-sm text-gray-600 file:mr-3 file:rounded-full file:border-0 file:bg-gray-100 file:px-3 file:py-1.5 file:text-xs file:text-gray-700 hover:file:bg-gray-200 dark:text-gray-300 dark:file:bg-gray-800 dark:file:text-gray-200 dark:hover:file:bg-gray-700"
+                />
+                {broadcastPhoto && (
+                  <div className="flex items-center justify-between gap-2 text-xs text-gray-500 dark:text-gray-400">
+                    <span className="truncate">{broadcastPhoto.name}</span>
+                    <button type="button" onClick={() => setBroadcastPhoto(null)} className="text-red-500 hover:text-red-700">Remove</button>
+                  </div>
+                )}
+              </div>
+
+              <div className="grid gap-2">
+                <label className="text-xs text-gray-500 dark:text-gray-400">Audience</label>
+                <div className="inline-flex w-fit rounded-full bg-gray-100 p-1 text-xs dark:bg-gray-800">
+                  <button
+                    type="button"
+                    onClick={() => setBroadcastMode("all")}
+                    className={`rounded-full px-3 py-1 ${broadcastMode === "all" ? "bg-white text-gray-900 shadow dark:bg-gray-950 dark:text-gray-100" : "text-gray-500 dark:text-gray-400"}`}
+                  >
+                    All ({eligibleBroadcastUsers.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setBroadcastMode("selected")}
+                    className={`rounded-full px-3 py-1 ${broadcastMode === "selected" ? "bg-white text-gray-900 shadow dark:bg-gray-950 dark:text-gray-100" : "text-gray-500 dark:text-gray-400"}`}
+                  >
+                    Selected ({broadcastRecipientIds.length})
+                  </button>
+                </div>
+              </div>
+
+              {broadcastMode === "selected" && (
+                <div className="grid gap-1">
+                  <input
+                    value={broadcastUserSearch}
+                    onChange={e => setBroadcastUserSearch(e.target.value)}
+                    placeholder="Search users or peers..."
+                    className="rounded-xl border border-gray-200 dark:border-gray-800 px-3 py-2 text-sm focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-700 dark:bg-gray-950 dark:text-gray-100"
+                  />
+                  <div className="max-h-48 overflow-y-auto rounded-xl border border-gray-100 dark:border-gray-800">
+                    {filteredBroadcastUsers.map(u => (
+                      <label key={u.id} className="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer text-sm">
+                        <input
+                          type="checkbox"
+                          checked={broadcastRecipientIds.includes(u.id)}
+                          onChange={e => toggleBroadcastRecipient(u.id, e.target.checked)}
+                          className="rounded"
+                        />
+                        <span className="min-w-0 flex-1 truncate text-gray-700 dark:text-gray-300">{telegramUserLabel(u)}</span>
+                        <span className="text-xs text-gray-400">{u.peers.length} peer(s)</span>
+                      </label>
+                    ))}
+                    {filteredBroadcastUsers.length === 0 && (
+                      <div className="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">No matching users.</div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between gap-3 pt-1">
+                <span className="text-xs text-gray-500 dark:text-gray-400">{broadcastTargetCount} recipient(s)</span>
+                <button
+                  type="button"
+                  disabled={sendingBroadcast}
+                  onClick={handleSendBroadcast}
+                  className="rounded-full bg-gray-900 text-white px-5 py-1.5 text-sm shadow hover:bg-gray-800 disabled:opacity-60 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200"
+                >
+                  {sendingBroadcast ? "Queueing..." : "Send broadcast"}
+                </button>
+              </div>
+            </div>
+
+            <div className="min-w-0">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">Outbox</div>
+                <div className="text-xs text-gray-400 dark:text-gray-500">{broadcastTotal} total</div>
+              </div>
+              <div className="space-y-2">
+                {broadcasts.length === 0 && (
+                  <div className="text-sm text-gray-500 dark:text-gray-400">No broadcasts yet.</div>
+                )}
+                {broadcasts.map(b => (
+                  <div key={b.id} className="rounded-xl bg-gray-50 dark:bg-gray-800/50 px-3 py-2 text-sm">
+                    <button
+                      type="button"
+                      onClick={() => openBroadcastDetail(b.id)}
+                      className="block w-full text-left"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-medium text-gray-900 dark:text-gray-100">#{b.id} {broadcastStatusLabel(b.status)}</span>
+                        <span className="text-xs text-gray-400 dark:text-gray-500">
+                          {b.sent_count}/{b.total_count}
+                        </span>
+                      </div>
+                      <div className="mt-1 max-h-10 overflow-hidden break-words text-xs text-gray-500 dark:text-gray-400">{b.body_preview}</div>
+                      <div className="mt-1 text-[11px] text-gray-400 dark:text-gray-500">
+                        Ack {b.acknowledged_count} &middot; Failed {b.failed_count}{b.has_photo ? " · Photo" : ""}
+                      </div>
+                    </button>
+                    {b.failed_count > 0 && (
+                      <button
+                        type="button"
+                        disabled={retryingBroadcastId === b.id}
+                        onClick={() => handleRetryBroadcast(b.id)}
+                        className="mt-2 rounded-full bg-white text-gray-700 px-3 py-1 text-xs ring-1 ring-gray-200 shadow-sm hover:ring-gray-300 disabled:opacity-60 dark:bg-gray-900 dark:text-gray-200 dark:ring-gray-700"
+                      >
+                        {retryingBroadcastId === b.id ? "Retrying..." : "Retry failed"}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </Card>
+
         {/* ── Signup Tokens ── */}
         <Card className="p-5 md:p-6 !hover:shadow-md !hover:-translate-y-0">
           <div className="flex items-center justify-between mb-4">
@@ -652,6 +936,70 @@ export default function TelegramPage() {
           </div>
         </Card>
       </div>
+
+      {broadcastDetail && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4">
+          <div className="w-full max-w-2xl bg-white dark:bg-gray-900 rounded-3xl ring-1 ring-gray-200 dark:ring-gray-800 shadow-lg p-6 relative">
+            <button
+              onClick={() => setBroadcastDetail(null)}
+              className="absolute top-4 right-4 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+            >
+              &times;
+            </button>
+            <div className="flex items-start justify-between gap-6 pr-8 mb-4">
+              <div>
+                <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">Broadcast #{broadcastDetail.id}</div>
+                <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  {broadcastStatusLabel(broadcastDetail.status)} &middot; {broadcastDetail.sent_count}/{broadcastDetail.total_count} sent &middot; {broadcastDetail.acknowledged_count} acknowledged
+                </div>
+              </div>
+              {broadcastDetail.failed_count > 0 && (
+                <button
+                  type="button"
+                  disabled={retryingBroadcastId === broadcastDetail.id}
+                  onClick={() => handleRetryBroadcast(broadcastDetail.id)}
+                  className="rounded-full bg-white text-gray-700 px-3 py-1 text-xs ring-1 ring-gray-200 shadow-sm hover:ring-gray-300 disabled:opacity-60 dark:bg-gray-800 dark:text-gray-200 dark:ring-gray-700"
+                >
+                  {retryingBroadcastId === broadcastDetail.id ? "Retrying..." : "Retry failed"}
+                </button>
+              )}
+            </div>
+
+            <div className="mb-4 rounded-xl bg-gray-50 dark:bg-gray-800/50 px-3 py-2 text-sm text-gray-700 dark:text-gray-300 whitespace-pre-wrap break-words">
+              {broadcastDetail.body}
+            </div>
+
+            <div className="max-h-[420px] overflow-y-auto rounded-xl border border-gray-100 dark:border-gray-800">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 bg-white dark:bg-gray-900">
+                  <tr className="border-b border-gray-100 text-left text-xs text-gray-500 dark:border-gray-800 dark:text-gray-400">
+                    <th className="px-3 py-2">Recipient</th>
+                    <th className="px-3 py-2">Status</th>
+                    <th className="px-3 py-2">Error</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {broadcastDetail.recipients.map(r => (
+                    <tr key={r.id} className="border-b border-gray-50 last:border-0 dark:border-gray-800/50">
+                      <td className="px-3 py-2 text-gray-800 dark:text-gray-200">{r.display_name || r.chat_id}</td>
+                      <td className="px-3 py-2 text-gray-600 dark:text-gray-300">{broadcastStatusLabel(r.status)}</td>
+                      <td className="px-3 py-2 text-xs text-red-500">{r.error_message || r.error_code || ""}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {loadingBroadcastDetail && !broadcastDetail && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4">
+          <div className="rounded-3xl bg-white px-5 py-3 text-sm shadow-lg ring-1 ring-gray-200 dark:bg-gray-900 dark:text-gray-100 dark:ring-gray-800">
+            Loading broadcast...
+          </div>
+        </div>
+      )}
 
       {/* ── Generate Token Modal ── */}
       {userPeersModalUser && (

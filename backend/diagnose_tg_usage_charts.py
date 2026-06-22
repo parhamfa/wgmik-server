@@ -13,7 +13,7 @@ from typing import Iterable, Sequence
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from .calendar_utils import app_date_calendar, selected_month_bounds_utc
+from .calendar_utils import app_date_calendar, selected_month_bounds_utc, utc_range_to_local_day_bounds
 from .fair_usage_usage import app_zoneinfo
 from .models import Peer, Router, TelegramPeerBinding, TelegramUser, UsageDaily, UsageMinute, UsageSample
 from .telegram.usage_chart_image import _calendar_day_start_utc, usage_points_for_tg_menu
@@ -113,10 +113,13 @@ def build_diagnosis_report(
     now = datetime.now(timezone.utc)
     month_start, month_end = selected_month_bounds_utc(now, app_zoneinfo(), app_date_calendar())
     day_start = _calendar_day_start_utc(now)
-    month_start_day = month_start.date().strftime("%Y-%m-%d")
     # Match usage_points_for_tg_menu / compute_peer_usage_points: cap end at now.
     month_end_capped = min(month_end, now)
-    month_end_day = month_end_capped.date().strftime("%Y-%m-%d")
+    month_start_day, month_end_day = utc_range_to_local_day_bounds(
+        month_start,
+        month_end_capped,
+        app_zoneinfo(),
+    )
 
     lines.append("--- Telegram bindings (visible) ---")
     for tu in tg_users:

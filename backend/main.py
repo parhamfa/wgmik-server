@@ -106,6 +106,8 @@ def _start():
     try:
         from .telegram.bot import start_bot
         start_bot()
+        from .telegram.outbox import resume_pending_broadcasts
+        resume_pending_broadcasts()
     except Exception as e:
         print(f"Telegram bot start skipped: {e}")
 

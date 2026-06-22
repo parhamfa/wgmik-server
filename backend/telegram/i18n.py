@@ -415,12 +415,16 @@ _STRINGS: dict[str, dict[str, str]] = {
         "fa": "\u0645\u0646\u0648\u06cc \u06af\u0632\u0627\u0631\u0634\u200c\u0647\u0627\u06cc \u0645\u062f\u06cc\u0631",
     },
     "adm_menu_title": {
-        "en": "Admin reports — choose a report.",
-        "fa": "\u06af\u0632\u0627\u0631\u0634\u200c\u0647\u0627\u06cc \u0645\u062f\u06cc\u0631 \u2014 \u06cc\u06a9 \u06af\u0632\u0627\u0631\u0634 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f.",
+        "en": "Admin menu — choose an action.",
+        "fa": "\u0645\u0646\u0648\u06cc \u0645\u062f\u06cc\u0631 \u2014 \u06cc\u06a9 \u06af\u0632\u06cc\u0646\u0647 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f.",
     },
     "adm_btn_user_report": {
         "en": "Per-user report",
         "fa": "\u06af\u0632\u0627\u0631\u0634 \u0647\u0631 \u06a9\u0627\u0631\u0628\u0631",
+    },
+    "adm_btn_outbox": {
+        "en": "Broadcast outbox",
+        "fa": "\u0635\u0646\u062f\u0648\u0642 \u067e\u06cc\u0627\u0645\u200c\u0647\u0627",
     },
     "adm_usage_sending": {
         "en": "Generating {scope} report for all peers…",
@@ -457,6 +461,38 @@ _STRINGS: dict[str, dict[str, str]] = {
     "adm_done": {
         "en": "Report complete.",
         "fa": "\u06af\u0632\u0627\u0631\u0634 \u062a\u0645\u0627\u0645 \u0634\u062f.",
+    },
+    "adm_outbox_title": {
+        "en": "Broadcast outbox — latest messages.",
+        "fa": "\u0635\u0646\u062f\u0648\u0642 \u067e\u06cc\u0627\u0645\u200c\u0647\u0627 \u2014 \u0622\u062e\u0631\u06cc\u0646 \u067e\u06cc\u0627\u0645\u200c\u0647\u0627.",
+    },
+    "adm_outbox_empty": {
+        "en": "No broadcasts have been sent yet.",
+        "fa": "\u0647\u0646\u0648\u0632 \u067e\u06cc\u0627\u0645 \u0639\u0645\u0648\u0645\u06cc \u0627\u0631\u0633\u0627\u0644 \u0646\u0634\u062f\u0647 \u0627\u0633\u062a.",
+    },
+    "adm_outbox_detail": {
+        "en": "Broadcast #{id}\nStatus: {status}\nRecipients: {total}\nSent: {sent}\nFailed: {failed}\nAcknowledged: {ack}\nCreated: {created}",
+        "fa": "\u067e\u06cc\u0627\u0645 #{id}\n\u0648\u0636\u0639\u06cc\u062a: {status}\n\u06af\u06cc\u0631\u0646\u062f\u0647\u200c\u0647\u0627: {total}\n\u0627\u0631\u0633\u0627\u0644\u200c\u0634\u062f\u0647: {sent}\n\u0646\u0627\u0645\u0648\u0641\u0642: {failed}\n\u062a\u0627\u06cc\u06cc\u062f\u0634\u062f\u0647: {ack}\n\u0633\u0627\u062e\u062a: {created}",
+    },
+    "adm_outbox_failed_examples": {
+        "en": "Failed recipients:\n{items}",
+        "fa": "\u06af\u06cc\u0631\u0646\u062f\u0647\u200c\u0647\u0627\u06cc \u0646\u0627\u0645\u0648\u0641\u0642:\n{items}",
+    },
+    "broadcast_ack_button": {
+        "en": "\u2705 Understood",
+        "fa": "\u2705 \u0645\u062a\u0648\u062c\u0647 \u0634\u062f\u0645",
+    },
+    "broadcast_ack_done_button": {
+        "en": "\u2705 Understood",
+        "fa": "\u2705 \u0645\u062a\u0648\u062c\u0647 \u0634\u062f\u0645",
+    },
+    "broadcast_ack_saved": {
+        "en": "Understood.",
+        "fa": "\u0645\u062a\u0648\u062c\u0647 \u0634\u062f\u0645.",
+    },
+    "broadcast_ack_unavailable": {
+        "en": "This acknowledgement is no longer available.",
+        "fa": "\u0627\u06cc\u0646 \u062a\u0627\u06cc\u06cc\u062f \u062f\u06cc\u06af\u0631 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a.",
     },
 }
 

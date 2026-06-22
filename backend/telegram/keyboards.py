@@ -136,7 +136,9 @@ def admin_menu(lang: str = "en") -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=t("btn_this_month", lang), callback_data="adm:scope:month"),
             InlineKeyboardButton(text=t("btn_all_time", lang), callback_data="adm:scope:alltime"),
         ],
+        [InlineKeyboardButton(text=t("btn_pick_month", lang), callback_data="admcal:a:years")],
         [InlineKeyboardButton(text=t("adm_btn_user_report", lang), callback_data="adm:users")],
+        [InlineKeyboardButton(text=t("adm_btn_outbox", lang), callback_data="adm:outbox")],
     ])
 
 
@@ -180,5 +182,115 @@ def admin_user_report_menu(user_id: int, lang: str = "en") -> InlineKeyboardMark
             InlineKeyboardButton(text=t("btn_this_month", lang), callback_data=f"adm:usr:{user_id}:month"),
             InlineKeyboardButton(text=t("btn_all_time", lang), callback_data=f"adm:usr:{user_id}:alltime"),
         ],
+        [InlineKeyboardButton(text=t("btn_pick_month", lang), callback_data=f"admcal:u:{user_id}:years")],
         [InlineKeyboardButton(text=t("btn_back", lang), callback_data="adm:users")],
+    ])
+
+
+def admin_usagepick_year_page_keyboard(
+    lang: str,
+    callback_prefix: str,
+    years: list[int],
+    page: int,
+    total_pages: int,
+    back_callback: str,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(years), 2):
+        row = [
+            InlineKeyboardButton(
+                text=str(years[i]),
+                callback_data=f"{callback_prefix}:y:{years[i]}",
+            )
+        ]
+        if i + 1 < len(years):
+            row.append(
+                InlineKeyboardButton(
+                    text=str(years[i + 1]),
+                    callback_data=f"{callback_prefix}:y:{years[i + 1]}",
+                )
+            )
+        rows.append(row)
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text=t("usagepick_prev", lang),
+                callback_data=f"{callback_prefix}:py:{page - 1}",
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            InlineKeyboardButton(
+                text=t("usagepick_next", lang),
+                callback_data=f"{callback_prefix}:py:{page + 1}",
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t("btn_back", lang), callback_data=back_callback)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_usagepick_months_for_year_keyboard(
+    lang: str,
+    callback_prefix: str,
+    year: int,
+    months_present: list[int],
+    calendar: str,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for m in sorted(months_present):
+        label = format_picker_month_button(year, m, calendar)
+        row.append(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"{callback_prefix}:m:{year}:{m}",
+            )
+        )
+        if len(row) >= 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text=t("btn_back", lang), callback_data=f"{callback_prefix}:years")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_outbox_list_keyboard(
+    items: list[tuple[int, str]],
+    page: int,
+    total_pages: int,
+    lang: str = "en",
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for broadcast_id, label in items:
+        rows.append([
+            InlineKeyboardButton(text=label, callback_data=f"adm:out:{broadcast_id}"),
+        ])
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text=t("usagepick_prev", lang),
+                callback_data=f"adm:outbox:p:{page - 1}",
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            InlineKeyboardButton(
+                text=t("usagepick_next", lang),
+                callback_data=f"adm:outbox:p:{page + 1}",
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t("btn_back", lang), callback_data="adm:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_outbox_detail_keyboard(lang: str = "en") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t("btn_back", lang), callback_data="adm:outbox")],
     ])

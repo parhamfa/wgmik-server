@@ -44,6 +44,7 @@ from .notifications import (
     get_user_notification_preferences,
     set_user_notification_preference,
 )
+from .outbox import acknowledge_recipient, acknowledged_keyboard
 from .tokens import redeem_token
 
 logger = logging.getLogger("wgmik.telegram.handlers")
@@ -600,6 +601,31 @@ async def cb_usagepick(cb: CallbackQuery):
 async def cb_usage_scope(cb: CallbackQuery):
     scope = cb.data.split(":")[1]
     await deliver_usage_scope_charts(cb.message, scope, use_edit=True, requester_id=cb.from_user.id)
+    await cb.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("bcast:ack:"))
+async def cb_broadcast_ack(cb: CallbackQuery):
+    lang = _get_lang(cb.from_user.id)
+    try:
+        recipient_id = int((cb.data or "").split(":")[2])
+    except (IndexError, ValueError):
+        await cb.answer(t("broadcast_ack_unavailable", lang), show_alert=True)
+        return
+    if not acknowledge_recipient(recipient_id, cb.from_user.id):
+        await cb.answer(t("broadcast_ack_unavailable", lang), show_alert=True)
+        return
+    try:
+        await cb.message.edit_reply_markup(
+            reply_markup=acknowledged_keyboard(recipient_id, lang)
+        )
+    except TelegramBadRequest:
+        pass
+    await cb.answer(t("broadcast_ack_saved", lang))
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("bcast:noop:"))
+async def cb_broadcast_noop(cb: CallbackQuery):
     await cb.answer()
 
 

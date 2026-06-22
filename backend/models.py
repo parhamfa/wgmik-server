@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Optional
-from sqlalchemy import Column, Integer, String, Boolean, BigInteger, ForeignKey, UniqueConstraint, DateTime, Index
+from sqlalchemy import Column, Integer, String, Boolean, BigInteger, ForeignKey, UniqueConstraint, DateTime, Index, Text
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from datetime import datetime
 from .db import Base
@@ -323,3 +323,57 @@ class TelegramNotificationLog(Base):
     event_type: Mapped[str] = mapped_column(String(32))
     sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     message_hash: Mapped[str] = mapped_column(String(64), default="")
+
+
+class TelegramBroadcast(Base):
+    __tablename__ = "telegram_broadcasts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_by_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    body: Mapped[str] = mapped_column(Text, default="")
+    photo_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    photo_filename: Mapped[str] = mapped_column(String(255), default="")
+    photo_mime: Mapped[str] = mapped_column(String(64), default="")
+    photo_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    recipient_mode: Mapped[str] = mapped_column(String(16), default="all")  # all | selected
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    total_count: Mapped[int] = mapped_column(Integer, default=0)
+    sent_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    acknowledged_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    recipients: Mapped[list["TelegramBroadcastRecipient"]] = relationship(
+        "TelegramBroadcastRecipient", back_populates="broadcast", cascade="all, delete-orphan"
+    )
+
+
+class TelegramBroadcastRecipient(Base):
+    __tablename__ = "telegram_broadcast_recipients"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    broadcast_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_broadcasts.id", ondelete="CASCADE"), index=True
+    )
+    telegram_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("telegram_users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    telegram_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    error_code: Mapped[str] = mapped_column(String(64), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    acknowledged_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    broadcast: Mapped["TelegramBroadcast"] = relationship("TelegramBroadcast", back_populates="recipients")
+
+    __table_args__ = (
+        UniqueConstraint("broadcast_id", "telegram_user_id", name="uq_tg_broadcast_recipient_user"),
+    )

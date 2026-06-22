@@ -1,9 +1,11 @@
 import base64
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import backend.api.routes as routes_module
 import backend.scheduler as scheduler_module
+from backend.calendar_utils import selected_calendar_month_bounds_utc
 from backend.db import SessionLocal
 from backend.models import Action, Peer, Router, SettingsKV, UsageDaily, UsageMinute, UsageSample
 from backend.routeros.client_base import WGInterfaceConfig
@@ -452,6 +454,89 @@ def test_grouped_summary_endpoints_return_router_scoped_rows(client):
     assert by_router[seeded["router1_id"]]["tx"] == 150
     assert by_router[seeded["router2_id"]]["rx"] == 600
     assert by_router[seeded["router2_id"]]["tx"] == 400
+
+
+def test_persian_selected_month_api_ranges_use_local_day_keys_and_minutes(client, monkeypatch):
+    monkeypatch.setattr(settings, "timezone", "Asia/Tehran")
+    monkeypatch.setattr(settings, "date_calendar", "persian")
+    tehran = ZoneInfo("Asia/Tehran")
+    start, end = selected_calendar_month_bounds_utc(1405, 2, tehran, "persian")
+    start_naive = start.replace(tzinfo=None)
+    end_naive = end.replace(tzinfo=None)
+
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Router Tehran",
+            host="10.0.0.1",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret",
+            tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
+        )
+        db.add(router)
+        db.flush()
+        peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="peer-tehran",
+            public_key="pub-tehran",
+            allowed_address="10.0.0.10/32",
+            disabled=False,
+            selected=True,
+        )
+        db.add(peer)
+        db.flush()
+        db.add_all(
+            [
+                UsageDaily(peer_id=peer.id, day="2026-04-20", rx=9000, tx=9000),
+                UsageDaily(peer_id=peer.id, day="2026-04-21", rx=1, tx=1),
+                UsageMinute(peer_id=peer.id, minute_ts=start_naive - timedelta(minutes=1), rx=9000, tx=9000),
+                UsageMinute(peer_id=peer.id, minute_ts=start_naive, rx=100, tx=50),
+                UsageMinute(peer_id=peer.id, minute_ts=end_naive - timedelta(minutes=1), rx=200, tx=75),
+                UsageMinute(peer_id=peer.id, minute_ts=end_naive, rx=8000, tx=8000),
+            ]
+        )
+        db.commit()
+        peer_id = peer.id
+        router_id = router.id
+    finally:
+        db.close()
+
+    params = {"start": start.isoformat(), "end": end.isoformat()}
+
+    month = client.get("/api/summary/month", params=params).json()
+    assert month == [
+        {"day": "2026-04-21", "rx": 100, "tx": 50},
+        {"day": "2026-05-21", "rx": 200, "tx": 75},
+    ]
+
+    by_router = client.get("/api/summary/month/by_router", params=params).json()
+    assert by_router == [
+        {"router_id": router_id, "day": "2026-04-21", "rx": 100, "tx": 50},
+        {"router_id": router_id, "day": "2026-05-21", "rx": 200, "tx": 75},
+    ]
+
+    peers = client.get("/api/summary/peers", params=params).json()
+    assert peers == [
+        {
+            "peer_id": peer_id,
+            "rx": 300,
+            "tx": 125,
+            "has_fair_usage": False,
+            "fair_usage_throttled": False,
+        }
+    ]
+
+    usage = client.get(f"/api/peers/{peer_id}/usage", params={"window": "daily", **params}).json()
+    assert usage == [
+        {"day": "2026-04-21", "rx": 100, "tx": 50},
+        {"day": "2026-05-21", "rx": 200, "tx": 75},
+    ]
 
 
 def test_dashboard_live_status_fetches_router_scope_once(client, monkeypatch):
@@ -1138,6 +1223,91 @@ def test_scheduler_upserts_usage_minute_with_counter_resets(client, monkeypatch)
         assert len(rows) == 1
         assert rows[0].rx == 80
         assert rows[0].tx == 50
+    finally:
+        db.close()
+
+
+def test_scheduler_writes_usage_daily_with_app_local_day(client, monkeypatch):
+    monkeypatch.setattr(settings, "timezone", "Asia/Tehran")
+    db = SessionLocal()
+    try:
+        router = Router(
+            name="Router Tehran",
+            host="10.0.0.1",
+            proto="rest",
+            port=443,
+            username="admin",
+            secret_enc="secret-a",
+            tls_verify=True,
+            ros_version="7.15",
+            ros_supported=True,
+        )
+        db.add(router)
+        db.flush()
+        peer = Peer(
+            router_id=router.id,
+            interface="wg0",
+            ros_id="*1",
+            name="peer-a",
+            public_key="pub-a-local-day",
+            allowed_address="10.0.0.10/32",
+            disabled=False,
+            selected=True,
+        )
+        db.add(peer)
+        db.flush()
+        poll_time = datetime(2026, 4, 20, 20, 31, 0, tzinfo=timezone.utc)
+        db.add(
+            UsageSample(
+                peer_id=peer.id,
+                ts=(poll_time - timedelta(seconds=5)).replace(tzinfo=None),
+                rx=100,
+                tx=50,
+                endpoint="",
+            )
+        )
+        db.commit()
+        peer_id = peer.id
+    finally:
+        db.close()
+
+    class FakeDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return poll_time.replace(tzinfo=None)
+            return poll_time.astimezone(tz)
+
+    class StubClient:
+        def list_all_wireguard_peers(self):
+            return [
+                SimpleNamespace(
+                    interface="wg0",
+                    public_key="pub-a-local-day",
+                    ros_id="*1",
+                    name="peer-a",
+                    allowed_address="10.0.0.10/32",
+                    disabled=False,
+                    rx_bytes=150,
+                    tx_bytes=80,
+                    endpoint="",
+                )
+            ]
+
+        def set_peer_disabled(self, iface, ros_id, disabled):
+            return None
+
+    monkeypatch.setattr("backend.scheduler.make_client", lambda router: StubClient())
+    monkeypatch.setattr(scheduler_module, "datetime", FakeDateTime)
+
+    scheduler_module._poll_once()
+
+    db = SessionLocal()
+    try:
+        daily = db.query(UsageDaily).filter(UsageDaily.peer_id == peer_id).one()
+        assert daily.day == "2026-04-21"
+        assert daily.rx == 50
+        assert daily.tx == 30
     finally:
         db.close()
 

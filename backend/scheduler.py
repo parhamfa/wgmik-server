@@ -84,7 +84,7 @@ def _poll_once():
             tz = ZoneInfo(getattr(settings, "timezone", "UTC") or "UTC")
         except Exception:
             tz = ZoneInfo("UTC")
-        day_key = now_utc.strftime("%Y-%m-%d")
+        day_key = counter_day_key(now_utc, tz)
         month_key = now_utc.strftime("%Y-%m")
 
         db: Session = SessionLocal()
@@ -266,7 +266,7 @@ def _poll_once():
                     if last_sample is not None:
                         rx_result = counter_delta(last_sample.rx, lp.rx_bytes)
                         tx_result = counter_delta(last_sample.tx, lp.tx_bytes)
-                        local_day_key = counter_day_key(now_utc, tz)
+                        local_day_key = day_key
 
                         if rx_result.near_32bit_drop:
                             _mark_counter_quarantined(

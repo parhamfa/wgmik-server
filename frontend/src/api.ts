@@ -1102,6 +1102,41 @@ export type TelegramNotifConfigDTO = {
   enabled: boolean;
 };
 
+export type TelegramBroadcastDTO = {
+  id: number;
+  body: string;
+  body_preview: string;
+  has_photo: boolean;
+  photo_filename: string;
+  photo_mime: string;
+  recipient_mode: "all" | "selected";
+  status: string;
+  total_count: number;
+  sent_count: number;
+  failed_count: number;
+  acknowledged_count: number;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+};
+
+export type TelegramBroadcastRecipientDTO = {
+  id: number;
+  telegram_user_id: number | null;
+  chat_id: number;
+  display_name: string;
+  status: string;
+  telegram_message_id: number | null;
+  error_code: string;
+  error_message: string;
+  sent_at: string | null;
+  acknowledged_at: string | null;
+};
+
+export type TelegramBroadcastDetailDTO = TelegramBroadcastDTO & {
+  recipients: TelegramBroadcastRecipientDTO[];
+};
+
 export async function getTelegramConfig(): Promise<TelegramConfigDTO> {
   return fetchJson("/api/telegram/config");
 }
@@ -1198,6 +1233,38 @@ export async function updateTelegramNotifConfig(configs: Array<{
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ configs }),
   });
+}
+
+export async function createTelegramBroadcast(data: {
+  text: string;
+  recipient_mode: "all" | "selected";
+  recipient_ids: number[];
+  photo?: File | null;
+}): Promise<TelegramBroadcastDTO> {
+  const form = new FormData();
+  form.set("text", data.text);
+  form.set("recipient_mode", data.recipient_mode);
+  form.set("recipient_ids", JSON.stringify(data.recipient_ids));
+  if (data.photo) form.set("photo", data.photo);
+  return fetchJson("/api/telegram/broadcasts", {
+    method: "POST",
+    body: form,
+  });
+}
+
+export async function listTelegramBroadcasts(params?: { limit?: number; offset?: number }): Promise<{ items: TelegramBroadcastDTO[]; total: number }> {
+  const qs = new URLSearchParams();
+  qs.set("limit", String(params?.limit ?? 25));
+  qs.set("offset", String(params?.offset ?? 0));
+  return fetchJson(`/api/telegram/broadcasts?${qs.toString()}`);
+}
+
+export async function getTelegramBroadcast(id: number): Promise<TelegramBroadcastDetailDTO> {
+  return fetchJson(`/api/telegram/broadcasts/${id}`);
+}
+
+export async function retryFailedTelegramBroadcast(id: number): Promise<{ ok: boolean; queued: number }> {
+  return fetchJson(`/api/telegram/broadcasts/${id}/retry-failed`, { method: "POST" });
 }
 
 export async function testTelegramNotify(): Promise<{ ok: boolean }> {

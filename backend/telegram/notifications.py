@@ -6,7 +6,6 @@ throttle/unthrottle alerts, and periodic summaries.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
@@ -193,31 +192,10 @@ def _make_hash(*parts: str) -> str:
 
 def _run_bot_coro(make_coro) -> bool:
     """Run a one-shot bot coroutine on the polling bot's loop, or a throwaway one."""
-    from .bot import _get_tg_settings, _decrypt_token
-
-    cfg = _get_tg_settings()
-    token = _decrypt_token(cfg.get("tg_bot_token", ""))
-    if not token or len(token) < 20:
-        logger.warning("Cannot send TG message: no valid bot token")
-        return False
-
-    async def _do_send():
-        from aiogram import Bot
-        bot = Bot(token=token)
-        try:
-            await make_coro(bot)
-            return True
-        finally:
-            await bot.session.close()
-
+    from .sender import run_bot_coro
     try:
-        # If there's already a running bot loop, use it; otherwise spin up a throwaway one
-        from .bot import _bot_loop, _bot_running
-        if _bot_running and _bot_loop and not _bot_loop.is_closed():
-            future = asyncio.run_coroutine_threadsafe(_do_send(), _bot_loop)
-            return future.result(timeout=30)
-        else:
-            return asyncio.run(_do_send())
+        run_bot_coro(make_coro)
+        return True
     except Exception:
         logger.exception("Failed to send TG message")
         return False
