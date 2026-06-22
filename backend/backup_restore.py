@@ -29,7 +29,7 @@ from .models import SettingsKV
 from .scheduler import pause_scheduler, resume_scheduler
 from .security import SecretBox
 from .settings import settings
-from .usage_maintenance import _run_usage_maintenance, is_usage_maintenance_running
+from .usage_maintenance import is_usage_maintenance_running
 
 
 LEGACY_BUNDLE_FORMAT_VERSION = 1
@@ -647,12 +647,12 @@ def run_backup_once() -> dict[str, Any]:
             "A manual backup is running. Wait for it to finish before changing data.",
         ):
             _update_backup_status(
-                phase="maintenance",
-                phase_label="Compacting data",
-                detail="Running usage maintenance to compact and clean the database before backup.",
+                phase="checking",
+                phase_label="Checking database",
+                detail="Checking database integrity before backup.",
                 progress_percent=10.0,
             )
-            _run_usage_maintenance(db_path)
+            _validate_sqlite_file(db_path)
 
             _update_backup_status(
                 phase="packaging",

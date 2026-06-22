@@ -1,4 +1,5 @@
 import os
+import shutil
 import sqlite3
 import tarfile
 from io import BytesIO
@@ -17,6 +18,7 @@ from backend.backup_restore import (
     _encrypt_v2_file_to_path,
     _encrypt_payload,
     _extract_bundle_from_tar_path,
+    run_backup_once,
     restore_backup_from_upload_path,
 )
 
@@ -214,6 +216,42 @@ def test_backup_status_endpoint(client, monkeypatch):
     response = client.get("/api/admin/backup")
     assert response.status_code == 200
     assert response.json()["phase"] == "idle"
+
+
+def test_run_backup_once_does_not_run_usage_maintenance(tmp_path, client, monkeypatch):
+    db_path = tmp_path / "wgmik.db"
+    _create_sqlite_db(db_path, "live")
+    backups_dir = tmp_path / "backups"
+    backups_dir.mkdir()
+    calls = {"validated": False}
+
+    def fake_validate(path):
+        assert path == str(db_path)
+        calls["validated"] = True
+
+    def fake_snapshot(source, target):
+        assert source == str(db_path)
+        shutil.copy2(source, target)
+
+    def forbidden_maintenance(_path):
+        raise AssertionError("manual backup must not run usage maintenance")
+
+    monkeypatch.setattr("backend.backup_restore.sqlite_database_path", lambda: str(db_path))
+    monkeypatch.setattr("backend.backup_restore._backups_dir", lambda: backups_dir)
+    monkeypatch.setattr("backend.backup_restore._validate_sqlite_file", fake_validate)
+    monkeypatch.setattr("backend.backup_restore._snapshot_database", fake_snapshot)
+    monkeypatch.setattr("backend.backup_restore.engine.dispose", lambda: None)
+    monkeypatch.setattr("backend.backup_restore.pause_scheduler", lambda: None)
+    monkeypatch.setattr("backend.backup_restore.resume_scheduler", lambda: None)
+    monkeypatch.setattr("backend.backup_restore.prepare_sqlite_database", lambda: None)
+    monkeypatch.setattr("backend.backup_restore.is_usage_maintenance_running", lambda _db: False)
+    monkeypatch.setattr("backend.usage_maintenance._run_usage_maintenance", forbidden_maintenance)
+
+    status = run_backup_once()
+
+    assert calls["validated"] is True
+    assert status["phase"] == "complete"
+    assert status["file_size"] > 0
 
 
 def test_restore_endpoint_streams_upload_to_temp_path(client, monkeypatch):
