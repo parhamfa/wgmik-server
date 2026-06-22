@@ -17,7 +17,7 @@ from .destructive_ops import exclusive_operation_gate
 from .fair_usage_usage import app_zoneinfo
 from .models import Peer, SettingsKV, UsageDaily, UsageMinute, UsageSample
 from .scheduler import pause_scheduler, resume_scheduler
-from .usage_deltas import CounterQuarantineState, counter_day_key, counter_delta, guarded_delta_sql, near_32bit_drop_sql
+from .usage_deltas import CounterQuarantineState, counter_day_key, counter_delta
 from .usage_storage import floor_to_minute_utc
 
 
@@ -880,6 +880,7 @@ def _phase_backfill(db_path: str) -> None:
 
         processed_samples = 0
         backfilled_minutes = 0
+        tz = app_zoneinfo()
         for peer_id, sample_count in peer_counts:
             _check_cancel()
             before_count = int(
@@ -889,77 +890,7 @@ def _phase_backfill(db_path: str) -> None:
                 ).fetchone()[0]
                 or 0
             )
-            conn.execute(
-                f"""
-                INSERT INTO usage_minute (peer_id, minute_ts, rx, tx)
-                SELECT peer_id, minute_ts, SUM(delta_rx), SUM(delta_tx)
-                FROM (
-                    SELECT
-                        peer_id,
-                        strftime('%Y-%m-%d %H:%M:00.000000', ts) AS minute_ts,
-                        {guarded_delta_sql("rx", "prev_rx", "rx_unstable")} AS delta_rx,
-                        {guarded_delta_sql("tx", "prev_tx", "tx_unstable")} AS delta_tx,
-                        ts
-                    FROM (
-                        SELECT
-                            peer_id,
-                            id,
-                            ts,
-                            rx,
-                            tx,
-                            prev_rx,
-                            prev_tx,
-                            SUM(rx_near_32bit_drop) OVER (
-                                PARTITION BY peer_id, substr(ts, 1, 10)
-                                ORDER BY ts, id
-                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                            ) AS rx_unstable,
-                            SUM(tx_near_32bit_drop) OVER (
-                                PARTITION BY peer_id, substr(ts, 1, 10)
-                                ORDER BY ts, id
-                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                            ) AS tx_unstable
-                        FROM (
-                            SELECT
-                                peer_id,
-                                id,
-                                ts,
-                                rx,
-                                tx,
-                                prev_rx,
-                                prev_tx,
-                                {near_32bit_drop_sql("rx", "prev_rx")} AS rx_near_32bit_drop,
-                                {near_32bit_drop_sql("tx", "prev_tx")} AS tx_near_32bit_drop
-                            FROM (
-                                SELECT
-                                    peer_id,
-                                    id,
-                                    ts,
-                                    rx,
-                                    tx,
-                                    LAG(rx) OVER (ORDER BY ts, id) AS prev_rx,
-                                    LAG(tx) OVER (ORDER BY ts, id) AS prev_tx
-                                FROM usage_samples INDEXED BY ix_usage_samples_peer_id_ts
-                                WHERE peer_id = ?
-                                  AND (
-                                    ts >= ?
-                                    OR id = (
-                                        SELECT id
-                                        FROM usage_samples INDEXED BY ix_usage_samples_peer_id_ts
-                                        WHERE peer_id = ? AND ts < ?
-                                        ORDER BY ts DESC, id DESC
-                                        LIMIT 1
-                                    )
-                                  )
-                            )
-                        )
-                    )
-                )
-                WHERE ts >= ? AND (delta_rx <> 0 OR delta_tx <> 0)
-                GROUP BY peer_id, minute_ts
-                """,
-                (peer_id, cutoff_value, peer_id, cutoff_value, cutoff_value),
-            )
+            _backfill_peer_minutes(conn, peer_id, _naive_utc(cutoff), cutoff_value, tz)
             conn.commit()
             after_count = int(
                 conn.execute(
@@ -996,6 +927,72 @@ def _phase_backfill(db_path: str) -> None:
         processed=processed_before + total_samples,
         extra={"backfilled_minutes": backfilled_minutes},
         last_completed_phase="backfill",
+    )
+
+
+def _backfill_peer_minutes(
+    conn: sqlite3.Connection,
+    peer_id: int,
+    cutoff_naive: datetime,
+    cutoff_value: str,
+    tz,
+) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, ts, rx, tx
+        FROM usage_samples INDEXED BY ix_usage_samples_peer_id_ts
+        WHERE peer_id = ?
+          AND (
+            ts >= ?
+            OR id = (
+                SELECT id
+                FROM usage_samples INDEXED BY ix_usage_samples_peer_id_ts
+                WHERE peer_id = ? AND ts < ?
+                ORDER BY ts DESC, id DESC
+                LIMIT 1
+            )
+          )
+        ORDER BY ts ASC, id ASC
+        """,
+        (peer_id, cutoff_value, peer_id, cutoff_value),
+    )
+
+    minute_totals: dict[str, list[int]] = {}
+    previous_rx: Optional[int] = None
+    previous_tx: Optional[int] = None
+    quarantine = CounterQuarantineState()
+    for row in rows:
+        _check_cancel()
+        ts_naive = _parse_sqlite_ts(str(row["ts"]))
+        rx = int(row["rx"] or 0)
+        tx = int(row["tx"] or 0)
+        if previous_rx is not None and previous_tx is not None and ts_naive >= cutoff_naive:
+            day_key = counter_day_key(ts_naive, tz)
+            delta_rx = quarantine.apply("rx", counter_delta(previous_rx, rx), day_key)
+            delta_tx = quarantine.apply("tx", counter_delta(previous_tx, tx), day_key)
+            if delta_rx or delta_tx:
+                minute_key = _sqlite_ts(floor_to_minute_utc(ts_naive))
+                totals = minute_totals.setdefault(minute_key, [0, 0])
+                totals[0] += int(delta_rx or 0)
+                totals[1] += int(delta_tx or 0)
+        previous_rx = rx
+        previous_tx = tx
+
+    if not minute_totals:
+        return
+    conn.executemany(
+        """
+        INSERT INTO usage_minute (peer_id, minute_ts, rx, tx)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(peer_id, minute_ts) DO UPDATE SET
+            rx = usage_minute.rx + excluded.rx,
+            tx = usage_minute.tx + excluded.tx
+        """,
+        [
+            (peer_id, minute_key, totals[0], totals[1])
+            for minute_key, totals in sorted(minute_totals.items())
+            if totals[0] or totals[1]
+        ],
     )
 
 

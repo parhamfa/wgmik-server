@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from backend.usage_maintenance import (
     _default_status,
@@ -152,6 +153,49 @@ def test_sqlite_backfill_quarantines_near_32bit_counter_spike(tmp_path, client):
     assert rows == [
         (1, "2026-06-16 00:01:00.000000", 50, 0),
         (1, "2026-06-16 00:02:00.000000", 50, 0),
+    ]
+
+
+def test_backfill_quarantines_near_32bit_reset_by_app_local_day(tmp_path, client, monkeypatch):
+    monkeypatch.setattr("backend.usage_maintenance.app_zoneinfo", lambda: ZoneInfo("Asia/Tehran"))
+    db_path = tmp_path / "usage.db"
+    conn = _create_usage_db(db_path)
+    conn.executemany(
+        "INSERT INTO usage_samples (id, peer_id, ts, rx, tx, endpoint) VALUES (?, ?, ?, ?, ?, '')",
+        [
+            # Reset happens at 00:09 Tehran on 2026-06-22, but still on
+            # 2026-06-21 in UTC. The whole Tehran day must be quarantined.
+            (1, 1, "2026-06-21 20:38:00.000000", 100, 4_286_665_100),
+            (2, 1, "2026-06-21 20:39:01.000000", 200, 525_212),
+            (3, 1, "2026-06-21 22:00:00.000000", 300, 50_000_000),
+            (4, 1, "2026-06-22 00:10:00.000000", 400, 100_000_000),
+            (5, 1, "2026-06-22 20:40:00.000000", 500, 120_000_000),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    cutoff = _dt("2026-06-21 20:39:00").replace(tzinfo=timezone.utc)
+    _seed_status(
+        phase="backfill",
+        backfill_cutoff=cutoff.isoformat(),
+        backfill_peer_counts=[[1, 4]],
+        backfill_samples_total=4,
+        total_units=4,
+    )
+
+    _phase_backfill(str(db_path))
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT minute_ts, rx, tx FROM usage_minute ORDER BY minute_ts"
+    ).fetchall()
+    conn.close()
+    assert rows == [
+        ("2026-06-21 20:39:00.000000", 100, 0),
+        ("2026-06-21 22:00:00.000000", 100, 0),
+        ("2026-06-22 00:10:00.000000", 100, 0),
+        ("2026-06-22 20:40:00.000000", 100, 20_000_000),
     ]
 
 
