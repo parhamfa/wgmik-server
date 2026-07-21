@@ -244,3 +244,11 @@ docker compose -f docker-compose.dev.yml down
 - **Restart:** `docker compose down && docker compose up` keeps your admin account and skips setup.
 - **Router test:** Settings → Connection profiles → Test returns OK (or a clear error).
 - **No secrets in logs:** `docker compose logs api` contains no admin password.
+
+## Security
+
+Report suspected vulnerabilities privately by following the [security policy](SECURITY.md).
+
+## License
+
+wgmik-server is available under the [MIT License](LICENSE).
