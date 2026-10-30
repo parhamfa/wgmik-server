@@ -1221,8 +1221,9 @@ def test_scheduler_upserts_usage_minute_with_counter_resets(client, monkeypatch)
     try:
         rows = db.query(UsageMinute).filter(UsageMinute.peer_id == peer_id).all()
         assert len(rows) == 1
-        assert rows[0].rx == 80
-        assert rows[0].tx == 50
+        # 180->40 and 100->20 are fresh starts: the new values count.
+        assert rows[0].rx == 120
+        assert rows[0].tx == 70
     finally:
         db.close()
 
@@ -1312,7 +1313,7 @@ def test_scheduler_writes_usage_daily_with_app_local_day(client, monkeypatch):
         db.close()
 
 
-def test_scheduler_quarantines_near_32bit_drop_direction_for_local_day(client, monkeypatch):
+def test_scheduler_counts_counter_drop_as_fresh_start_and_ignores_old_quarantine_keys(client, monkeypatch):
     db = SessionLocal()
     try:
         router = Router(
@@ -1350,6 +1351,9 @@ def test_scheduler_quarantines_near_32bit_drop_direction_for_local_day(client, m
                 endpoint="",
             )
         )
+        # Left behind by the old quarantine; must have no effect any more.
+        db.add(SettingsKV(key=f"usage_counter_unstable:{peer.id}:tx:2026-06-16", value="x"))
+        db.add(SettingsKV(key=f"usage_anomaly_logged:{peer.id}:tx:2026-06-16", value="x"))
         db.commit()
         peer_id = peer.id
     finally:
@@ -1398,15 +1402,11 @@ def test_scheduler_quarantines_near_32bit_drop_direction_for_local_day(client, m
         rows = db.query(UsageMinute).filter(UsageMinute.peer_id == peer_id).all()
         assert len(rows) == 1
         assert rows[0].rx == 100
-        assert rows[0].tx == 0
+        assert rows[0].tx == 20_000_000
         assert db.query(UsageSample).filter(UsageSample.peer_id == peer_id).count() == 3
-        anomaly = (
-            db.query(Action)
-            .filter(Action.peer_id == peer_id, Action.action == "usage_anomaly")
-            .all()
-        )
-        assert len(anomaly) == 1
-        assert "Quarantined tx usage" in anomaly[0].note
+        resets = db.query(Action).filter(Action.peer_id == peer_id, Action.action == "counter_reset").all()
+        assert [a.note for a in resets] == ["Detected counter reset: rx 100->150, tx 4200000000->12000000"]
+        assert db.query(Action).filter(Action.action.in_(["usage_anomaly", "usage_held"])).count() == 0
     finally:
         db.close()
 
@@ -1480,7 +1480,7 @@ def test_summary_endpoints_fall_back_when_minute_data_starts_after_cutoff(client
     assert peer_usage.json()[0]["tx"] == 400
 
 
-def test_raw_fallbacks_quarantine_near_32bit_wireguard_spikes(client):
+def test_raw_fallbacks_count_counter_drop_as_fresh_start(client):
     db = SessionLocal()
     try:
         router = Router(
@@ -1519,21 +1519,26 @@ def test_raw_fallbacks_quarantine_near_32bit_wireguard_spikes(client):
     finally:
         db.close()
 
+    # 4.2e9 -> 12e6 is a fresh start: 12e6 counts, then 12e6 -> 1.5e9 grows normally.
     peers = client.get("/api/summary/peers?seconds=600")
     assert peers.status_code == 200, peers.text
     peer_row = next(row for row in peers.json() if row["peer_id"] == peer_id)
     assert peer_row["rx"] == 100
-    assert peer_row["tx"] == 0
+    assert peer_row["tx"] == 1_500_000_000
 
     raw = client.get("/api/summary/raw?seconds=600&interval=60")
     assert raw.status_code == 200, raw.text
     assert sum(row["rx"] for row in raw.json()) == 100
-    assert sum(row["tx"] for row in raw.json()) == 0
+    assert sum(row["tx"] for row in raw.json()) == 1_500_000_000
+
+    by_router = client.get("/api/summary/raw/by_router?seconds=600&interval=60")
+    assert by_router.status_code == 200, by_router.text
+    assert sum(row["tx"] for row in by_router.json()) == 1_500_000_000
 
     peer_usage = client.get(f"/api/peers/{peer_id}/usage?window=raw&seconds=600&interval=60")
     assert peer_usage.status_code == 200, peer_usage.text
     assert sum(row["rx"] for row in peer_usage.json()) == 100
-    assert sum(row["tx"] for row in peer_usage.json()) == 0
+    assert sum(row["tx"] for row in peer_usage.json()) == 1_500_000_000
 
 
 def test_reset_and_purge_include_usage_minute(client):

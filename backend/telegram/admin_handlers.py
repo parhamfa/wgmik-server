@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -628,6 +629,56 @@ async def cmd_admin(msg: Message):
         return
     lang = _get_admin_lang()
     await msg.answer(t("adm_menu_title", lang), reply_markup=admin_menu(lang))
+
+
+@router.message(Command("selfcheck"))
+async def cmd_selfcheck(msg: Message):
+    if not _is_admin(msg.from_user.id):
+        return
+    from ..usage_selfcheck import selfcheck_reply_text
+
+    try:
+        # DB work waits for the poller's lock; keep it off the bot's event loop.
+        text = await asyncio.to_thread(selfcheck_reply_text)
+    except Exception:
+        logger.exception("Usage self-check failed")
+        text = "Self-check could not run. See the server log."
+    await msg.answer(text)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("hold:"))
+async def cb_usage_hold(cb: CallbackQuery):
+    """Count it / Discard buttons under a usage-held alert."""
+    if not _is_admin(cb.from_user.id):
+        await cb.answer()
+        return
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in ("approve", "discard"):
+        await cb.answer()
+        return
+    try:
+        hold_id = int(parts[2])
+    except ValueError:
+        await cb.answer()
+        return
+    from ..usage_holds import decide_hold_by_id
+
+    try:
+        decision = await asyncio.to_thread(
+            decide_hold_by_id, hold_id, approve=parts[1] == "approve", source="Telegram admin"
+        )
+    except Exception:
+        logger.exception("Usage hold %s decision failed", hold_id)
+        await cb.answer("Could not update this hold. Try again.", show_alert=True)
+        return
+    await cb.answer(decision.message[:200])
+    if not decision.changed or cb.message is None:
+        return
+    original = cb.message.text or ""
+    try:
+        await _safe_edit_text(cb.message, f"{original}\n\n{decision.message}".strip(), reply_markup=None)
+    except Exception:
+        logger.warning("Could not edit usage hold message for hold %s", hold_id)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("adm:"))

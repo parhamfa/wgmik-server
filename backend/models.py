@@ -100,6 +100,25 @@ class UsageMonthly(Base):
     )
 
 
+class UsageHold(Base):
+    """Usage bytes kept out of the rollups until an admin counts or discards them."""
+
+    __tablename__ = "usage_holds"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    peer_id: Mapped[int] = mapped_column(ForeignKey("peers.id", ondelete="CASCADE"), index=True)
+    direction: Mapped[str] = mapped_column(String(2))  # rx | tx
+    reason: Mapped[str] = mapped_column(String(32))  # one_sided | implausible_jump
+    start_ts: Mapped[datetime] = mapped_column(DateTime)
+    end_ts: Mapped[datetime] = mapped_column(DateTime, index=True)
+    bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    #: {"YYYY-MM-DD HH:MM:SS" (UTC minute): bytes} so a decision restores exactly.
+    minutes_json: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending | approved | discarded
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class PeerTotalsMerge(Base):
     __tablename__ = "peer_totals_merge"
 

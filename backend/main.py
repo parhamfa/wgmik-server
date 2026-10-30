@@ -6,7 +6,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from .api.routes import router as api_router
 from .destructive_ops import exclusive_operation_gate
-from .scheduler import ensure_scheduler
+from .scheduler import ensure_scheduler, record_usage_counting_version
 from .db import (
     Base,
     engine,
@@ -100,6 +100,8 @@ def _start():
     from .backup_restore import reset_stale_backup_status
     reset_stale_backup_status()
 
+    # Fresh-start counting marker; the quarantine repair tool refuses to run without it.
+    record_usage_counting_version()
     ensure_scheduler()
 
     # Start Telegram bot if configured

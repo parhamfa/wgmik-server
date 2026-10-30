@@ -414,6 +414,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "Admin reports menu",
         "fa": "\u0645\u0646\u0648\u06cc \u06af\u0632\u0627\u0631\u0634\u200c\u0647\u0627\u06cc \u0645\u062f\u06cc\u0631",
     },
+    "cmd_desc_selfcheck": {
+        "en": "Check today's usage counting",
+        "fa": "\u0628\u0631\u0631\u0633\u06cc \u0635\u062d\u062a \u0634\u0645\u0627\u0631\u0634 \u0645\u0635\u0631\u0641",
+    },
     "adm_menu_title": {
         "en": "Admin menu — choose an action.",
         "fa": "\u0645\u0646\u0648\u06cc \u0645\u062f\u06cc\u0631 \u2014 \u06cc\u06a9 \u06af\u0632\u06cc\u0646\u0647 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f.",

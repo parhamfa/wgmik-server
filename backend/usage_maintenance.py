@@ -14,10 +14,10 @@ from sqlalchemy.orm import Session
 
 from .db import SessionLocal, engine, prepare_sqlite_database, sqlite_database_path
 from .destructive_ops import exclusive_operation_gate
-from .fair_usage_usage import app_zoneinfo
 from .models import Peer, SettingsKV, UsageDaily, UsageMinute, UsageSample
 from .scheduler import pause_scheduler, resume_scheduler
-from .usage_deltas import CounterQuarantineState, counter_day_key, counter_delta
+from .usage_deltas import counter_delta
+from .usage_holds import EXCLUDED_HOLD_STATUSES, held_minute_bytes, held_minute_totals
 from .usage_storage import floor_to_minute_utc
 
 
@@ -880,7 +880,6 @@ def _phase_backfill(db_path: str) -> None:
 
         processed_samples = 0
         backfilled_minutes = 0
-        tz = app_zoneinfo()
         for peer_id, sample_count in peer_counts:
             _check_cancel()
             before_count = int(
@@ -890,7 +889,7 @@ def _phase_backfill(db_path: str) -> None:
                 ).fetchone()[0]
                 or 0
             )
-            _backfill_peer_minutes(conn, peer_id, _naive_utc(cutoff), cutoff_value, tz)
+            _backfill_peer_minutes(conn, peer_id, _naive_utc(cutoff), cutoff_value)
             conn.commit()
             after_count = int(
                 conn.execute(
@@ -930,12 +929,27 @@ def _phase_backfill(db_path: str) -> None:
     )
 
 
+def _held_minutes_sqlite(conn: sqlite3.Connection, peer_id: int, cutoff_naive: datetime) -> dict[str, list[int]]:
+    """Bytes of pending/discarded holds per minute key; they must not be rebuilt into usage."""
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'usage_holds'"
+    ).fetchone()
+    if not has_table:
+        return {}
+    placeholders = ", ".join("?" for _ in EXCLUDED_HOLD_STATUSES)
+    rows = conn.execute(
+        f"SELECT direction, minutes_json FROM usage_holds WHERE peer_id = ? AND status IN ({placeholders})",
+        (peer_id, *EXCLUDED_HOLD_STATUSES),
+    ).fetchall()
+    held = held_minute_totals(((row[0], row[1]) for row in rows), start=cutoff_naive)
+    return {_sqlite_ts(minute): totals for minute, totals in held.items()}
+
+
 def _backfill_peer_minutes(
     conn: sqlite3.Connection,
     peer_id: int,
     cutoff_naive: datetime,
     cutoff_value: str,
-    tz,
 ) -> None:
     rows = conn.execute(
         """
@@ -960,16 +974,14 @@ def _backfill_peer_minutes(
     minute_totals: dict[str, list[int]] = {}
     previous_rx: Optional[int] = None
     previous_tx: Optional[int] = None
-    quarantine = CounterQuarantineState()
     for row in rows:
         _check_cancel()
         ts_naive = _parse_sqlite_ts(str(row["ts"]))
         rx = int(row["rx"] or 0)
         tx = int(row["tx"] or 0)
         if previous_rx is not None and previous_tx is not None and ts_naive >= cutoff_naive:
-            day_key = counter_day_key(ts_naive, tz)
-            delta_rx = quarantine.apply("rx", counter_delta(previous_rx, rx), day_key)
-            delta_tx = quarantine.apply("tx", counter_delta(previous_tx, tx), day_key)
+            delta_rx = counter_delta(previous_rx, rx).delta
+            delta_tx = counter_delta(previous_tx, tx).delta
             if delta_rx or delta_tx:
                 minute_key = _sqlite_ts(floor_to_minute_utc(ts_naive))
                 totals = minute_totals.setdefault(minute_key, [0, 0])
@@ -977,6 +989,12 @@ def _backfill_peer_minutes(
                 totals[1] += int(delta_tx or 0)
         previous_rx = rx
         previous_tx = tx
+
+    for minute_key, held in _held_minutes_sqlite(conn, peer_id, cutoff_naive).items():
+        totals = minute_totals.get(minute_key)
+        if totals is not None:
+            totals[0] = max(0, totals[0] - held[0])
+            totals[1] = max(0, totals[1] - held[1])
 
     if not minute_totals:
         return
@@ -1365,17 +1383,17 @@ def _raw_peer_total_range(
     rx = 0
     tx = 0
     current_prev = prev
-    quarantine = CounterQuarantineState()
-    tz = app_zoneinfo()
     for row in rows:
         if current_prev is None:
             current_prev = row
             continue
-        ts_naive = row.ts.replace(tzinfo=None) if row.ts.tzinfo else row.ts
-        day_key = counter_day_key(ts_naive, tz)
-        rx += quarantine.apply("rx", counter_delta(current_prev.rx, row.rx), day_key)
-        tx += quarantine.apply("tx", counter_delta(current_prev.tx, row.tx), day_key)
+        rx += counter_delta(current_prev.rx, row.rx).delta
+        tx += counter_delta(current_prev.tx, row.tx).delta
         current_prev = row
+    # Held bytes were never (or are no longer) in the minute rollups.
+    held = held_minute_bytes(db, peer_id, start=start_naive, end=end_naive, include_end=include_end)
+    rx -= sum(totals[0] for totals in held.values())
+    tx -= sum(totals[1] for totals in held.values())
     return int(rx), int(tx)
 
 

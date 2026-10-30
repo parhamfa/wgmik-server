@@ -58,6 +58,7 @@ async def _sync_bot_commands(bot) -> None:
             admin_chat_id = int(admin_chat_raw)
             admin_cmds = _bot_commands_for_language(lang) + [
                 BotCommand(command="admin", description=t("cmd_desc_admin", lang)),
+                BotCommand(command="selfcheck", description=t("cmd_desc_selfcheck", lang)),
             ]
             await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=admin_chat_id))
         except ValueError:

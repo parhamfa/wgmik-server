@@ -152,7 +152,7 @@ def _create_backup_db(path: Path, now: datetime) -> None:
         conn.commit()
 
 
-def test_rebuild_usage_rollups_quarantines_near_32bit_counter_spike(tmp_path):
+def test_rebuild_usage_rollups_counts_counter_drop_as_fresh_start(tmp_path):
     db_path = tmp_path / "rollups.db"
     with _connect(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
@@ -180,9 +180,10 @@ def test_rebuild_usage_rollups_quarantines_near_32bit_counter_spike(tmp_path):
         monthly = conn.execute("SELECT rx, tx FROM usage_monthly").fetchone()
         minute = conn.execute("SELECT COALESCE(SUM(rx), 0) AS rx, COALESCE(SUM(tx), 0) AS tx FROM usage_minute").fetchone()
 
-    assert (daily["rx"], daily["tx"]) == (100, 0)
-    assert (monthly["rx"], monthly["tx"]) == (100, 0)
-    assert (minute["rx"], minute["tx"]) == (100, 0)
+    # 4.2e9 -> 12e6 counts 12e6 (fresh start), then 12e6 -> 1.5e9 grows by 1.488e9.
+    assert (daily["rx"], daily["tx"]) == (100, 1_500_000_000)
+    assert (monthly["rx"], monthly["tx"]) == (100, 1_500_000_000)
+    assert (minute["rx"], minute["tx"]) == (100, 1_500_000_000)
 
 
 def test_recover_database_salvages_delta_rebuilds_rollups_and_prunes_raw(tmp_path):
@@ -238,13 +239,14 @@ def test_recover_database_salvages_delta_rebuilds_rollups_and_prunes_raw(tmp_pat
             "SELECT day, rx, tx FROM usage_daily ORDER BY day"
         ).fetchall()
         assert len(daily_rows) == 2
-        assert [(row["rx"], row["tx"]) for row in daily_rows] == [(80, 60), (120, 100)]
+        # 300->20 and 210->5 are fresh starts: the new values count.
+        assert [(row["rx"], row["tx"]) for row in daily_rows] == [(80, 60), (140, 105)]
 
         monthly_rows = conn.execute(
             "SELECT month_key, rx, tx FROM usage_monthly ORDER BY month_key"
         ).fetchall()
         assert len(monthly_rows) == 1
-        assert (monthly_rows[0]["rx"], monthly_rows[0]["tx"]) == (200, 160)
+        assert (monthly_rows[0]["rx"], monthly_rows[0]["tx"]) == (220, 165)
 
         minute_rows = conn.execute(
             "SELECT COUNT(*) AS count, MIN(minute_ts) AS min_ts, MAX(minute_ts) AS max_ts FROM usage_minute"

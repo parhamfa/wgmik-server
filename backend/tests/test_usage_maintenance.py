@@ -1,6 +1,5 @@
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from backend.usage_maintenance import (
     _default_status,
@@ -17,7 +16,7 @@ from backend.usage_maintenance import (
 from backend.scheduler import auto_maintenance_due
 from backend.destructive_ops import exclusive_operation_gate
 from backend.db import SessionLocal
-from backend.models import Peer, Router, UsageMinute, UsageSample
+from backend.models import Peer, Router, UsageHold, UsageMinute, UsageSample
 
 
 def _dt(value: str) -> datetime:
@@ -107,8 +106,9 @@ def test_sqlite_backfill_uses_precutoff_sample_and_counter_reset(tmp_path, clien
         "SELECT peer_id, minute_ts, rx, tx FROM usage_minute ORDER BY minute_ts"
     ).fetchall()
     conn.close()
+    # 150->10 and 90->5 are fresh starts: the new values count.
     assert rows == [
-        (1, "2026-01-01 00:01:00.000000", 50, 40),
+        (1, "2026-01-01 00:01:00.000000", 60, 45),
         (1, "2026-01-01 00:02:00.000000", 15, 10),
     ]
     conn = sqlite3.connect(db_path)
@@ -117,10 +117,10 @@ def test_sqlite_backfill_uses_precutoff_sample_and_counter_reset(tmp_path, clien
         ("2026-01-01 00:01:00.000000",),
     ).fetchone()
     conn.close()
-    assert lower_bound_total == (65, 50)
+    assert lower_bound_total == (75, 55)
 
 
-def test_sqlite_backfill_quarantines_near_32bit_counter_spike(tmp_path, client):
+def test_sqlite_backfill_counts_near_32bit_drop_as_fresh_start(tmp_path, client):
     db_path = tmp_path / "usage.db"
     conn = _create_usage_db(db_path)
     conn.executemany(
@@ -151,52 +151,121 @@ def test_sqlite_backfill_quarantines_near_32bit_counter_spike(tmp_path, client):
     ).fetchall()
     conn.close()
     assert rows == [
-        (1, "2026-06-16 00:01:00.000000", 50, 0),
-        (1, "2026-06-16 00:02:00.000000", 50, 0),
+        (1, "2026-06-16 00:01:00.000000", 50, 12_000_000),
+        (1, "2026-06-16 00:02:00.000000", 50, 1_488_000_000),
     ]
 
 
-def test_backfill_quarantines_near_32bit_reset_by_app_local_day(tmp_path, client, monkeypatch):
-    monkeypatch.setattr("backend.usage_maintenance.app_zoneinfo", lambda: ZoneInfo("Asia/Tehran"))
+USAGE_HOLDS_SQL = """
+CREATE TABLE usage_holds (
+    id INTEGER NOT NULL PRIMARY KEY,
+    peer_id INTEGER NOT NULL,
+    direction VARCHAR(2) NOT NULL,
+    reason VARCHAR(32) NOT NULL,
+    start_ts DATETIME NOT NULL,
+    end_ts DATETIME NOT NULL,
+    bytes BIGINT NOT NULL,
+    minutes_json TEXT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    created_at DATETIME NOT NULL,
+    decided_at DATETIME
+);
+"""
+
+
+def test_sqlite_backfill_leaves_out_pending_and_discarded_holds(tmp_path, client):
     db_path = tmp_path / "usage.db"
     conn = _create_usage_db(db_path)
+    conn.executescript(USAGE_HOLDS_SQL)
     conn.executemany(
         "INSERT INTO usage_samples (id, peer_id, ts, rx, tx, endpoint) VALUES (?, ?, ?, ?, ?, '')",
         [
-            # Reset happens at 00:09 Tehran on 2026-06-22, but still on
-            # 2026-06-21 in UTC. The whole Tehran day must be quarantined.
-            (1, 1, "2026-06-21 20:38:00.000000", 100, 4_286_665_100),
-            (2, 1, "2026-06-21 20:39:01.000000", 200, 525_212),
-            (3, 1, "2026-06-21 22:00:00.000000", 300, 50_000_000),
-            (4, 1, "2026-06-22 00:10:00.000000", 400, 100_000_000),
-            (5, 1, "2026-06-22 20:40:00.000000", 500, 120_000_000),
+            (1, 1, "2026-06-16 00:00:00.000000", 100, 1_000),
+            (2, 1, "2026-06-16 00:01:00.000000", 200, 5_000_001_000),
+            (3, 1, "2026-06-16 00:02:00.000000", 300, 9_000_001_000),
+            (4, 1, "2026-06-16 00:03:00.000000", 400, 9_500_001_000),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO usage_holds (peer_id, direction, reason, start_ts, end_ts, bytes, minutes_json, status, created_at)"
+        " VALUES (1, 'tx', ?, ?, ?, ?, ?, ?, '2026-06-16 00:05:00')",
+        [
+            ("one_sided", "2026-06-16 00:01:00", "2026-06-16 00:02:00", 5_000_000_000,
+             '{"2026-06-16 00:01:00": 5000000000}', "pending"),
+            ("one_sided", "2026-06-16 00:02:00", "2026-06-16 00:03:00", 4_000_000_000,
+             '{"2026-06-16 00:02:00": 4000000000}', "discarded"),
+            # Approved holds were added back, so the backfill keeps those bytes.
+            ("implausible_jump", "2026-06-16 00:02:00", "2026-06-16 00:03:00", 500_000_000,
+             '{"2026-06-16 00:03:00": 500000000}', "approved"),
         ],
     )
     conn.commit()
     conn.close()
 
-    cutoff = _dt("2026-06-21 20:39:00").replace(tzinfo=timezone.utc)
+    cutoff = _dt("2026-06-16 00:01:00").replace(tzinfo=timezone.utc)
     _seed_status(
         phase="backfill",
         backfill_cutoff=cutoff.isoformat(),
-        backfill_peer_counts=[[1, 4]],
-        backfill_samples_total=4,
-        total_units=4,
+        backfill_peer_counts=[[1, 3]],
+        backfill_samples_total=3,
+        total_units=3,
     )
 
     _phase_backfill(str(db_path))
 
     conn = sqlite3.connect(db_path)
-    rows = conn.execute(
-        "SELECT minute_ts, rx, tx FROM usage_minute ORDER BY minute_ts"
-    ).fetchall()
+    rows = conn.execute("SELECT minute_ts, rx, tx FROM usage_minute ORDER BY minute_ts").fetchall()
     conn.close()
     assert rows == [
-        ("2026-06-21 20:39:00.000000", 100, 0),
-        ("2026-06-21 22:00:00.000000", 100, 0),
-        ("2026-06-22 00:10:00.000000", 100, 0),
-        ("2026-06-22 20:40:00.000000", 100, 20_000_000),
+        ("2026-06-16 00:01:00.000000", 100, 0),
+        ("2026-06-16 00:02:00.000000", 100, 0),
+        ("2026-06-16 00:03:00.000000", 100, 500_000_000),
     ]
+
+
+def test_validate_rollups_ignores_held_bytes(client, monkeypatch):
+    monkeypatch.setattr(
+        "backend.usage_maintenance._utc_now",
+        lambda: _dt("2026-06-16 12:00:30").replace(tzinfo=timezone.utc),
+    )
+    db = SessionLocal()
+    try:
+        router = Router(name="A", host="10.0.0.1", proto="rest", port=443, username="admin", secret_enc="s")
+        db.add(router)
+        db.flush()
+        peer = Peer(router_id=router.id, interface="wg0", ros_id="*1", name="p", public_key="pub", allowed_address="10.0.0.2/32")
+        db.add(peer)
+        db.flush()
+        db.add_all(
+            [
+                UsageSample(peer_id=peer.id, ts=_dt("2026-06-16 11:58:10"), rx=1_000, tx=1_000, endpoint=""),
+                UsageSample(peer_id=peer.id, ts=_dt("2026-06-16 11:59:10"), rx=2_000, tx=6_000_001_000, endpoint=""),
+                UsageSample(peer_id=peer.id, ts=_dt("2026-06-16 12:00:10"), rx=3_000, tx=6_000_002_000, endpoint=""),
+                # tx of 11:59 is held, so the minute rollup only has rx there.
+                UsageMinute(peer_id=peer.id, minute_ts=_dt("2026-06-16 11:59:00"), rx=1_000, tx=0),
+                UsageMinute(peer_id=peer.id, minute_ts=_dt("2026-06-16 12:00:00"), rx=1_000, tx=1_000),
+                UsageHold(
+                    peer_id=peer.id,
+                    direction="tx",
+                    reason="one_sided",
+                    start_ts=_dt("2026-06-16 11:59:00"),
+                    end_ts=_dt("2026-06-16 12:00:00"),
+                    bytes=6_000_000_000,
+                    minutes_json='{"2026-06-16 11:59:00": 6000000000}',
+                    status="pending",
+                    created_at=_dt("2026-06-16 12:00:20"),
+                ),
+            ]
+        )
+        db.commit()
+
+        # Would raise "validation failed" if held bytes were compared as usage.
+        _validate_rollups(
+            db,
+            {"backfill_cutoff": _dt("2026-06-16 11:59:00").replace(tzinfo=timezone.utc).isoformat()},
+        )
+    finally:
+        db.close()
 
 
 def test_prune_uses_retention_cutoff_and_preserves_newer_rows(tmp_path, client):

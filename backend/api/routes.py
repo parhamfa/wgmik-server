@@ -14,7 +14,7 @@ from ..scheduler import (
     get_usage_maintenance_next_run,
 )
 from ..security import SecretBox
-from ..models import Router, SettingsKV, Peer, UsageDaily, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User, UserSecurityEvent, FairUsageRule, FairUsageAssignment, FairUsageState, FairUsageTier, PeerTotalsMerge, TelegramBroadcast, TelegramBroadcastRecipient, TelegramPeerBinding, TelegramSignupToken, TelegramNotificationLog
+from ..models import Router, SettingsKV, Peer, UsageDaily, UsageHold, UsageMinute, UsageMonthly, UsageSample, Quota, Action, User, UserSecurityEvent, FairUsageRule, FairUsageAssignment, FairUsageState, FairUsageTier, PeerTotalsMerge, TelegramBroadcast, TelegramBroadcastRecipient, TelegramPeerBinding, TelegramSignupToken, TelegramNotificationLog
 from ..auth import verify_password, get_password_hash, create_access_token, verify_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from ..routeros.factory import make_client
 from ..routeros import tls_setup as router_tls_setup
@@ -54,7 +54,8 @@ from ..fair_usage_peer_status_dto import (
     build_fair_usage_peer_status_dto,
 )
 from ..fair_usage_tiers import ordered_tiers_for_rule, replace_rule_tiers
-from ..usage_deltas import CounterQuarantineState, counter_day_key, counter_delta, guarded_delta_sql, near_32bit_drop_sql
+from ..usage_deltas import counter_delta, fresh_start_delta_sql
+from ..usage_holds import HOLD_STATUSES, decide_hold, parse_minutes_json, peer_label
 from ..usage_bucketing import aggregate_rows_to_local_buckets, aggregate_router_rows_to_local_buckets
 from ..calendar_utils import (
     app_date_calendar,
@@ -525,46 +526,12 @@ def _query_raw_peer_summaries(
             LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_rx,
             LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_tx
         FROM filtered_samples
-    ),
-    marked AS (
-        SELECT
-            id,
-            peer_id,
-            ts,
-            rx,
-            tx,
-            prev_rx,
-            prev_tx,
-            {near_32bit_drop_sql("rx", "prev_rx")} AS rx_near_32bit_drop,
-            {near_32bit_drop_sql("tx", "prev_tx")} AS tx_near_32bit_drop
-        FROM deltas
-    ),
-    guarded AS (
-        SELECT
-            id,
-            peer_id,
-            ts,
-            rx,
-            tx,
-            prev_rx,
-            prev_tx,
-            SUM(rx_near_32bit_drop) OVER (
-                PARTITION BY peer_id, substr(ts, 1, 10)
-                ORDER BY ts, id
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) AS rx_unstable,
-            SUM(tx_near_32bit_drop) OVER (
-                PARTITION BY peer_id, substr(ts, 1, 10)
-                ORDER BY ts, id
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) AS tx_unstable
-        FROM marked
     )
     SELECT
         peer_id,
-        SUM({guarded_delta_sql("rx", "prev_rx", "rx_unstable")}) as total_rx,
-        SUM({guarded_delta_sql("tx", "prev_tx", "tx_unstable")}) as total_tx
-    FROM guarded
+        SUM({fresh_start_delta_sql("rx", "prev_rx")}) as total_rx,
+        SUM({fresh_start_delta_sql("tx", "prev_tx")}) as total_tx
+    FROM deltas
     WHERE prev_rx IS NOT NULL
     GROUP BY peer_id
     """)
@@ -612,46 +579,12 @@ def _query_raw_sample_delta_rows(
             LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_rx,
             LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_tx
         FROM filtered_samples
-    ),
-    marked AS (
-        SELECT
-            id,
-            peer_id,
-            ts,
-            rx,
-            tx,
-            prev_rx,
-            prev_tx,
-            {near_32bit_drop_sql("rx", "prev_rx")} AS rx_near_32bit_drop,
-            {near_32bit_drop_sql("tx", "prev_tx")} AS tx_near_32bit_drop
-        FROM deltas
-    ),
-    guarded AS (
-        SELECT
-            id,
-            peer_id,
-            ts,
-            rx,
-            tx,
-            prev_rx,
-            prev_tx,
-            SUM(rx_near_32bit_drop) OVER (
-                PARTITION BY peer_id, substr(ts, 1, 10)
-                ORDER BY ts, id
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) AS rx_unstable,
-            SUM(tx_near_32bit_drop) OVER (
-                PARTITION BY peer_id, substr(ts, 1, 10)
-                ORDER BY ts, id
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) AS tx_unstable
-        FROM marked
     )
     SELECT
         ts,
-        {guarded_delta_sql("rx", "prev_rx", "rx_unstable")} as d_rx,
-        {guarded_delta_sql("tx", "prev_tx", "tx_unstable")} as d_tx
-    FROM guarded
+        {fresh_start_delta_sql("rx", "prev_rx")} as d_rx,
+        {fresh_start_delta_sql("tx", "prev_tx")} as d_tx
+    FROM deltas
     WHERE prev_rx IS NOT NULL
     ORDER BY ts
     """)
@@ -707,49 +640,13 @@ def _query_raw_router_sample_delta_rows(
             LAG(rx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_rx,
             LAG(tx) OVER (PARTITION BY peer_id ORDER BY ts, id) as prev_tx
         FROM filtered_samples
-    ),
-    marked AS (
-        SELECT
-            id,
-            router_id,
-            peer_id,
-            ts,
-            rx,
-            tx,
-            prev_rx,
-            prev_tx,
-            {near_32bit_drop_sql("rx", "prev_rx")} AS rx_near_32bit_drop,
-            {near_32bit_drop_sql("tx", "prev_tx")} AS tx_near_32bit_drop
-        FROM deltas
-    ),
-    guarded AS (
-        SELECT
-            id,
-            router_id,
-            peer_id,
-            ts,
-            rx,
-            tx,
-            prev_rx,
-            prev_tx,
-            SUM(rx_near_32bit_drop) OVER (
-                PARTITION BY peer_id, substr(ts, 1, 10)
-                ORDER BY ts, id
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) AS rx_unstable,
-            SUM(tx_near_32bit_drop) OVER (
-                PARTITION BY peer_id, substr(ts, 1, 10)
-                ORDER BY ts, id
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) AS tx_unstable
-        FROM marked
     )
     SELECT
         router_id,
         ts,
-        {guarded_delta_sql("rx", "prev_rx", "rx_unstable")} as d_rx,
-        {guarded_delta_sql("tx", "prev_tx", "tx_unstable")} as d_tx
-    FROM guarded
+        {fresh_start_delta_sql("rx", "prev_rx")} as d_rx,
+        {fresh_start_delta_sql("tx", "prev_tx")} as d_tx
+    FROM deltas
     WHERE prev_rx IS NOT NULL
     ORDER BY router_id, ts
     """)
@@ -3350,15 +3247,13 @@ def compute_peer_usage_points(
         )
         delta_rows: list[tuple[datetime, int, int]] = []
         prev: Optional[UsageSample] = None
-        quarantine = CounterQuarantineState()
         for s in samples:
             if prev is None:
                 prev = s
                 continue
             ts_naive = s.ts.replace(tzinfo=None) if s.ts.tzinfo else s.ts
-            day_key = counter_day_key(ts_naive, tz)
-            drx = quarantine.apply("rx", counter_delta(prev.rx, s.rx), day_key)
-            dtx = quarantine.apply("tx", counter_delta(prev.tx, s.tx), day_key)
+            drx = counter_delta(prev.rx, s.rx).delta
+            dtx = counter_delta(prev.tx, s.tx).delta
             prev = s
             if drx <= 0 and dtx <= 0:
                 continue
@@ -4035,6 +3930,96 @@ def cancel_running_usage_maintenance(
 ):
     _require_admin(current_user)
     return UsageMaintenanceStatusDTO(**cancel_usage_maintenance())
+
+
+class UsageHoldDTO(BaseModel):
+    id: int
+    peer_id: int
+    peer_name: str
+    direction: str
+    reason: str
+    start_ts: str
+    end_ts: str
+    bytes: int
+    minutes: dict[str, int]
+    status: str
+    created_at: Optional[str] = None
+    decided_at: Optional[str] = None
+
+
+def _utc_iso(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).isoformat()
+
+
+def _usage_hold_dto(db: Session, hold: UsageHold) -> UsageHoldDTO:
+    return UsageHoldDTO(
+        id=hold.id,
+        peer_id=hold.peer_id,
+        peer_name=peer_label(db.get(Peer, hold.peer_id), hold.peer_id),
+        direction=hold.direction,
+        reason=hold.reason,
+        start_ts=_utc_iso(hold.start_ts) or "",
+        end_ts=_utc_iso(hold.end_ts) or "",
+        bytes=int(hold.bytes or 0),
+        minutes={_utc_iso(minute) or "": amount for minute, amount in sorted(parse_minutes_json(hold.minutes_json).items())},
+        status=hold.status,
+        created_at=_utc_iso(hold.created_at),
+        decided_at=_utc_iso(hold.decided_at),
+    )
+
+
+@router.get("/admin/usage_holds", response_model=List[UsageHoldDTO])
+def list_usage_holds(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    limit: int = Query(200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Usage held back for admin review (one-sided bursts, implausible counter jumps)."""
+    _require_admin(current_user)
+    query = db.query(UsageHold)
+    if status_filter:
+        if status_filter not in HOLD_STATUSES:
+            raise HTTPException(status_code=400, detail=f"status must be one of {', '.join(HOLD_STATUSES)}")
+        query = query.filter(UsageHold.status == status_filter)
+    holds = query.order_by(UsageHold.created_at.desc(), UsageHold.id.desc()).limit(limit).all()
+    return [_usage_hold_dto(db, hold) for hold in holds]
+
+
+def _decide_usage_hold(db: Session, hold_id: int, *, approve: bool, current_user: User) -> UsageHoldDTO:
+    _require_admin(current_user)
+    if exclusive_operation_gate.is_active():
+        raise HTTPException(status_code=409, detail="Usage maintenance is running. Try again when it finishes.")
+    # Serialise with polling and the one-sided guard, which also write the rollups.
+    with exclusive_operation_gate.coordinated_activity():
+        hold, _changed = decide_hold(db, hold_id, approve=approve, source=f"web admin {current_user.username}")
+        if hold is None:
+            db.rollback()
+            raise HTTPException(status_code=404, detail="usage hold not found")
+        db.commit()
+    return _usage_hold_dto(db, hold)
+
+
+@router.post("/admin/usage_holds/{hold_id}/approve", response_model=UsageHoldDTO)
+def approve_usage_hold(
+    hold_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Count the held bytes: add them back to the minute, daily and monthly usage. Idempotent."""
+    return _decide_usage_hold(db, hold_id, approve=True, current_user=current_user)
+
+
+@router.post("/admin/usage_holds/{hold_id}/discard", response_model=UsageHoldDTO)
+def discard_usage_hold(
+    hold_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Keep the held bytes out of usage for good. Idempotent."""
+    return _decide_usage_hold(db, hold_id, approve=False, current_user=current_user)
 
 
 class BackupStatusDTO(BaseModel):

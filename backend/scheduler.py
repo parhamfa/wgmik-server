@@ -14,55 +14,12 @@ from .models import Router, Peer, UsageSample, UsageMinute, UsageDaily, UsageMon
 from .fair_usage_sync import apply_fair_usage_policy, get_applicable_fair_usage_rules
 from .routeros.factory import make_client
 from .routeros.version import is_routeros_supported
-from .usage_deltas import counter_day_key, counter_delta
+from .usage_deltas import USAGE_COUNTING_VERSION, USAGE_COUNTING_VERSION_KEY, counter_day_key, counter_delta
+from .usage_holds import create_hold, format_bytes, max_peer_rate_bytes_per_second, notify_holds_created
 from .usage_storage import floor_to_minute_utc, upsert_usage_minute
 
 
 _scheduler: Optional[BackgroundScheduler] = None
-
-
-def _counter_quarantine_key(peer_id: int, direction: str, day_key: str) -> str:
-    return f"usage_counter_unstable:{peer_id}:{direction}:{day_key}"
-
-
-def _counter_anomaly_log_key(peer_id: int, direction: str, day_key: str) -> str:
-    return f"usage_anomaly_logged:{peer_id}:{direction}:{day_key}"
-
-
-def _is_counter_quarantined(db: Session, peer_id: int, direction: str, day_key: str) -> bool:
-    return db.get(SettingsKV, _counter_quarantine_key(peer_id, direction, day_key)) is not None
-
-
-def _mark_counter_quarantined(
-    db: Session,
-    *,
-    peer_id: int,
-    direction: str,
-    day_key: str,
-    previous: int,
-    current: int,
-    now_utc: datetime,
-) -> None:
-    key = _counter_quarantine_key(peer_id, direction, day_key)
-    if db.get(SettingsKV, key) is None:
-        db.add(SettingsKV(key=key, value=now_utc.isoformat()))
-
-    log_key = _counter_anomaly_log_key(peer_id, direction, day_key)
-    if db.get(SettingsKV, log_key) is not None:
-        return
-    db.add(SettingsKV(key=log_key, value=now_utc.isoformat()))
-    db.add(
-        Action(
-            peer_id=peer_id,
-            ts=now_utc,
-            action="usage_anomaly",
-            note=(
-                f"Quarantined {direction} usage for local day {day_key} after near-32-bit "
-                f"counter drop: {previous}->{current}. Raw samples are kept, but this "
-                "direction's deltas are ignored for the rest of the local day."
-            ),
-        )
-    )
 
 
 def _enforce_fair_usage(db: Session, peer: Peer, client, now_utc: datetime):
@@ -75,6 +32,8 @@ def _poll_once():
     if exclusive_operation_gate.is_active():
         return
 
+    # Telegram alerts for new holds go out after the poll releases the activity lock.
+    hold_notices: list[tuple[int, str]] = []
     with exclusive_operation_gate.coordinated_activity():
         if exclusive_operation_gate.is_active():
             return
@@ -98,6 +57,7 @@ def _poll_once():
                 return
 
             now_naive = now_utc.replace(tzinfo=None)
+            max_rate_bytes_per_sec = max_peer_rate_bytes_per_second(db)
 
             for router in routers:
                 if not is_routeros_supported(getattr(router, "ros_version", "")):
@@ -225,6 +185,7 @@ def _poll_once():
                 db.commit()
 
                 polled_peer_ids: list[int] = []
+                router_hold_notices: list[tuple[int, str]] = []
 
                 selected_peers = (
                     db.query(Peer)
@@ -259,38 +220,45 @@ def _poll_once():
                     )
                     db.add(sample)
 
-                    # Compute deltas. RouterOS WireGuard peer counters can drop or wrap
-                    # near 32-bit values; never count a drop transition as usage.
+                    # Compute deltas. A counter that went down started over (router reboot,
+                    # peer disable/enable, 32-bit wrap): count its new value as fresh traffic.
                     delta_rx = 0
                     delta_tx = 0
                     if last_sample is not None:
                         rx_result = counter_delta(last_sample.rx, lp.rx_bytes)
                         tx_result = counter_delta(last_sample.tx, lp.tx_bytes)
-                        local_day_key = day_key
+                        delta_rx = rx_result.delta
+                        delta_tx = tx_result.delta
 
-                        if rx_result.near_32bit_drop:
-                            _mark_counter_quarantined(
+                        # One reading faster than the per-peer rate cap is a counter glitch
+                        # (bounce-back, or a peer moved to a router whose counter is already
+                        # high). Hold it for an admin instead of counting it.
+                        last_ts = last_sample.ts.replace(tzinfo=None) if last_sample.ts.tzinfo else last_sample.ts
+                        elapsed_seconds = max((now_naive - last_ts).total_seconds(), 1.0)
+                        max_bytes = int(max_rate_bytes_per_sec * elapsed_seconds)
+                        for direction, delta, reverse in (("rx", delta_rx, delta_tx), ("tx", delta_tx, delta_rx)):
+                            if delta <= max_bytes:
+                                continue
+                            hold, note = create_hold(
                                 db,
-                                peer_id=peer.id,
-                                direction="rx",
-                                day_key=local_day_key,
-                                previous=last_sample.rx,
-                                current=lp.rx_bytes,
+                                peer=peer,
+                                direction=direction,
+                                reason="implausible_jump",
+                                minutes={floor_to_minute_utc(now_utc): delta},
+                                start_ts=last_ts,
+                                end_ts=now_naive,
+                                reverse_bytes=reverse,
+                                reason_detail=(
+                                    f"{format_bytes(delta)} in {elapsed_seconds:.0f} s is faster than the "
+                                    f"{max_rate_bytes_per_sec * 8 // 1_000_000} Mbit/s cap"
+                                ),
                                 now_utc=now_utc,
                             )
-                        if tx_result.near_32bit_drop:
-                            _mark_counter_quarantined(
-                                db,
-                                peer_id=peer.id,
-                                direction="tx",
-                                day_key=local_day_key,
-                                previous=last_sample.tx,
-                                current=lp.tx_bytes,
-                                now_utc=now_utc,
-                            )
-
-                        delta_rx = 0 if _is_counter_quarantined(db, peer.id, "rx", local_day_key) else rx_result.delta
-                        delta_tx = 0 if _is_counter_quarantined(db, peer.id, "tx", local_day_key) else tx_result.delta
+                            router_hold_notices.append((hold.id, note))
+                            if direction == "rx":
+                                delta_rx = 0
+                            else:
+                                delta_tx = 0
 
                         if rx_result.dropped or tx_result.dropped:
                             db.add(
@@ -335,6 +303,7 @@ def _poll_once():
                 # Commit usage/history updates immediately so a later slow/offline router
                 # cannot hold SQLite write locks over already-saved data.
                 db.commit()
+                hold_notices.extend(router_hold_notices)
 
                 for peer_id in polled_peer_ids:
                     peer = db.get(Peer, peer_id)
@@ -360,6 +329,62 @@ def _poll_once():
             print(f"Polling skipped due to database error: {exc}")
         finally:
             db.close()
+
+    notify_holds_created(hold_notices)
+
+
+def _usage_one_sided_guard():
+    """Every 5 minutes: hold download/upload bursts with almost no traffic the other way."""
+    if exclusive_operation_gate.is_active():
+        return
+    from .usage_guard import run_one_sided_guard
+
+    notices: list[tuple[int, str]] = []
+    with exclusive_operation_gate.coordinated_activity():
+        if exclusive_operation_gate.is_active():
+            return
+        db: Session = SessionLocal()
+        try:
+            notices = run_one_sided_guard(db)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            notices = []
+            print(f"One-sided usage guard skipped: {exc}")
+        finally:
+            db.close()
+    notify_holds_created(notices)
+
+
+def _usage_selfcheck_job():
+    """Nightly: recompute today's usage from raw samples and compare with the minute rollups."""
+    from .usage_selfcheck import run_usage_selfcheck_locked
+
+    try:
+        run_usage_selfcheck_locked(notify=True)
+    except Exception as exc:
+        print(f"Usage self-check failed: {exc}")
+
+
+def record_usage_counting_version() -> None:
+    """Mark this database as counting usage with the fresh-start rule (see usage_deltas)."""
+    db: Session = SessionLocal()
+    try:
+        kv = db.get(SettingsKV, USAGE_COUNTING_VERSION_KEY)
+        if kv is None or kv.value != USAGE_COUNTING_VERSION:
+            if kv is None:
+                db.add(SettingsKV(key=USAGE_COUNTING_VERSION_KEY, value=USAGE_COUNTING_VERSION))
+            else:
+                kv.value = USAGE_COUNTING_VERSION
+            # When this rule went live; the repair tool refuses to run after a later
+            # maintenance rebuild of the minute rollups.
+            since_key = f"{USAGE_COUNTING_VERSION_KEY}_since"
+            since = db.get(SettingsKV, since_key) or SettingsKV(key=since_key, value="")
+            since.value = datetime.now(timezone.utc).isoformat()
+            db.add(since)
+        db.commit()
+    finally:
+        db.close()
 
 
 def _local_timezone() -> ZoneInfo:
@@ -565,6 +590,20 @@ def ensure_scheduler() -> BackgroundScheduler:
             id="usage-maintenance-auto",
             replace_existing=True,
             misfire_grace_time=6 * 3600,
+        )
+        _scheduler.add_job(
+            _usage_one_sided_guard,
+            IntervalTrigger(minutes=5),
+            id="usage-one-sided-guard",
+            replace_existing=True,
+        )
+        # 23:50 local: raw samples (kept 24 h) still cover the whole local day.
+        _scheduler.add_job(
+            _usage_selfcheck_job,
+            CronTrigger(hour=23, minute=50, timezone=_local_timezone()),
+            id="usage-selfcheck",
+            replace_existing=True,
+            misfire_grace_time=600,
         )
         _scheduler.start()
         try:
